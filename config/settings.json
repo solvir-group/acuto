@@ -1,0 +1,9 @@
+{
+  // Phase 2: theme selection only. Fonts, docks, density and the rest land in Phase 3.
+  // Copied into <data-dir>\config\settings.json by config\apply.ps1. Hot-reloads.
+  "theme": {
+    "mode": "dark",
+    "dark": "Monochrome Dark",
+    "light": "Monochrome Dark"
+  }
+}
