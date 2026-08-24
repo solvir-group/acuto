@@ -1,5 +1,5 @@
 use editor::{EditorSettings, ui_scrollbar_settings_from_raw};
-use gpui::Pixels;
+use gpui::{Pixels, px};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
@@ -35,6 +35,23 @@ pub struct ProjectPanelSettings {
     pub sort_order: ProjectPanelSortOrder,
     pub diagnostic_badges: bool,
     pub git_status_indicator: bool,
+    pub row: RowSettings,
+}
+
+/// Resolved geometry for a single project panel row.
+///
+/// These were fixed constants in the panel's rendering until now, so changing the
+/// tree's density or shape meant a rebuild. They are settings so that retuning it
+/// costs a file save.
+/// Not `Eq`: pixel values are `f32`.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct RowSettings {
+    pub padding_x: Pixels,
+    pub padding_y: Pixels,
+    pub corner_radius: Pixels,
+    pub icon_size: Pixels,
+    pub icon_gap: Pixels,
+    pub show_chevron_with_folder_icon: bool,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -113,6 +130,22 @@ impl Settings for ProjectPanelSettings {
             indent_size: *project_panel.indent_size.unwrap(),
             indent_guides: IndentGuidesSettings {
                 show: project_panel.indent_guides.unwrap().show.unwrap(),
+            },
+            // Unlike the fields around it, these fall back in code rather than
+            // relying on default.json being present and complete. A missing value
+            // here degrades to the documented default instead of panicking.
+            row: {
+                let row = project_panel.row.unwrap_or_default();
+                RowSettings {
+                    padding_x: px(row.padding_x.map_or(8.0, |value| *value)),
+                    padding_y: px(row.padding_y.map_or(6.0, |value| *value)),
+                    corner_radius: px(row.corner_radius.map_or(6.0, |value| *value)),
+                    icon_size: px(row.icon_size.map_or(16.0, |value| *value)),
+                    icon_gap: px(row.icon_gap.map_or(8.0, |value| *value)),
+                    show_chevron_with_folder_icon: row
+                        .show_chevron_with_folder_icon
+                        .unwrap_or(true),
+                }
             },
             sticky_scroll: project_panel.sticky_scroll.unwrap(),
             auto_reveal_entries: project_panel.auto_reveal_entries.unwrap(),

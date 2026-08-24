@@ -817,6 +817,8 @@ pub struct ProjectPanelSettingsContent {
     pub show_diagnostics: Option<ShowDiagnostics>,
     /// Settings related to indent guides in the project panel.
     pub indent_guides: Option<ProjectPanelIndentGuidesSettings>,
+    /// Geometry of a single row in the project panel.
+    pub row: Option<ProjectPanelRowSettings>,
     /// Whether to hide the root entry when only one folder is open in the window.
     ///
     /// Default: false
@@ -978,6 +980,46 @@ pub struct ProjectPanelScrollbarSettingsContent {
 )]
 pub struct ProjectPanelIndentGuidesSettings {
     pub show: Option<ShowIndentGuides>,
+}
+
+/// Geometry of a single row in the project panel.
+///
+/// These values were previously fixed in the panel's rendering code, which meant
+/// changing the tree's density or shape required recompiling. Exposing them here
+/// makes the tree retunable from settings.json with no rebuild.
+///
+/// Not `Eq`: pixel values are `f32`.
+#[with_fallible_options]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Default)]
+pub struct ProjectPanelRowSettings {
+    /// Horizontal padding inside a row, in pixels.
+    ///
+    /// Default: 8
+    pub padding_x: Option<crate::PixelSetting>,
+    /// Vertical padding inside a row, in pixels. Drives row height.
+    ///
+    /// Default: 6
+    pub padding_y: Option<crate::PixelSetting>,
+    /// Corner radius of the row's hover and selection highlight, in pixels.
+    ///
+    /// Default: 6
+    pub corner_radius: Option<crate::PixelSetting>,
+    /// Size of file and folder icons, in pixels.
+    ///
+    /// Default: 16
+    pub icon_size: Option<crate::PixelSetting>,
+    /// Gap between an entry's icon and its name, in pixels.
+    ///
+    /// Default: 8
+    pub icon_gap: Option<crate::PixelSetting>,
+    /// Whether to show an expand/collapse chevron alongside folder icons.
+    ///
+    /// Upstream treats these as mutually exclusive: a directory row shows either
+    /// a folder icon or a chevron, never both. Enabling this shows the chevron
+    /// beside the icon instead of replacing it.
+    ///
+    /// Default: true
+    pub show_chevron_with_folder_icon: Option<bool>,
 }
 
 /// Controls how semantic tokens from language servers are used for syntax highlighting.

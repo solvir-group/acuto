@@ -877,6 +877,24 @@
     "show_diagnostics": "all",
     // Whether to stick parent directories at top of the project panel.
     "sticky_scroll": true,
+    // Geometry of a single row in the project panel. These were fixed in code
+    // until now; they are settings so the tree can be retuned without a rebuild.
+    "row": {
+      // Horizontal padding inside a row, in pixels.
+      "padding_x": 8,
+      // Vertical padding inside a row, in pixels. Drives row height.
+      "padding_y": 6,
+      // Corner radius of the hover and selection highlight, in pixels.
+      "corner_radius": 6,
+      // Size of file and folder icons, in pixels.
+      "icon_size": 16,
+      // Gap between an entry's icon and its name, in pixels.
+      "icon_gap": 8,
+      // Whether to show an expand/collapse chevron alongside folder icons.
+      // Upstream treats these as mutually exclusive - a directory row shows
+      // either a folder icon or a chevron. This shows both.
+      "show_chevron_with_folder_icon": true,
+    },
     // Settings related to indent guides in the project panel.
     "indent_guides": {
       // When to show indent guides in the project panel.

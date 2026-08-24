@@ -5730,6 +5730,16 @@ impl ProjectPanel {
 
         let file_name = details.filename.clone();
 
+        // Upstream treats folder icons and chevrons as mutually exclusive: a
+        // directory row shows one or the other. When enabled, render the chevron
+        // beside the icon rather than in place of it, so a folder reads as both
+        // "a folder" and "expandable".
+        let chevron = (settings.row.show_chevron_with_folder_icon
+            && settings.folder_icons
+            && kind.is_dir())
+        .then(|| FileIcons::get_chevron_icon(details.is_expanded, cx))
+        .flatten();
+
         let mut icon = details.icon.clone();
         if settings.file_icons && show_editor && details.kind.is_file() {
             let filename = self.filename_editor.read(cx).text(cx);
@@ -6259,6 +6269,11 @@ impl ProjectPanel {
                             )
                         },
                     )
+                    .when_some(chevron, |this, chevron_path| {
+                        this.child(
+                            h_flex().child(Icon::from_path(chevron_path).color(Color::Muted)),
+                        )
+                    })
                     .child(if let Some(icon) = &icon {
                         if let Some((_, decoration_color)) =
                             entry_diagnostic_aware_icon_decoration_and_color(diagnostic_severity)
