@@ -628,6 +628,43 @@ fn get_item_color(is_sticky: bool, cx: &App) -> ItemColors {
     }
 }
 
+/// Colors a project panel entry's icon by broad file category rather than by
+/// language, so the tree reads as a small fixed set of kinds instead of a
+/// per-extension rainbow.
+///
+/// The colors come from the theme's `accents` array rather than being hardcoded,
+/// so they stay tunable from theme JSON without a rebuild. The index order is
+/// fixed by the design spec and must not be reordered:
+///
+///   0 folder   1 code   2 style   3 config   4 text and everything else
+///
+/// `color_for_index` wraps modulo the array length, so a theme shipping fewer
+/// accents degrades to a repeated color rather than panicking.
+fn entry_icon_color(kind: EntryKind, file_name: &str, cx: &App) -> Color {
+    let index = match kind {
+        EntryKind::File => {
+            let extension = Path::new(file_name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+
+            match extension.as_str() {
+                "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "rs" | "go" | "py" | "rb"
+                | "java" | "kt" | "swift" | "c" | "h" | "cc" | "cpp" | "hpp" | "cs" | "php"
+                | "vue" | "svelte" | "sh" | "bash" | "ps1" | "lua" | "zig" | "ex" | "exs" => 1,
+                "css" | "scss" | "sass" | "less" | "pcss" | "postcss" | "styl" => 2,
+                "json" | "jsonc" | "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "lock"
+                | "env" => 3,
+                _ => 4,
+            }
+        }
+        _ => 0,
+    };
+
+    Color::Custom(cx.theme().accents().color_for_index(index))
+}
+
 enum DeleteEntryOutcome {
     /// Entry was successfully trashed, returning the `Change` that can be
     /// recorded to the undo stack.
@@ -6231,7 +6268,8 @@ impl ProjectPanel {
                                 .unwrap_or(false);
                             div().child(
                                 DecoratedIcon::new(
-                                    Icon::from_path(icon.clone()).color(Color::Muted),
+                                    Icon::from_path(icon.clone())
+                                        .color(entry_icon_color(kind, &file_name, cx)),
                                     Some(
                                         IconDecoration::new(
                                             if kind.is_file() {
@@ -6258,7 +6296,10 @@ impl ProjectPanel {
                                 .into_any_element(),
                             )
                         } else {
-                            h_flex().child(Icon::from_path(icon.to_string()).color(Color::Muted))
+                            h_flex().child(
+                                Icon::from_path(icon.to_string())
+                                    .color(entry_icon_color(kind, &file_name, cx)),
+                            )
                         }
                     } else if let Some((icon_name, color)) =
                         entry_diagnostic_aware_icon_name_and_color(diagnostic_severity)
