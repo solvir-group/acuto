@@ -1268,7 +1268,7 @@ impl Dock {
 }
 
 impl Render for Dock {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context();
 
         // A labelled tab strip along the top of the bottom dock, so panels docked
@@ -1293,7 +1293,14 @@ impl Render for Dock {
                     .border_color(cx.theme().colors().border_variant)
                     .children(self.panel_entries.iter().enumerate().map(|(ix, entry)| {
                         let is_active = Some(ix) == active_index;
-                        let name = entry.panel.persistent_name();
+                        // icon_tooltip is the human-facing label ("Terminal",
+                        // "Debug Panel"). persistent_name is the serialization key
+                        // and reads as the struct name ("TerminalPanel"), so it is
+                        // only a fallback.
+                        let name = entry
+                            .panel
+                            .icon_tooltip(window, cx)
+                            .unwrap_or_else(|| entry.panel.persistent_name());
                         Button::new(("dock-tab", ix), name)
                             .label_size(LabelSize::Small)
                             .color(if is_active {
