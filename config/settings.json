@@ -14,8 +14,11 @@
   // chrome labels. Body UI text is 0.825rem (crates/ui/src/styles/typography.rs).
   // 15.5 * 0.825 = 12.8px labels, which is the 12.5-13px the spec asks for.
   // Setting this to 13 would give ~10.7px and shrink the entire UI.
-  "ui_font_family": "Test Söhne",
-  "ui_font_fallbacks": ["Inter", "Segoe UI Variable", "Segoe UI"],
+  // Inter is NOT currently installed on this machine, so this renders Segoe UI
+  // Variable through the fallback until it is. DirectWrite refreshes the system
+  // collection on a miss, so installing Inter should take effect without an edit.
+  "ui_font_family": "Inter",
+  "ui_font_fallbacks": ["Segoe UI Variable", "Segoe UI"],
   "ui_font_size": 15.5,
   "ui_font_weight": 400,
 
@@ -30,7 +33,7 @@
   "buffer_line_height": { "custom": 1.75 },
 
   // Agent panel: sans for responses, mono for user messages, matching the editor.
-  "agent_ui_font_family": "Test Söhne",
+  "agent_ui_font_family": "Inter",
   "agent_buffer_font_family": "JetBrains Mono",
 
   // UNSTABLE upstream ("expect many elements to be broken"). It is the single
@@ -69,7 +72,7 @@
   "tab_bar": {
     "show": true,
     "show_nav_history_buttons": false,
-    "show_tab_bar_buttons": false
+    "show_tab_bar_buttons": true
   },
 
   "tabs": {
