@@ -4351,7 +4351,10 @@ impl ThreadView {
 
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let has_messages = self.list_state.item_count() > 0;
-        let fills_container = !has_messages || editor_expanded;
+        // Previously `!has_messages || editor_expanded`. On an empty thread the
+        // composer stretched to fill the panel; now it keeps its natural height so
+        // it can be centred instead.
+        let fills_container = editor_expanded;
 
         h_flex()
             .py_2()
@@ -4360,12 +4363,16 @@ impl ThreadView {
             .on_action(cx.listener(Self::handle_message_editor_move_up))
             .map(|this| {
                 if has_messages {
+                    // The separating border used to live here, which read as a rule
+                    // across the panel rather than an input. It moved onto the
+                    // composer itself below, so the composer is a discrete box.
                     this.on_action(cx.listener(Self::expand_message_editor))
-                        .border_t_1()
-                        .border_color(cx.theme().colors().border)
                         .when(editor_expanded, |this| this.h(vh(0.8, window)))
                 } else {
-                    this.flex_1().size_full()
+                    // Empty thread: centre the composer in the panel instead of
+                    // stretching it. justify_center on this row handles the
+                    // horizontal axis already; items_center handles the vertical.
+                    this.flex_1().size_full().items_center()
                 }
             })
             .child(
@@ -4385,8 +4392,13 @@ impl ThreadView {
                             .w_full()
                             .min_h_0()
                             .when(fills_container, |this| this.flex_1())
-                            .pt_1()
-                            .pr_2p5()
+                            // The composer is a discrete rectangular input rather
+                            // than text sitting under a divider.
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .rounded_md()
+                            .bg(editor_bg_color)
+                            .p_2()
                             .child(self.message_editor.clone())
                             .when(has_messages, |this| {
                                 this.child(
