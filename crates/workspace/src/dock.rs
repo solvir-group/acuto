@@ -1270,6 +1270,43 @@ impl Dock {
 impl Render for Dock {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context();
+
+        // A labelled tab strip along the top of the bottom dock, so panels docked
+        // there read like the tabbed drawer people expect rather than a single
+        // surface whose identity is only discoverable from icons in the status bar.
+        //
+        // Driven by the panels actually docked here, so it needs no list of its own
+        // and stays correct when panels are moved between docks. Only rendered when
+        // there is more than one panel, since a strip with a single tab is noise.
+        let panel_tabs = (self.position == DockPosition::Bottom
+            && self.panel_entries.len() > 1)
+            .then(|| {
+                let active_index = self.active_panel_index;
+                h_flex()
+                    .w_full()
+                    .flex_none()
+                    .gap_1()
+                    .px_2()
+                    .pt_1()
+                    .pb_0p5()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .children(self.panel_entries.iter().enumerate().map(|(ix, entry)| {
+                        let is_active = Some(ix) == active_index;
+                        let name = entry.panel.persistent_name();
+                        Button::new(("dock-tab", ix), name)
+                            .label_size(LabelSize::Small)
+                            .color(if is_active {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            })
+                            .toggle_state(is_active)
+                            .on_click(cx.listener(move |dock, _, window, cx| {
+                                dock.activate_panel(ix, window, cx);
+                            }))
+                    }))
+            });
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
             let create_resize_handle = || {
@@ -1351,11 +1388,12 @@ impl Render for Dock {
                     DockPosition::Right => this.border_l_1(),
                     DockPosition::Bottom => this.border_t_1(),
                 })
+                .children(panel_tabs)
                 .child(
                     div()
                         .map(|this| match self.position().axis() {
                             Axis::Horizontal => this.w_full().h_full(),
-                            Axis::Vertical => this.h_full().w_full(),
+                            Axis::Vertical => this.h_full().w_full().min_h_0().flex_1(),
                         })
                         .child(
                             entry

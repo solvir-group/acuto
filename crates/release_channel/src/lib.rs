@@ -203,12 +203,18 @@ impl ReleaseChannel {
     }
 
     /// Returns the display name for this [`ReleaseChannel`].
+    /// The product name shown to users: window titles, the About dialog, error
+    /// notifications.
+    ///
+    /// This is display only. The data directory is still keyed off `APP_NAME` in
+    /// the `paths` crate, which is deliberately left as-is so the fork keeps using
+    /// its existing config and database rather than orphaning them.
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Zed Dev",
-            ReleaseChannel::Nightly => "Zed Nightly",
-            ReleaseChannel::Preview => "Zed Preview",
-            ReleaseChannel::Stable => "Zed",
+            ReleaseChannel::Dev => "Acuto Dev",
+            ReleaseChannel::Nightly => "Acuto Nightly",
+            ReleaseChannel::Preview => "Acuto Preview",
+            ReleaseChannel::Stable => "Acuto",
         }
     }
 

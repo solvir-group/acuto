@@ -3405,6 +3405,53 @@ impl Pane {
             })
     }
 
+    /// Rendered in place of an empty pane while a project is open.
+    ///
+    /// Upstream leaves this blank - the placeholder is an empty div - so closing
+    /// the last tab leaves nothing to act on.
+    ///
+    /// Actions are dispatched by name through the global registry because
+    /// `workspace` does not depend on the crates that own them, and taking those
+    /// dependencies for four buttons would pull large subtrees into its rebuild
+    /// graph. `build_action` returns a `Result`, so an action renamed upstream
+    /// degrades to a logged warning and a dead button rather than a panic.
+    fn render_launchpad(&self) -> impl IntoElement {
+        fn entry(id: &'static str, label: &'static str, action_name: &'static str) -> Button {
+            Button::new(id, label).full_width().on_click(
+                move |_, window, cx: &mut App| {
+                    if let Some(action) = cx.build_action(action_name, None).log_err() {
+                        window.dispatch_action(action, cx);
+                    }
+                },
+            )
+        }
+
+        v_flex()
+            .w_64()
+            .gap_1()
+            .child(
+                Label::new("Start something")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(entry("launchpad-file", "Open a File", "file_finder::Toggle"))
+            .child(entry(
+                "launchpad-terminal",
+                "New Terminal",
+                "terminal_panel::Toggle",
+            ))
+            .child(entry(
+                "launchpad-agent",
+                "New Agent Thread",
+                "agent::NewThread",
+            ))
+            .child(entry(
+                "launchpad-git",
+                "Git Status",
+                "git_panel::ToggleFocus",
+            ))
+    }
+
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Pane>) -> AnyElement {
         if self.workspace.upgrade().is_none() {
             return gpui::Empty.into_any();
@@ -4571,7 +4618,7 @@ impl Render for Pane {
                                     },
                                 ));
                             if has_worktrees || !self.should_display_welcome_page {
-                                placeholder
+                                placeholder.items_center().child(self.render_launchpad())
                             } else {
                                 if self.welcome_page.is_none() {
                                     let workspace = self.workspace.clone();
