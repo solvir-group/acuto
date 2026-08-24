@@ -947,6 +947,17 @@ impl TitleBar {
                         }
                     }),
             )
+            .child(
+                IconButton::new("title-bar-agent", IconName::Chat)
+                    .tooltip(Tooltip::text("Agent Panel"))
+                    .icon_size(IconSize::Small)
+                    .on_click(move |_, window, cx| {
+                        if let Some(action) = cx.build_action("agent::ToggleFocus", None).log_err()
+                        {
+                            window.dispatch_action(action, cx);
+                        }
+                    }),
+            )
     }
 
     fn render_worktree_and_branch(

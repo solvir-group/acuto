@@ -18,8 +18,9 @@ use git;
 use git::status::GitSummary;
 use git_ui_core::file_diff_view::FileDiffView;
 use gpui::{
-    Action, AnyElement, App, AsyncWindowContext, Bounds, ClipboardEntry as GpuiClipboardEntry,
-    ClipboardItem, Context, CursorStyle, DismissEvent, Div, DragMoveEvent, Entity, EventEmitter,
+    Action, AnyElement, App, AsyncWindowContext, Bounds, ClickEvent,
+    ClipboardEntry as GpuiClipboardEntry, ClipboardItem, Context, CursorStyle, DismissEvent, Div,
+    DragMoveEvent, Entity, EventEmitter,
     ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, FontWeight, Hsla,
     InteractiveElement, KeyContext, ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, ParentElement,
@@ -6363,6 +6364,41 @@ impl ProjectPanel {
                                         .into_any_element(),
                                 ),
                             })
+                    })
+                    // Directories get an affordance on hover for creating something
+                    // inside them, so it does not require finding the folder in the
+                    // right-click menu first.
+                    .when(kind.is_dir() && !show_editor, |this| {
+                        this.child(
+                            div()
+                                // Pushed to the trailing edge of the row rather than
+                                // sitting against the folder name.
+                                .ml_auto()
+                                .child(
+                                    IconButton::new(
+                                        ("new-in-folder", entry_id.to_usize()),
+                                        IconName::Plus,
+                                    )
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .visible_on_hover(GROUP_NAME)
+                                    .tooltip(Tooltip::text("New…"))
+                                    .on_click(cx.listener(
+                                        move |this, event: &ClickEvent, window, cx| {
+                                            // Open the entry menu so the choice
+                                            // between file and folder is the user's,
+                                            // rather than assuming a new file.
+                                            this.selection = Some(selection);
+                                            this.deploy_context_menu(
+                                                event.position(),
+                                                entry_id,
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                                ),
+                        )
                     })
                     .on_secondary_mouse_down(cx.listener(
                         move |this, event: &MouseDownEvent, window, cx| {

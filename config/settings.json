@@ -37,7 +37,7 @@
 
   // Agent panel: sans for responses, mono for user messages, matching the editor.
   "agent_ui_font_family": "Inter",
-  "agent_buffer_font_family": "JetBrains Mono",
+  "agent_buffer_font_family": "Inter",
 
   // UNSTABLE upstream ("expect many elements to be broken"). It is the single
   // biggest lever on density. FIRST THING TO REMOVE if the UI looks wrong.
@@ -61,11 +61,22 @@
   },
 
   "agent": {
-    "dock": "right"
+    "dock": "right",
+    // Composer height. Default is 4 lines.
+    "message_editor_min_lines": 2
   },
 
   "terminal": {
     "dock": "bottom",
+    // Git Bash rather than PowerShell: no logo/copyright banner on every new
+    // terminal, and a POSIX shell. cmd.exe is the other native option but is
+    // noisier. pwsh (PowerShell 7) is not installed on this machine.
+    "shell": {
+      "with_arguments": {
+        "program": "C:/Program Files/Git/bin/bash.exe",
+        "args": ["-i"]
+      }
+    },
     "font_family": "JetBrains Mono",
     "font_size": 14,
     "line_height": { "custom": 1.5 }

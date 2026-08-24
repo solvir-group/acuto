@@ -6293,11 +6293,14 @@ impl GitPanel {
             .child(SplitButton::new(
                 ButtonLike::new_rounded_left(format!("split-button-left-{}", title))
                     .layer(ElevationIndex::ModalSurface)
-                    .size(ButtonSize::Compact)
+                    // Commit is the primary action in this panel and reads as such:
+                    // a solid, tinted button at full size rather than a compact
+                    // subtle one competing with everything around it.
+                    .style(ButtonStyle::Tinted(TintColor::Accent))
+                    .size(ButtonSize::Default)
                     .disabled(!can_commit || self.modal_open)
                     .child(
                         Label::new(title)
-                            .size(LabelSize::Small)
                             .color(label_color)
                             .mr_0p5(),
                     )

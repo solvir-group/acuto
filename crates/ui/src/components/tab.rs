@@ -144,25 +144,33 @@ impl RenderOnce for Tab {
         self.div
             .h(Tab::container_height(cx))
             .bg(tab_bg)
-            .border_color(cx.theme().colors().border)
-            .map(|this| match self.position {
-                TabPosition::First => {
-                    if self.selected {
-                        this.pl_px().border_r_1().pb_px()
-                    } else {
-                        this.pl_px().pr_px().border_b_1()
-                    }
+            // VSCode-style rather than the previous Chrome-style skirts: essentially
+            // square, with a small radius on the top corners only and an accent rule
+            // along the top edge of the active tab.
+            //
+            // `border_color` applies to every edge at once, so the two states set it
+            // separately instead of sharing one value: the active tab needs an accent
+            // top and no bottom, the inactive tabs need a neutral separator and
+            // underline.
+            .map(|this| {
+                // Retain the original per-position pixel alignment so the first and
+                // last tabs still sit flush against the ends of the strip.
+                let this = match self.position {
+                    TabPosition::First => this.pl_px(),
+                    TabPosition::Last => this.pr_px(),
+                    TabPosition::Middle(_) => this,
+                };
+
+                if self.selected {
+                    // No coloured indicator: the active tab is distinguished by its
+                    // fill matching the editor surface and by having no bottom
+                    // border, so it merges into the editor below.
+                    this.rounded_t_sm()
+                } else {
+                    this.border_r_1()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
                 }
-                TabPosition::Last => {
-                    if self.selected {
-                        this.border_l_1().border_r_1().pb_px()
-                    } else {
-                        this.pl_px().border_b_1().border_r_1()
-                    }
-                }
-                TabPosition::Middle(Ordering::Equal) => this.border_l_1().border_r_1().pb_px(),
-                TabPosition::Middle(Ordering::Less) => this.border_l_1().pr_px().border_b_1(),
-                TabPosition::Middle(Ordering::Greater) => this.border_r_1().pl_px().border_b_1(),
             })
             .cursor_pointer()
             .child(

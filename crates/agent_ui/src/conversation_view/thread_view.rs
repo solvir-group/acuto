@@ -4340,8 +4340,6 @@ impl ThreadView {
         }
 
         let focus_handle = self.message_editor.focus_handle(cx);
-        let editor_bg_color = cx.theme().colors().editor_background;
-
         let editor_expanded = self.editor_expanded;
         let (expand_icon, expand_tooltip) = if editor_expanded {
             (IconName::Minimize, "Minimize Message Editor")
@@ -4357,8 +4355,9 @@ impl ThreadView {
         let fills_container = editor_expanded;
 
         h_flex()
-            .py_2()
-            .bg(editor_bg_color)
+            .p_2()
+            // The strip behind the composer belongs to the panel, not the editor.
+            .bg(cx.theme().colors().panel_background)
             .justify_center()
             .on_action(cx.listener(Self::handle_message_editor_move_up))
             .map(|this| {
@@ -4381,24 +4380,37 @@ impl ThreadView {
                     .when(max_content_width.is_none(), |this| this.w_full())
                     .min_w_0()
                     .when(fills_container, |this| this.h_full())
-                    .px_2()
+                    // The box wraps this container rather than the editor alone,
+                    // so the send button, model selector and context controls sit
+                    // inside the input instead of floating beneath it.
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .rounded_md()
+                    // Not editor_background: the composer should read as a raised
+                    // surface on the panel, not a black hole punched into it.
+                    .bg(cx.theme().colors().element_background)
+                    .p_2()
                     .flex_shrink_1()
                     .flex_grow_0()
                     .justify_between()
-                    .gap_2()
+                    .gap_1p5()
                     .child(
                         v_flex()
                             .relative()
                             .w_full()
-                            .min_h_0()
-                            .when(fills_container, |this| this.flex_1())
-                            // The composer is a discrete rectangular input rather
-                            // than text sitting under a divider.
-                            .border_1()
-                            .border_color(cx.theme().colors().border)
-                            .rounded_md()
-                            .bg(editor_bg_color)
-                            .p_2()
+                            // min_h_0 only applies when this is also flexing; on its
+                            // own it lets the editor collapse to nothing. When not
+                            // flexing the editor needs an explicit floor, because the
+                            // centred empty state shrinks it to its content and the
+                            // content resolves to zero height - which left the
+                            // composer as a strip of buttons with no visible input.
+                            .map(|this| {
+                                if fills_container {
+                                    this.min_h_0().flex_1()
+                                } else {
+                                    this.min_h(px(52.))
+                                }
+                            })
                             .child(self.message_editor.clone())
                             .when(has_messages, |this| {
                                 this.child(
@@ -6217,13 +6229,19 @@ impl ThreadView {
                             .relative()
                             .child(
                                 div()
-                                    .py_3()
+                                    .py_1p5()
                                     .px_2()
-                                    .rounded_md()
-                                    .bg(cx.theme().colors().editor_background)
-                                    .border_1()
+                                    // No bubble. A user message reads as plain text
+                                    // in the transcript; the box and background only
+                                    // appear while editing, where they communicate an
+                                    // active input rather than decorating every turn.
+                                    .when(is_editable && editing, |this| {
+                                        this.rounded_md()
+                                            .border_1()
+                                            .bg(cx.theme().colors().element_background)
+                                    })
                                     .when(is_indented, |this| {
-                                        this.py_2().px_2().when(opaque_window, |this| {
+                                        this.py_1().px_2().when(opaque_window, |this| {
                                             this.shadow_sm()
                                         })
                                     })
