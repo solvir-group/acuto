@@ -330,6 +330,10 @@ impl Render for TitleBar {
                                 )
                         })
                 })
+                // Appended inside this group rather than pushed as a new child:
+                // `children` is an ArrayVec<_, 5> with 4 pushes already, so a
+                // fifth would fill it exactly and panic if upstream ever adds one.
+                .child(self.render_title_bar_tools())
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .into_any_element(),
         );
@@ -907,6 +911,42 @@ impl TitleBar {
                 },
             )
             .anchor(gpui::Anchor::TopLeft)
+    }
+
+    /// Git and terminal controls in the title bar.
+    ///
+    /// Actions are dispatched by name through the global registry rather than by
+    /// importing `git_ui` and `terminal_view`. Neither is a dependency of this
+    /// crate, and adding them would pull two large subtrees into its rebuild
+    /// graph for the sake of two buttons. `build_action` returns a `Result`, so
+    /// an action that is renamed upstream degrades to a logged warning and a
+    /// dead button rather than a panic.
+    fn render_title_bar_tools(&self) -> impl IntoElement {
+        h_flex()
+            .gap_0p5()
+            .child(
+                IconButton::new("title-bar-git", IconName::GitBranch)
+                    .tooltip(Tooltip::text("Git Panel"))
+                    .icon_size(IconSize::Small)
+                    .on_click(move |_, window, cx| {
+                        if let Some(action) = cx.build_action("git_panel::ToggleFocus", None).log_err()
+                        {
+                            window.dispatch_action(action, cx);
+                        }
+                    }),
+            )
+            .child(
+                IconButton::new("title-bar-terminal", IconName::Terminal)
+                    .tooltip(Tooltip::text("Terminal"))
+                    .icon_size(IconSize::Small)
+                    .on_click(move |_, window, cx| {
+                        if let Some(action) =
+                            cx.build_action("terminal_panel::Toggle", None).log_err()
+                        {
+                            window.dispatch_action(action, cx);
+                        }
+                    }),
+            )
     }
 
     fn render_worktree_and_branch(

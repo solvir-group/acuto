@@ -28,9 +28,12 @@
   // without editing this file again. Test Söhne Mono to return later.
   "buffer_font_family": "JetBrains Mono",
   "buffer_font_fallbacks": ["Cascadia Mono", "Consolas"],
-  "buffer_font_size": 13,
+  "buffer_font_size": 14,
   "buffer_font_weight": 400,
-  "buffer_line_height": { "custom": 1.75 },
+  // 1.75 was the original spec value, but JetBrains Mono has a tall x-height
+  // and is drawn around ~1.2. At 1.75 the glyphs sit in very sparse rows and
+  // read as horizontally squashed even though advance width is unchanged.
+  "buffer_line_height": { "custom": 1.5 },
 
   // Agent panel: sans for responses, mono for user messages, matching the editor.
   "agent_ui_font_family": "Inter",
@@ -64,8 +67,8 @@
   "terminal": {
     "dock": "bottom",
     "font_family": "JetBrains Mono",
-    "font_size": 13,
-    "line_height": { "custom": 1.75 }
+    "font_size": 14,
+    "line_height": { "custom": 1.5 }
   },
 
   // -------------------------------------------------------------------- chrome
