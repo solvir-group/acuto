@@ -1,14 +1,51 @@
 [
   // Fork keymap. Copied to <data-dir>\config\keymap.json by config\apply.ps1.
-  // Hot-reloads. Layout presets (Phase 4) will extend this file.
+  // Hot-reloads - no rebuild.
+
   {
     // Upstream binds assistant::InlineAssist to ctrl-enter in the editor and to
     // ctrl-i in the terminal. This adds ctrl-i in the editor as well so the
     // inline chat opens at the caret with the same key everywhere.
-    // Context mirrors upstream's editor binding exactly.
     "context": "!AcpThread > Editor && mode == full",
     "bindings": {
       "ctrl-i": "assistant::InlineAssist"
+    }
+  },
+
+  {
+    // ---------------------------------------------------------- layout presets
+    //
+    // Dock toggles are state-dependent, so chaining them blind gives different
+    // results depending on what was already open. workspace::CloseAllDocks is
+    // deterministic, so every preset normalises to "all docks closed" first and
+    // then opens exactly what it wants. That makes the whole thing reproducible
+    // from any starting state without a line of Rust.
+    //
+    // Panel-specific ToggleFocus actions are used rather than ToggleLeftDock /
+    // ToggleRightDock, because a dock reopens whichever panel was last active in
+    // it - and git_panel also defaults to the right dock, so ToggleRightDock
+    // could surface git instead of the agent.
+    //
+    // Each chain ends on alt-1 (ActivatePane 0) to leave focus in the editor
+    // rather than in whichever panel opened last.
+    "context": "Workspace",
+    "bindings": {
+      // primitive, and useful on its own
+      "alt-shift-0": "workspace::CloseAllDocks",
+
+      // preset: default - tree left, editor centre, agent right, terminal bottom
+      "alt-shift-1": [
+        "workspace::SendKeystrokes",
+        "alt-shift-0 ctrl-shift-e ctrl-shift-/ ctrl-` alt-1"
+      ],
+
+      // preset: focus - editor only, everything else hidden
+      "alt-shift-2": "workspace::CloseAllDocks"
+
+      // preset: split - editor left full-height, terminal top-right, agent
+      // bottom-right. NOT BOUND YET. Docks cannot express it: there is one dock
+      // per edge showing one panel at a time, so "terminal top-right AND agent
+      // bottom-right" is pane-group geometry, not dock state. Needs Rust.
     }
   }
 ]

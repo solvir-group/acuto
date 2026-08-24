@@ -89,6 +89,9 @@
   },
 
   "title_bar": {
+    // File / Edit / Selection / View / Go / Run / Window / Help, always visible
+    // in the title bar instead of collapsed behind the hamburger. Off upstream.
+    "show_menus": true,
     "show_branch_name": true,
     "show_branch_status_icon": true,
     "show_worktree_name": true,
