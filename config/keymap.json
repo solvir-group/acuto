@@ -1,0 +1,14 @@
+[
+  // Fork keymap. Copied to <data-dir>\config\keymap.json by config\apply.ps1.
+  // Hot-reloads. Layout presets (Phase 4) will extend this file.
+  {
+    // Upstream binds assistant::InlineAssist to ctrl-enter in the editor and to
+    // ctrl-i in the terminal. This adds ctrl-i in the editor as well so the
+    // inline chat opens at the caret with the same key everywhere.
+    // Context mirrors upstream's editor binding exactly.
+    "context": "!AcpThread > Editor && mode == full",
+    "bindings": {
+      "ctrl-i": "assistant::InlineAssist"
+    }
+  }
+]

@@ -1,9 +1,106 @@
 {
-  // Phase 2: theme selection only. Fonts, docks, density and the rest land in Phase 3.
-  // Copied into <data-dir>\config\settings.json by config\apply.ps1. Hot-reloads.
+  // Fork settings. Source of truth lives here; config\apply.ps1 copies this into
+  // <data-dir>\config\settings.json. Hot-reloads - no rebuild, no restart.
+
   "theme": {
     "mode": "dark",
     "dark": "Monochrome Dark",
     "light": "Monochrome Dark"
+  },
+
+  // ---------------------------------------------------------------- typography
+  //
+  // THE REM TRAP: ui_font_size is the rem base for ALL chrome, not the size of
+  // chrome labels. Body UI text is 0.825rem (crates/ui/src/styles/typography.rs).
+  // 15.5 * 0.825 = 12.8px labels, which is the 12.5-13px the spec asks for.
+  // Setting this to 13 would give ~10.7px and shrink the entire UI.
+  "ui_font_family": "Test Söhne",
+  "ui_font_fallbacks": ["Inter", "Segoe UI Variable", "Segoe UI"],
+  "ui_font_size": 15.5,
+  "ui_font_weight": 400,
+
+  "buffer_font_family": "Test Söhne Mono",
+  "buffer_font_fallbacks": ["Cascadia Mono", "Consolas"],
+  "buffer_font_size": 13,
+  "buffer_font_weight": 400,
+  "buffer_line_height": { "custom": 1.75 },
+
+  // Agent panel: sans for responses, mono for user messages, matching the editor.
+  "agent_ui_font_family": "Test Söhne",
+  "agent_buffer_font_family": "Test Söhne Mono",
+
+  // UNSTABLE upstream ("expect many elements to be broken"). It is the single
+  // biggest lever on density. FIRST THING TO REMOVE if the UI looks wrong.
+  "unstable.ui_density": "compact",
+
+  // ------------------------------------------------------------------- layout
+  // default preset: tree left, editor centre, agent right, terminal bottom.
+  "project_panel": {
+    "dock": "left",
+    "default_width": 240,
+    "entry_spacing": "standard",
+    "indent_size": 20,
+    "file_icons": true,
+    "folder_icons": true,
+    "git_status": true,
+    "git_status_indicator": false,
+    "diagnostic_badges": false,
+    "indent_guides": { "show": "never" },
+    "auto_fold_dirs": true,
+    "bold_folder_labels": false
+  },
+
+  "agent": {
+    "dock": "right"
+  },
+
+  "terminal": {
+    "dock": "bottom",
+    "font_family": "Test Söhne Mono",
+    "font_size": 13,
+    "line_height": { "custom": 1.75 }
+  },
+
+  // -------------------------------------------------------------------- chrome
+  "tab_bar": {
+    "show": true,
+    "show_nav_history_buttons": false,
+    "show_tab_bar_buttons": false
+  },
+
+  "tabs": {
+    "file_icons": false,
+    "git_status": false,
+    "show_close_button": "hover",
+    "close_position": "right"
+  },
+
+  // Breadcrumbs stay: they carry position information. The rest is chrome that
+  // duplicates the command palette.
+  "toolbar": {
+    "breadcrumbs": true,
+    "quick_actions": false,
+    "selections_menu": false,
+    "code_actions": false
+  },
+
+  "title_bar": {
+    "show_branch_name": true,
+    "show_branch_status_icon": true,
+    "show_worktree_name": true,
+    "show_project_items": true,
+    "show_onboarding_banner": false,
+    "show_user_picture": false
+  },
+
+  // Spec: branch, LSP, cursor position, focus timer, layout preset switcher.
+  // Focus timer and preset switcher do not exist yet - they are Rust, later.
+  "status_bar": {
+    "experimental.show": true,
+    "show_active_file": false,
+    "active_language_button": false,
+    "cursor_position_button": true,
+    "line_endings_button": false,
+    "active_encoding_button": "disabled"
   }
 }
