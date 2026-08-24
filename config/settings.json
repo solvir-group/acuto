@@ -19,7 +19,11 @@
   "ui_font_size": 15.5,
   "ui_font_weight": 400,
 
-  "buffer_font_family": "Test Söhne Mono",
+  // JetBrains Mono is NOT currently installed on this machine, so this renders
+  // Cascadia Mono via the fallback until it is. DirectWrite refreshes the system
+  // font collection on a miss and retries, so installing it should take effect
+  // without editing this file again. Test Söhne Mono to return later.
+  "buffer_font_family": "JetBrains Mono",
   "buffer_font_fallbacks": ["Cascadia Mono", "Consolas"],
   "buffer_font_size": 13,
   "buffer_font_weight": 400,
@@ -27,7 +31,7 @@
 
   // Agent panel: sans for responses, mono for user messages, matching the editor.
   "agent_ui_font_family": "Test Söhne",
-  "agent_buffer_font_family": "Test Söhne Mono",
+  "agent_buffer_font_family": "JetBrains Mono",
 
   // UNSTABLE upstream ("expect many elements to be broken"). It is the single
   // biggest lever on density. FIRST THING TO REMOVE if the UI looks wrong.
@@ -56,7 +60,7 @@
 
   "terminal": {
     "dock": "bottom",
-    "font_family": "Test Söhne Mono",
+    "font_family": "JetBrains Mono",
     "font_size": 13,
     "line_height": { "custom": 1.75 }
   },
