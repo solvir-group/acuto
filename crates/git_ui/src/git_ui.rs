@@ -859,7 +859,7 @@ mod remote_button {
     use gpui::{Action, Anchor, AnyView, ClickEvent, FocusHandle};
     use ui::{
         ButtonLike, CommonAnimationExt, ContextMenu, ElevationIndex, PopoverMenu,
-        PopoverMenuHandle, SplitButton, Tooltip, prelude::*,
+        PopoverMenuHandle, SplitButton, TintColor, Tooltip, prelude::*,
     };
 
     pub fn render_fetch_button(
@@ -889,6 +889,7 @@ mod remote_button {
                     cx,
                 )
             },
+            false,
         )
     }
 
@@ -920,6 +921,7 @@ mod remote_button {
                     cx,
                 )
             },
+            true,
         )
     }
 
@@ -952,6 +954,7 @@ mod remote_button {
                     cx,
                 )
             },
+            false,
         )
     }
 
@@ -982,6 +985,7 @@ mod remote_button {
                     cx,
                 )
             },
+            false,
         )
     }
 
@@ -1012,6 +1016,7 @@ mod remote_button {
                     cx,
                 )
             },
+            false,
         )
     }
 
@@ -1088,6 +1093,9 @@ mod remote_button {
         menu_handle: PopoverMenuHandle<ContextMenu>,
         left_on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
+        // Only the primary remote action is emphasised; fetch and pull stay
+        // subtle so a single button carries the eye.
+        emphasis: bool,
     ) -> SplitButton {
         fn count(count: usize) -> impl IntoElement {
             h_flex()
@@ -1107,7 +1115,17 @@ mod remote_button {
 
         let left = ButtonLike::new_rounded_left(format!("split-button-left-{}", id))
             .layer(ElevationIndex::ModalSurface)
-            .size(ButtonSize::Compact)
+            .map(|this| {
+                if emphasis {
+                    // Push is the action worth reaching for, so it gets a solid fill
+                    // at full size. The tint resolves from the theme's status colors,
+                    // so its hue is retunable without a rebuild.
+                    this.style(ButtonStyle::Tinted(TintColor::Accent))
+                        .size(ButtonSize::Default)
+                } else {
+                    this.size(ButtonSize::Compact)
+                }
+            })
             .disabled(is_in_progress)
             .when(should_render_counts, |this| {
                 this.child(

@@ -310,7 +310,9 @@
           "diff.minus": {
             "color": "#c96a6aff"
           }
-        }
+        },
+        "info.background": "#6d4fc7ff",
+        "info.border": "#8b6ee0ff"
       }
     },
     {
@@ -620,7 +622,9 @@
           "diff.minus": {
             "color": "#cc706aff"
           }
-        }
+        },
+        "info.background": "#7357c9ff",
+        "info.border": "#9478e2ff"
       }
     },
     {
@@ -930,7 +934,9 @@
           "diff.minus": {
             "color": "#e07a7aff"
           }
-        }
+        },
+        "info.background": "#7a5cf0ff",
+        "info.border": "#a78bfaff"
       }
     }
   ]
