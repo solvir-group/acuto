@@ -4099,24 +4099,47 @@ impl AgentPanel {
             return None;
         }
 
+        let border = cx.theme().colors().border;
+        let active_bg = cx.theme().colors().panel_background;
+        let inactive_bg = cx.theme().colors().surface_background;
+
         Some(
             h_flex()
                 .w_full()
                 .flex_none()
-                .gap_1()
-                .px_2()
-                .pt_1()
-                .pb_0p5()
+                .items_end()
+                .bg(inactive_bg)
                 .border_b_1()
-                .border_color(cx.theme().colors().border_variant)
+                .border_color(border)
                 // Index rather than ThreadId for the element id: ThreadId wraps a
                 // private uuid and implements neither Display nor Into<ElementId>.
                 // The index is unique and stable within a single render.
                 .children(tabs.into_iter().enumerate().map(|(ix, (id, title, is_active))| {
-                    Button::new(("agent-thread-tab", ix), title)
-                        .label_size(LabelSize::Small)
-                        .color(if is_active { Color::Default } else { Color::Muted })
-                        .toggle_state(is_active)
+                    // Chrome-style: rounded top corners, the active tab filled to
+                    // match the panel below so it merges into it, and no bottom
+                    // border on the active tab so the seam disappears.
+                    h_flex()
+                        .id(("agent-thread-tab", ix))
+                        .min_w_0()
+                        .max_w_40()
+                        .px_2()
+                        .py_1()
+                        .gap_1()
+                        .rounded_t_md()
+                        .cursor_pointer()
+                        .map(|this| {
+                            if is_active {
+                                this.bg(active_bg)
+                            } else {
+                                this.bg(inactive_bg).hover(|s| s.bg(active_bg.opacity(0.6)))
+                            }
+                        })
+                        .child(
+                            Label::new(title)
+                                .size(LabelSize::Small)
+                                .color(if is_active { Color::Default } else { Color::Muted })
+                                .single_line(),
+                        )
                         .on_click(cx.listener(move |panel, _, window, cx| {
                             panel.activate_retained_thread(id, true, window, cx);
                         }))

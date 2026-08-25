@@ -43,6 +43,11 @@
   // biggest lever on density. FIRST THING TO REMOVE if the UI looks wrong.
   "unstable.ui_density": "compact",
 
+  // Panel toggles close the panel when it is already focused, instead of only
+  // moving focus back to the editor. Makes the title bar chat icon a real
+  // on/off toggle rather than an "open" button.
+  "close_panel_on_toggle": true,
+
   // ------------------------------------------------------------------- layout
   // default preset: tree left, editor centre, agent right, terminal bottom.
   "project_panel": {
@@ -63,7 +68,10 @@
   "agent": {
     "dock": "right",
     // Composer height. Default is 4 lines.
-    "message_editor_min_lines": 2
+    "message_editor_min_lines": 2,
+    // Fixed rather than filling the panel: the composer keeps a constant width
+    // as the sidebar is resized, so it does not reflow while typing.
+    "max_content_width": 420
   },
 
   "terminal": {
@@ -126,6 +134,7 @@
     "show_branch_status_icon": true,
     "show_worktree_name": true,
     "show_project_items": true,
+    "show_sign_in": false,
     "show_onboarding_banner": false,
     "show_user_picture": false
   },
