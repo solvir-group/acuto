@@ -2915,16 +2915,17 @@ impl Terminal {
                                 .map(|name| name.to_string_lossy().into_owned())
                                 .unwrap_or_default();
 
-                            let argv = fpi.argv.as_slice();
-                            let process_name = format!(
-                                "{}{}",
-                                fpi.name,
-                                if !argv.is_empty() {
-                                    format!(" {}", (argv[1..]).join(" "))
-                                } else {
-                                    "".to_string()
-                                }
-                            );
+                            // Just the process, without its arguments. Shells are
+                            // launched with flags and an inline profile command,
+                            // and appending argv made every tab read
+                            // "powershell.exe -NoLogo -NoExit -Command ..." which
+                            // then truncated to something unreadable. The trailing
+                            // .exe carries no information either.
+                            let process_name = fpi
+                                .name
+                                .strip_suffix(".exe")
+                                .unwrap_or(&fpi.name)
+                                .to_string();
                             let (process_file, process_name) = if truncate {
                                 (
                                     truncate_and_trailoff(&process_file, MAX_CHARS),

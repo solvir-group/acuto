@@ -48,6 +48,33 @@
   // on/off toggle rather than an "open" button.
   "close_panel_on_toggle": true,
 
+  // ------------------------------------------------------------ language models
+  //
+  // Provider wiring only - NO API KEY HERE. This file is committed and pushed,
+  // and a key in git history survives deleting the line. Zed stores provider keys
+  // in the OS credential store; paste it once into the agent panel's provider
+  // setup instead.
+  //
+  // Note: NVIDIA's `chat_template_kwargs: {enable_thinking: true}` and the
+  // `reasoning_content` delta field are vendor extensions. Zed's OpenAI-compatible
+  // provider neither sends nor reads them, so the model runs without its
+  // reasoning stream surfaced.
+  "language_models": {
+    "openai_compatible": {
+      "NVIDIA": {
+        "api_url": "https://integrate.api.nvidia.com/v1",
+        "available_models": [
+          {
+            "name": "nvidia/nemotron-3-super-120b-a12b",
+            "display_name": "Nemotron 3 Super 120B",
+            "max_tokens": 16384,
+            "max_output_tokens": 16384
+          }
+        ]
+      }
+    }
+  },
+
   // ------------------------------------------------------------------- layout
   // default preset: tree left, editor centre, agent right, terminal bottom.
   "project_panel": {

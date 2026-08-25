@@ -1,4 +1,5 @@
 pub mod items;
+pub mod problems_panel;
 mod toolbar_controls;
 
 mod buffer_diagnostics;
@@ -165,7 +166,7 @@ impl ProjectDiagnosticsEditor {
         workspace.register_action(Self::deploy);
     }
 
-    fn new(
+    pub(crate) fn new(
         include_warnings: bool,
         project_handle: Entity<Project>,
         workspace: WeakEntity<Workspace>,

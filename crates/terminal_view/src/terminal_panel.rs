@@ -126,7 +126,9 @@ impl TerminalPanel {
     ) {
         let assistant_enabled = self.assistant_enabled;
         terminal_pane.update(cx, |pane, cx| {
-            pane.set_render_tab_bar_buttons(cx, move |pane, window, cx| {
+            // window is unused since the focus guard was removed; every remaining
+            // reference below is a closure parameter that shadows it.
+            pane.set_render_tab_bar_buttons(cx, move |pane, _window, cx| {
                 let split_context = pane
                     .active_item()
                     .and_then(|item| item.downcast::<TerminalView>())
