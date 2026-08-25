@@ -2031,7 +2031,11 @@ impl Render for MessageEditor {
                 EditorElement::new(
                     &self.editor,
                     EditorStyle {
-                        background: cx.theme().colors().editor_background,
+                        // Transparent rather than editor_background: the composer
+                        // sits inside a container that paints its own surface, and
+                        // an opaque editor background punched a black rectangle into
+                        // it regardless of the active theme.
+                        background: gpui::transparent_black(),
                         local_player: cx.theme().players().local(),
                         text: text_style,
                         syntax: cx.theme().syntax().clone(),

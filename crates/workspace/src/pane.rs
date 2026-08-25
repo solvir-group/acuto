@@ -4301,9 +4301,10 @@ fn default_render_tab_bar_buttons(
     window: &mut Window,
     cx: &mut Context<Pane>,
 ) -> (Option<AnyElement>, Option<AnyElement>) {
-    if !pane.has_focus(window, cx) && !pane.context_menu_focused(window, cx) {
-        return (None, None);
-    }
+    // Upstream hides these until the pane takes focus, so the new-file and split
+    // controls only appear after clicking the tab bar - which makes them
+    // undiscoverable, and makes the bar shift as focus moves between panes.
+    // They are permanent affordances here.
     let (can_clone, can_split_move) = match pane.active_item() {
         Some(active_item) if active_item.can_split(cx) => (true, false),
         Some(_) => (false, pane.items_len() > 1),
