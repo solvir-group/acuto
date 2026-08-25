@@ -4298,7 +4298,9 @@ impl Pane {
 
 fn default_render_tab_bar_buttons(
     pane: &mut Pane,
-    window: &mut Window,
+    // Unused since the focus guard was removed: every remaining reference to a
+    // window inside this function is a closure parameter that shadows this one.
+    _window: &mut Window,
     cx: &mut Context<Pane>,
 ) -> (Option<AnyElement>, Option<AnyElement>) {
     // Upstream hides these until the pane takes focus, so the new-file and split
@@ -4315,10 +4317,22 @@ fn default_render_tab_bar_buttons(
     let right_children = h_flex()
         // Instead we need to replicate the spacing from the [TabBar]'s `end_slot` here.
         .gap(DynamicSpacing::Base04.rems(cx))
+        // `+` opens a Launchpad tab rather than an untitled buffer, so the next
+        // thing you do is a choice instead of an assumption that you want to type
+        // code. The full New… menu is still on the chevron beside it.
+        .child(
+            IconButton::new("new-tab", IconName::Plus)
+                .icon_size(IconSize::Small)
+                .tooltip(Tooltip::text("New Tab"))
+                .on_click(cx.listener(|pane, _, window, cx| {
+                    let launchpad = cx.new(|cx| crate::launchpad::Launchpad::new(cx));
+                    pane.add_item(Box::new(launchpad), true, true, None, window, cx);
+                })),
+        )
         .child(
             PopoverMenu::new("pane-tab-bar-popover-menu")
                 .trigger_with_tooltip(
-                    IconButton::new("plus", IconName::Plus).icon_size(IconSize::Small),
+                    IconButton::new("more-new", IconName::ChevronDown).icon_size(IconSize::Small),
                     Tooltip::text("New…"),
                 )
                 .anchor(Anchor::TopRight)

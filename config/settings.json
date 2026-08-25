@@ -74,7 +74,9 @@
     "shell": {
       "with_arguments": {
         "program": "C:/Program Files/Git/bin/bash.exe",
-        "args": ["-i"]
+        // --rcfile scopes our shell setup to Acuto's terminal only; the rc file
+        // sources ~/.bashrc first, so the user's own config still applies.
+        "args": ["--rcfile", "C:/Users/broad/zed-fork-data/config/acuto.bashrc", "-i"]
       }
     },
     "font_family": "JetBrains Mono",

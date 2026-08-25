@@ -4389,11 +4389,13 @@ impl ThreadView {
                     // Not editor_background: the composer should read as a raised
                     // surface on the panel, not a black hole punched into it.
                     .bg(cx.theme().colors().element_background)
-                    .p_2()
+                    // Tight padding: the composer should not take more vertical
+                    // space than the text it holds plus its controls.
+                    .p_1p5()
                     .flex_shrink_1()
                     .flex_grow_0()
                     .justify_between()
-                    .gap_1p5()
+                    .gap_1()
                     .child(
                         v_flex()
                             .relative()
@@ -5506,7 +5508,7 @@ impl ThreadView {
         PopoverMenu::new("add-context-menu")
             .trigger_with_tooltip(
                 IconButton::new("add-context", IconName::Plus)
-                    .icon_size(IconSize::Small)
+                    .icon_size(IconSize::Medium)
                     .icon_color(Color::Muted),
                 {
                     move |_window, cx| {
