@@ -74,7 +74,7 @@ use fs::Fs;
 use futures::FutureExt as _;
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem,
-    Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
+    Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, MouseButton, Pixels,
     PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, prelude::*,
     pulsating_between,
 };
@@ -91,7 +91,7 @@ use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
+    ContextMenu, ContextMenuEntry, GradientFade, IconButton, Indicator, KeyBinding, PopoverMenu,
     PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
 };
 use util::ResultExt as _;
@@ -1166,6 +1166,14 @@ pub struct AgentPanel {
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
+    /// Ordered list backing the thread tab strip.
+    ///
+    /// `retained_threads` cannot serve as the tab model: it is a `HashMap`, so
+    /// its iteration order changes between renders, and `cleanup_retained_threads`
+    /// evicts idle entries behind the user's back. A tab must stay where it was
+    /// put and disappear only when the user closes it, so the strip keeps its own
+    /// explicit order and the eviction pass skips anything listed here.
+    thread_tabs: Vec<ThreadId>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1543,7 +1551,10 @@ impl AgentPanel {
             &ThreadMetadataStore::global(cx),
             |this, _store, event, cx| {
                 let ThreadMetadataStoreEvent::ThreadArchived(thread_id) = event;
-                if this.retained_threads.remove(thread_id).is_some() {
+                let was_retained = this.retained_threads.remove(thread_id).is_some();
+                let was_tab = this.thread_tabs.contains(thread_id);
+                this.thread_tabs.retain(|id| id != thread_id);
+                if was_retained || was_tab {
                     cx.notify();
                 }
             },
@@ -1568,6 +1579,7 @@ impl AgentPanel {
             context_server_registry,
             draft_thread: None,
             retained_threads: HashMap::default(),
+            thread_tabs: Vec::new(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
             new_thread_menu_handle: PopoverMenuHandle::default(),
@@ -4076,31 +4088,146 @@ impl AgentPanel {
     ///
     /// Rendered only when more than one thread exists, since a single tab is
     /// noise.
-    fn render_thread_tabs(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let active_id = self
-            .active_conversation_view()
-            .map(|view| view.read(cx).thread_id);
+    /// Finds a tab's conversation view wherever it currently lives.
+    ///
+    /// A live thread sits in exactly one of three places, and which one changes
+    /// as the panel shuffles threads between the ephemeral draft slot and the
+    /// retained map, so every tab operation has to check all three.
+    fn conversation_view_for_tab(
+        &self,
+        id: &ThreadId,
+        cx: &App,
+    ) -> Option<&Entity<ConversationView>> {
+        if let Some(view) = self.active_conversation_view()
+            && view.read(cx).thread_id == *id
+        {
+            return Some(view);
+        }
+        if let Some(draft) = &self.draft_thread
+            && draft.read(cx).thread_id == *id
+        {
+            return Some(draft);
+        }
+        self.retained_threads.get(id)
+    }
 
-        let mut tabs: Vec<(ThreadId, SharedString, bool)> = Vec::new();
-        if let Some(view) = self.active_conversation_view() {
-            let view = view.read(cx);
-            tabs.push((view.thread_id, view.title(cx), true));
-        }
-        for view in self.retained_threads.values() {
-            let view = view.read(cx);
-            let id = view.thread_id;
-            if Some(id) == active_id {
-                continue;
+    /// Drops tab entries whose thread no longer exists anywhere in the panel.
+    ///
+    /// Threads can vanish through paths the strip does not own — history
+    /// archival, the ephemeral-draft slot being recycled underneath a thread —
+    /// so rather than hooking every one of them, the strip re-verifies its
+    /// entries against the three places a live thread can be before it draws.
+    fn prune_thread_tabs(&mut self, cx: &App) {
+        let active = self.active_thread_id(cx);
+        let draft = self.draft_thread.as_ref().map(|draft| draft.read(cx).thread_id);
+        let retained = &self.retained_threads;
+        let kept = self
+            .thread_tabs
+            .iter()
+            .copied()
+            .filter(|id| {
+                Some(*id) == active || Some(*id) == draft || retained.contains_key(id)
+            })
+            .collect::<Vec<_>>();
+        self.thread_tabs = kept;
+    }
+
+    /// Closes one thread tab, activating a neighbour if the closed tab was the
+    /// active one.
+    pub fn close_thread_tab(&mut self, id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.thread_tabs.iter().position(|tab| *tab == id) else {
+            return;
+        };
+
+        let was_active = self.active_thread_id(cx) == Some(id);
+        self.thread_tabs.remove(index);
+
+        // Closing the active tab moves to the tab on its right, falling back to
+        // the left when it was the last one — what every other tab strip in the
+        // app does.
+        let successor = if was_active {
+            self.thread_tabs
+                .get(index)
+                .or_else(|| index.checked_sub(1).and_then(|prev| self.thread_tabs.get(prev)))
+                .copied()
+        } else {
+            None
+        };
+
+        // An empty draft holds nothing worth keeping, so closing it deletes the
+        // history row too rather than leaving a blank entry behind. A thread the
+        // user actually wrote in stays in history and is only dropped from
+        // memory, so closing a tab is never destructive to real work.
+        let view = self.conversation_view_for_tab(&id, cx).cloned();
+        let is_empty_draft = self.ephemeral_draft_thread_id(cx) == Some(id)
+            && !view
+                .as_ref()
+                .is_some_and(|view| self.draft_has_content(view, cx));
+
+        if is_empty_draft {
+            self.remove_thread_without_activating_draft(id, window, cx);
+        } else {
+            self.retained_threads.remove(&id);
+            if self
+                .draft_thread
+                .as_ref()
+                .is_some_and(|draft| draft.read(cx).thread_id == id)
+            {
+                self.draft_thread = None;
+                self._draft_editor_observation = None;
             }
-            tabs.push((id, view.title(cx), false));
+            if was_active {
+                self.base_view = BaseView::Uninitialized;
+                self.refresh_base_view_subscriptions(window, cx);
+            }
         }
+
+        if let Some(successor) = successor {
+            self.activate_retained_thread(successor, true, window, cx);
+        } else if was_active {
+            // Closing the last tab lands on a fresh draft rather than an empty
+            // panel, so the strip is never left with nothing in it.
+            self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+        }
+
+        self.serialize(cx);
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+        cx.notify();
+    }
+
+    fn render_thread_tabs(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let active_id = self.active_thread_id(cx);
+        let tabs = self
+            .thread_tabs
+            .iter()
+            .filter_map(|id| {
+                let view = self.conversation_view_for_tab(id, cx)?;
+                // Whether the thread is mid-response. With several threads
+                // running at once this is the only way to tell which one is
+                // working, since only the active one shows its transcript.
+                let is_generating = view
+                    .read(cx)
+                    .root_thread_view()
+                    .is_some_and(|thread_view| {
+                        thread_view.read(cx).thread.read(cx).status() == ThreadStatus::Generating
+                    });
+                Some((
+                    *id,
+                    view.read(cx).title(cx),
+                    Some(*id) == active_id,
+                    is_generating,
+                ))
+            })
+            .collect::<Vec<_>>();
 
         if tabs.is_empty() {
             return None;
         }
 
-        let active_bg = cx.theme().colors().panel_background;
-        let inactive_bg = cx.theme().colors().surface_background;
+        let colors = cx.theme().colors();
+        let active_bg = colors.panel_background;
+        let inactive_bg = colors.surface_background;
+        let hover_bg = colors.element_hover;
 
         Some(
             h_flex()
@@ -4111,15 +4238,15 @@ impl AgentPanel {
                 // Index rather than ThreadId for the element id: ThreadId wraps a
                 // private uuid and implements neither Display nor Into<ElementId>.
                 // The index is unique and stable within a single render.
-                .children(tabs.into_iter().enumerate().map(|(ix, (id, title, is_active))| {
-                    // Chrome-style: rounded top corners, the active tab filled to
-                    // match the panel below so it merges into it, and no bottom
-                    // border on the active tab so the seam disappears.
+                .children(tabs.into_iter().enumerate().map(
+                    |(ix, (id, title, is_active, is_generating))| {
                     h_flex()
                         .id(("agent-thread-tab", ix))
+                        .group(SharedString::from(format!("agent-thread-tab-{ix}")))
                         .min_w_0()
                         .max_w_40()
-                        .px_2()
+                        .pl_2()
+                        .pr_1()
                         .py_1()
                         .gap_1()
                         .rounded_t_md()
@@ -4128,19 +4255,75 @@ impl AgentPanel {
                             if is_active {
                                 this.bg(active_bg)
                             } else {
-                                this.bg(inactive_bg).hover(|s| s.bg(active_bg.opacity(0.6)))
+                                this.bg(inactive_bg).hover(|style| style.bg(hover_bg))
                             }
                         })
+                        .when(is_generating, |this| {
+                            // Animated on a wrapping div: `opacity` comes from
+                            // `Styled`, which `Indicator` does not implement.
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .child(Indicator::dot().color(Color::Accent))
+                                    .with_animation(
+                                        ("agent-thread-tab-pulse", ix),
+                                        Animation::new(Duration::from_secs(2))
+                                            .repeat()
+                                            .with_easing(pulsating_between(0.3, 1.0)),
+                                        |this, delta| this.opacity(delta),
+                                    ),
+                            )
+                        })
                         .child(
-                            Label::new(title)
-                                .size(LabelSize::Small)
-                                .color(if is_active { Color::Default } else { Color::Muted })
-                                .single_line(),
+                            div().min_w_0().flex_1().child(
+                                Label::new(title)
+                                    .size(LabelSize::Small)
+                                    .color(if is_active { Color::Default } else { Color::Muted })
+                                    .single_line(),
+                            ),
+                        )
+                        .child(
+                            IconButton::new(("agent-thread-tab-close", ix), IconName::Close)
+                                .icon_size(IconSize::Indicator)
+                                .shape(ui::IconButtonShape::Square)
+                                // Hidden until the tab is hovered so a row of
+                                // crosses does not compete with the titles, but
+                                // always shown on the active tab, which is the
+                                // one most likely to be closed next.
+                                .when(!is_active, |this| {
+                                    this.visible_on_hover(SharedString::from(format!(
+                                        "agent-thread-tab-{ix}"
+                                    )))
+                                })
+                                .tooltip(Tooltip::text("Close Thread"))
+                                .on_click(cx.listener(move |panel, _, window, cx| {
+                                    panel.close_thread_tab(id, window, cx);
+                                })),
                         )
                         .on_click(cx.listener(move |panel, _, window, cx| {
                             panel.activate_retained_thread(id, true, window, cx);
                         }))
-                })),
+                        .on_mouse_down(
+                            MouseButton::Middle,
+                            cx.listener(move |panel, _, window, cx| {
+                                panel.close_thread_tab(id, window, cx);
+                            }),
+                        )
+                    },
+                ))
+                .child(
+                    IconButton::new("agent-thread-tab-new", IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("New Thread"))
+                        .on_click(cx.listener(|panel, _, window, cx| {
+                            panel.activate_new_thread(
+                                true,
+                                AgentThreadSource::AgentPanel,
+                                window,
+                                cx,
+                            );
+                        })),
+                ),
         )
     }
 
@@ -4256,7 +4439,12 @@ impl AgentPanel {
         let mut potential_removals = self
             .retained_threads
             .iter()
-            .filter(|(_id, view)| {
+            .filter(|(id, view)| {
+                // An open tab is a promise that the thread stays put, so it is
+                // never a candidate for idle eviction.
+                if self.thread_tabs.contains(*id) {
+                    return false;
+                }
                 let Some(thread_view) = view.read(cx).root_thread_view() else {
                     return true;
                 };
@@ -4297,6 +4485,15 @@ impl AgentPanel {
     ) {
         let old_view = std::mem::replace(&mut self.base_view, new_view);
         self.retain_running_thread(old_view, cx);
+
+        // Any thread that becomes active earns a tab, appended so the strip
+        // grows left-to-right in the order the user opened things.
+        if let BaseView::AgentThread { conversation_view } = &self.base_view {
+            let thread_id = conversation_view.read(cx).thread_id;
+            if !self.thread_tabs.contains(&thread_id) {
+                self.thread_tabs.push(thread_id);
+            }
+        }
 
         if let BaseView::AgentThread { conversation_view } = &self.base_view {
             let conversation_view = conversation_view.read(cx);
@@ -6157,6 +6354,10 @@ impl AgentPanel {
         let thread_tabs = self
             .render_thread_tabs(cx)
             .map(|tabs| tabs.into_any_element());
+        // The tab strip carries its own `+` at the end, where a tab strip's new
+        // button belongs, so the one on the far right would be a second button
+        // for the same action in the same bar.
+        let has_thread_tabs = thread_tabs.is_some();
 
         let empty_thread_title = matches!(mode, ToolbarMode::EmptyThread).then(|| {
             Label::new(format!("New {} Thread", selected_agent_label))
@@ -6224,14 +6425,16 @@ impl AgentPanel {
                         .when(can_create_entries, |this| {
                             // `+` starts a thread outright rather than opening a
                             // menu; the full New Thread... menu is on the chevron.
-                            this.child(
-                                IconButton::new("new_thread_btn", IconName::Plus)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("New Thread"))
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(NewThread.boxed_clone(), cx);
-                                    }),
-                            )
+                            this.when(!has_thread_tabs, |this| {
+                                this.child(
+                                    IconButton::new("new_thread_btn", IconName::Plus)
+                                        .icon_size(IconSize::Small)
+                                        .tooltip(Tooltip::text("New Thread"))
+                                        .on_click(|_, window, cx| {
+                                            window.dispatch_action(NewThread.boxed_clone(), cx);
+                                        }),
+                                )
+                            })
                             .child(new_thread_menu)
                         })
                         .child(full_screen_button)
@@ -6532,6 +6735,10 @@ impl AgentPanel {
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Verified once per frame rather than inside the tab strip, because
+        // `render_toolbar` — which draws the strip — only takes `&self`.
+        self.prune_thread_tabs(cx);
+
         // WARNING: Changes to this element hierarchy can have
         // non-obvious implications to the layout of children.
         //
