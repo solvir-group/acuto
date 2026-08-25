@@ -26,8 +26,8 @@
   // Cascadia Mono via the fallback until it is. DirectWrite refreshes the system
   // font collection on a miss and retries, so installing it should take effect
   // without editing this file again. Test Söhne Mono to return later.
-  "buffer_font_family": "JetBrains Mono",
-  "buffer_font_fallbacks": ["Cascadia Mono", "Consolas"],
+  "buffer_font_family": "Consolas",
+  "buffer_font_fallbacks": ["Cascadia Mono", "JetBrains Mono"],
   "buffer_font_size": 14,
   "buffer_font_weight": 400,
   // 1.75 was the original spec value, but JetBrains Mono has a tall x-height
@@ -125,7 +125,7 @@
     "env": {
       "EDITOR": "C:/Users/broad/zed/target/debug/zed.exe --user-data-dir C:/Users/broad/zed-fork-data --wait"
     },
-    "font_family": "JetBrains Mono",
+    "font_family": "Consolas",
     "font_size": 14,
     "line_height": { "custom": 1.5 }
   },
@@ -165,6 +165,38 @@
     "show_onboarding_banner": false,
     "show_user_picture": false
   },
+
+  // ------------------------------------------------------------ code autofill
+  // Inline completions ran through no provider at all before this: the enum
+  // defaults to Copilot, which was never authenticated, so nothing was ever
+  // requested. This routes them at the same NVIDIA endpoint the agent uses.
+  //
+  // Nothing here involves Zed AI. `open_ai_compatible_api` is a first-class
+  // provider, so custom models drive completions the same way a subscription
+  // would. The key comes from ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY.
+  //
+  // The model must serve fill-in-the-middle on /v1/completions - an
+  // instruct-only chat model will return nothing useful. Swap `model` if
+  // NVIDIA stops serving this one; `prompt_format` must match the model
+  // family, not the vendor.
+  "edit_predictions": {
+    "provider": "open_ai_compatible_api",
+    "open_ai_compatible_api": {
+      "api_url": "https://integrate.api.nvidia.com/v1/completions",
+      "model": "qwen/qwen2.5-coder-32b-instruct",
+      "prompt_format": "qwen",
+      "max_output_tokens": 256,
+      // Fire as soon as typing stops. The default already is 0; stated here
+      // because it is the setting most worth reaching for if completions feel
+      // like they interrupt rather than help.
+      "prediction_debounce": 0
+    }
+  },
+
+  // Display switch, separate from the provider above. Stated explicitly so a
+  // silent default can never be the reason nothing appears.
+  "show_edit_predictions": true,
+  "edit_predictions_disabled_in": [],
 
   // Spec: branch, LSP, cursor position, focus timer, layout preset switcher.
   // Focus timer and preset switcher do not exist yet - they are Rust, later.

@@ -64,7 +64,6 @@ use anyhow::{Context as _, Result, anyhow};
 use audio::{Audio, Sound};
 use chrono::{DateTime, Utc};
 use client::UserStore;
-use cloud_api_types::Plan;
 use collections::HashMap;
 use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
@@ -1154,6 +1153,10 @@ pub struct AgentPanel {
     workspace: WeakEntity<Workspace>,
     /// Workspace id is used as a database key
     workspace_id: Option<WorkspaceId>,
+    /// Retained though nothing in the fork reads it: upstream's only consumers
+    /// were the two Zed AI upsell gates, and dropping the field would widen the
+    /// rebase diff to the constructor for no gain.
+    #[allow(dead_code)]
     user_store: Entity<UserStore>,
     project: Entity<Project>,
     fs: Arc<dyn Fs>,
@@ -4244,7 +4247,10 @@ impl AgentPanel {
                         .id(("agent-thread-tab", ix))
                         .group(SharedString::from(format!("agent-thread-tab-{ix}")))
                         .min_w_0()
-                        .max_w_40()
+                        // Wider than before but with smaller text: thread
+                        // titles are sentences, so the tab needs both to show
+                        // enough of one to tell threads apart.
+                        .max_w_48()
                         .pl_2()
                         .pr_1()
                         .py_1()
@@ -4277,7 +4283,7 @@ impl AgentPanel {
                         .child(
                             div().min_w_0().flex_1().child(
                                 Label::new(title)
-                                    .size(LabelSize::Small)
+                                    .size(LabelSize::XSmall)
                                     .color(if is_active { Color::Default } else { Color::Muted })
                                     .single_line(),
                             ),
@@ -6454,32 +6460,10 @@ impl AgentPanel {
             .child(toolbar_content)
     }
 
-    fn should_render_trial_end_upsell(&self, cx: &mut Context<Self>) -> bool {
-        if TrialEndUpsell::dismissed(cx) {
-            return false;
-        }
-
-        match &self.base_view {
-            BaseView::AgentThread { .. } => {
-                if LanguageModelRegistry::global(cx)
-                    .read(cx)
-                    .default_model()
-                    .is_some_and(|model| {
-                        model.provider.id() != language_model::ZED_CLOUD_PROVIDER_ID
-                    })
-                {
-                    return false;
-                }
-            }
-            BaseView::Terminal { .. } | BaseView::Uninitialized => {
-                return false;
-            }
-        }
-
-        let plan = self.user_store.read(cx).plan();
-        let has_previous_trial = self.user_store.read(cx).trial_started_at().is_some();
-
-        plan.is_some_and(|plan| plan == Plan::ZedFree) && has_previous_trial
+    /// Always false in this fork: the trial-end upsell is removed along with
+    /// the rest of the Zed AI surface. See [`Self::should_render_new_user_onboarding`].
+    fn should_render_trial_end_upsell(&self, _cx: &mut Context<Self>) -> bool {
+        false
     }
 
     fn dismiss_ai_onboarding(&mut self, cx: &mut Context<Self>) {
@@ -6489,50 +6473,17 @@ impl AgentPanel {
         cx.notify();
     }
 
-    fn should_render_new_user_onboarding(&mut self, cx: &mut Context<Self>) -> bool {
-        if self
-            .new_user_onboarding_upsell_dismissed
-            .load(Ordering::Acquire)
-        {
-            return false;
-        }
-
-        let user_store = self.user_store.read(cx);
-
-        if user_store.plan().is_some_and(|plan| plan == Plan::ZedPro)
-            && user_store
-                .subscription_period()
-                .and_then(|period| period.0.checked_add_days(chrono::Days::new(1)))
-                .is_some_and(|date| date < chrono::Utc::now())
-        {
-            if !self
-                .new_user_onboarding_upsell_dismissed
-                .load(Ordering::Acquire)
-            {
-                self.dismiss_ai_onboarding(cx);
-            }
-            return false;
-        }
-
-        let has_configured_non_zed_providers = LanguageModelRegistry::read_global(cx)
-            .visible_providers()
-            .iter()
-            .any(|provider| {
-                provider.is_authenticated(cx)
-                    && provider.id() != language_model::ZED_CLOUD_PROVIDER_ID
-            });
-
-        match &self.base_view {
-            BaseView::Uninitialized | BaseView::Terminal { .. } => false,
-            BaseView::AgentThread { conversation_view } => {
-                if conversation_view.read(cx).as_native_thread(cx).is_some() {
-                    let history_is_empty = ThreadStore::global(cx).read(cx).is_empty();
-                    history_is_empty || !has_configured_non_zed_providers
-                } else {
-                    false
-                }
-            }
-        }
+    /// Always false in this fork: the Zed AI onboarding card is removed.
+    ///
+    /// Upstream showed it whenever thread history was empty, regardless of
+    /// whether a provider was configured, so a working non-Zed setup still got
+    /// a "Welcome to Zed AI / Try Zed Pro" upsell on every fresh thread. The
+    /// fork brings its own model, so there is nothing to onboard to.
+    ///
+    /// The body is replaced rather than the call sites removed, to keep this a
+    /// one-line conflict on rebase instead of a scattered one.
+    fn should_render_new_user_onboarding(&mut self, _cx: &mut Context<Self>) -> bool {
+        false
     }
 
     fn render_new_user_onboarding(
