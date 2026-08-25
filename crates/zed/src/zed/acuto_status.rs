@@ -13,7 +13,8 @@ use gpui::{EventEmitter, Task};
 use ui::prelude::*;
 use ui::Tooltip;
 use util::ResultExt as _;
-use workspace::{ItemHandle, StatusItemView, status_bar::HideStatusItem};
+// status_bar is a private module; these are re-exported from the crate root.
+use workspace::{HideStatusItem, StatusItemView, item::ItemHandle};
 
 /// A stopwatch for the current stretch of work.
 ///
