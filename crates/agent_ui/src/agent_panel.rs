@@ -36,6 +36,7 @@ use zed_actions::{
 
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
+use crate::agent_thread_item::AgentThreadItem;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
@@ -91,11 +92,13 @@ use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
     ContextMenu, ContextMenuEntry, GradientFade, IconButton, Indicator, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
+    PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, right_click_menu,
+    utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
-    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
+    CollaboratorId, DraggedPanelItem, DraggedPanelItemPreview, DraggedSelection, DraggedTab,
+    MultiWorkspace, PathList, SerializedPathList,
     ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
@@ -4135,6 +4138,88 @@ impl AgentPanel {
         self.thread_tabs = kept;
     }
 
+    /// Moves a thread out of the panel and into the active pane.
+    ///
+    /// The same gesture as dragging the tab into the editor area, reachable
+    /// without a mouse drag. Dragging is not a discoverable affordance, and a
+    /// thread being read closely is exactly the case where the panel is the
+    /// wrong shape for it.
+    pub fn open_thread_in_pane(
+        &mut self,
+        id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.detach_thread_for_pane(id, window, cx) else {
+            return;
+        };
+        let item = cx.new(|_| AgentThreadItem::new(view));
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            })
+            .log_err();
+    }
+
+    /// Removes a thread from the panel and hands its view to the caller.
+    ///
+    /// Used when a thread is dragged into a pane: the same `ConversationView`
+    /// moves rather than being rebuilt, so an in-flight response keeps
+    /// streaming across the move and nothing is re-fetched. The thread stays in
+    /// history — this is a change of location, not a close.
+    pub fn detach_thread_for_pane(
+        &mut self,
+        id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ConversationView>> {
+        let view = self.conversation_view_for_tab(&id, cx).cloned()?;
+
+        let was_active = self.active_thread_id(cx) == Some(id);
+        let index = self.thread_tabs.iter().position(|tab| *tab == id);
+        if let Some(index) = index {
+            self.thread_tabs.remove(index);
+        }
+
+        self.retained_threads.remove(&id);
+        if self
+            .draft_thread
+            .as_ref()
+            .is_some_and(|draft| draft.read(cx).thread_id == id)
+        {
+            self.draft_thread = None;
+            self._draft_editor_observation = None;
+        }
+
+        if was_active {
+            self.base_view = BaseView::Uninitialized;
+            self.refresh_base_view_subscriptions(window, cx);
+
+            // Move to whatever tab took its place so the panel is not left
+            // blank behind the drag.
+            let successor = index.and_then(|index| {
+                self.thread_tabs
+                    .get(index)
+                    .or_else(|| index.checked_sub(1).and_then(|prev| self.thread_tabs.get(prev)))
+                    .copied()
+            });
+            match successor {
+                Some(successor) => self.activate_retained_thread(successor, false, window, cx),
+                None => self.activate_new_thread(
+                    false,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                ),
+            }
+        }
+
+        self.serialize(cx);
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+        cx.notify();
+        Some(view)
+    }
+
     /// Closes one thread tab, activating a neighbour if the closed tab was the
     /// active one.
     pub fn close_thread_tab(&mut self, id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
@@ -4227,6 +4312,7 @@ impl AgentPanel {
             return None;
         }
 
+        let panel_handle = cx.entity().downgrade();
         let colors = cx.theme().colors();
         let active_bg = colors.panel_background;
         let inactive_bg = colors.surface_background;
@@ -4243,7 +4329,8 @@ impl AgentPanel {
                 // The index is unique and stable within a single render.
                 .children(tabs.into_iter().enumerate().map(
                     |(ix, (id, title, is_active, is_generating))| {
-                    h_flex()
+                    let drag_title = title.clone();
+                    let tab = h_flex()
                         .id(("agent-thread-tab", ix))
                         .group(SharedString::from(format!("agent-thread-tab-{ix}")))
                         .min_w_0()
@@ -4315,6 +4402,71 @@ impl AgentPanel {
                                 panel.close_thread_tab(id, window, cx);
                             }),
                         )
+
+                        // Dragging a tab into the editor area promotes the
+                        // thread to a pane item. The payload carries a builder
+                        // rather than the item itself: the drop may never
+                        // happen, and detaching the thread from the panel on
+                        // mouse-down would empty the panel for a drag the user
+                        // then abandons.
+                        .on_drag(
+                            DraggedPanelItem {
+                                label: drag_title.clone(),
+                                icon: Some(IconName::ZedAssistant),
+                                build: {
+                                    let panel = panel_handle.clone();
+                                    Rc::new(move |window, cx| {
+                                        let view = panel
+                                            .update(cx, |panel, cx| {
+                                                panel.detach_thread_for_pane(id, window, cx)
+                                            })
+                                            .ok()
+                                            .flatten()?;
+                                        Some(Box::new(
+                                            cx.new(|_| AgentThreadItem::new(view)),
+                                        )
+                                            as Box<dyn workspace::item::ItemHandle>)
+                                    })
+                                },
+                            },
+                            |dragged, _offset, _window, cx| {
+                                cx.new(|_| DraggedPanelItemPreview {
+                                    item: dragged.clone(),
+                                })
+                            },
+                        );
+
+                    right_click_menu(("agent-thread-tab-menu", ix))
+                        .trigger(move |_, _, _| tab)
+                        .menu({
+                            let panel = panel_handle.clone();
+                            move |window, cx| {
+                                let panel = panel.clone();
+                                ContextMenu::build(window, cx, move |menu, _, _| {
+                                    menu.entry("Open in Editor", None, {
+                                        let panel = panel.clone();
+                                        move |window, cx| {
+                                            panel
+                                                .update(cx, |panel, cx| {
+                                                    panel.open_thread_in_pane(id, window, cx)
+                                                })
+                                                .log_err();
+                                        }
+                                    })
+                                    .separator()
+                                    .entry("Close Thread", None, {
+                                        let panel = panel.clone();
+                                        move |window, cx| {
+                                            panel
+                                                .update(cx, |panel, cx| {
+                                                    panel.close_thread_tab(id, window, cx)
+                                                })
+                                                .log_err();
+                                        }
+                                    })
+                                })
+                            }
+                        })
                     },
                 ))
                 .child(
@@ -7075,7 +7227,7 @@ impl AgentPanel {
 mod tests {
     use super::*;
     use crate::NewWorktreeBranchTarget;
-    use crate::conversation_view::tests::{StubAgentServer, init_test};
+use crate::conversation_view::tests::{StubAgentServer, init_test};
     use crate::test_support::{
         active_session_id, active_thread_id, open_thread_with_connection,
         open_thread_with_custom_connection, register_test_sidebar, send_message,

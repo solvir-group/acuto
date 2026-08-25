@@ -528,6 +528,52 @@ pub struct DraggedTab {
     pub is_active: bool,
 }
 
+/// A drag payload for content that does not yet live in a pane.
+///
+/// [`DraggedTab`] carries an `Entity<Pane>`, so only a pane can produce one.
+/// Panels hold items too — an agent thread, for instance — and dragging one
+/// into the editor area is the natural gesture for promoting it. Rather than
+/// teaching `workspace` about every panel that might want this (it cannot
+/// depend on the crates that own them), the payload carries a closure that
+/// builds the item on drop.
+///
+/// The builder returns an `Option` so a source whose content vanished between
+/// the drag starting and the drop landing declines rather than panicking.
+#[derive(Clone)]
+pub struct DraggedPanelItem {
+    /// Shown on the drag preview.
+    pub label: SharedString,
+    pub icon: Option<IconName>,
+    pub build: Rc<dyn Fn(&mut Window, &mut App) -> Option<Box<dyn ItemHandle>>>,
+}
+
+impl DraggedPanelItem {
+    pub fn render_preview(&self, cx: &App) -> AnyElement {
+        h_flex()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(cx.theme().colors().tab_active_background)
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .children(self.icon.map(|icon| Icon::new(icon).size(IconSize::XSmall)))
+            .child(Label::new(self.label.clone()).size(LabelSize::Small))
+            .into_any_element()
+    }
+}
+
+/// The floating chip shown under the cursor while a panel item is dragged.
+pub struct DraggedPanelItemPreview {
+    pub item: DraggedPanelItem,
+}
+
+impl Render for DraggedPanelItemPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.item.render_preview(cx)
+    }
+}
+
 impl EventEmitter<Event> for Pane {}
 
 pub enum Side {
@@ -2991,6 +3037,12 @@ impl Pane {
                     this.handle_dragged_selection_drop(selection, Some(ix), window, cx)
                 }),
             )
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedPanelItem, window, cx| {
+                    this.drag_split_direction = None;
+                    this.handle_panel_item_drop(dragged, Some(ix), window, cx)
+                }),
+            )
             .on_drop(cx.listener(move |this, paths, window, cx| {
                 this.drag_split_direction = None;
                 this.handle_external_paths_drop(paths, window, cx)
@@ -3701,6 +3753,15 @@ impl Pane {
             .drag_over::<DraggedSelection>(|bar, _, _, cx| {
                 bar.bg(cx.theme().colors().drop_target_background)
             })
+            .drag_over::<DraggedPanelItem>(|bar, _, _, cx| {
+                bar.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedPanelItem, window, cx| {
+                    this.drag_split_direction = None;
+                    this.handle_panel_item_drop(dragged, None, window, cx)
+                }),
+            )
             .on_drop(
                 cx.listener(move |this, dragged_tab: &DraggedTab, window, cx| {
                     this.drag_split_direction = None;
@@ -3844,6 +3905,41 @@ impl Pane {
         if direction != self.drag_split_direction {
             self.drag_split_direction = direction;
         }
+    }
+
+    /// Adds an item dragged out of a panel, honouring any split the drop
+    /// gesture requested.
+    ///
+    /// The split is deferred the same way [`Self::handle_tab_drop`] defers its
+    /// own: splitting mutates the pane group that is currently being rendered,
+    /// so it has to happen after this frame rather than during it.
+    pub fn handle_panel_item_drop(
+        &mut self,
+        dragged: &DraggedPanelItem,
+        ix: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let build = dragged.build.clone();
+        let split_direction = self.drag_split_direction;
+        let mut to_pane = cx.entity();
+
+        self.workspace
+            .update(cx, |_, cx| {
+                cx.defer_in(window, move |workspace, window, cx| {
+                    let Some(item) = build(window, cx) else {
+                        return;
+                    };
+                    if let Some(split_direction) = split_direction {
+                        to_pane = workspace.split_pane(to_pane, split_direction, window, cx);
+                    }
+                    to_pane.update(cx, |pane, cx| {
+                        let destination = ix.unwrap_or(pane.items.len()).min(pane.items.len());
+                        pane.add_item_inner(item, true, true, true, Some(destination), window, cx);
+                    });
+                });
+            })
+            .log_err();
     }
 
     pub fn handle_tab_drop(
