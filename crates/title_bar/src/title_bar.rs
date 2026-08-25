@@ -949,11 +949,21 @@ impl TitleBar {
             )
             .child(
                 IconButton::new("title-bar-agent", IconName::Chat)
-                    .tooltip(Tooltip::text("Agent Panel"))
+                    .tooltip(Tooltip::text("Toggle Agent Sidebar"))
                     .icon_size(IconSize::Small)
                     .on_click(move |_, window, cx| {
                         if let Some(action) = cx.build_action("agent::ToggleFocus", None).log_err()
                         {
+                            window.dispatch_action(action, cx);
+                        }
+                    }),
+            )
+            .child(
+                IconButton::new("title-bar-settings", IconName::Settings)
+                    .tooltip(Tooltip::text("Settings"))
+                    .icon_size(IconSize::Small)
+                    .on_click(move |_, window, cx| {
+                        if let Some(action) = cx.build_action("zed::OpenSettings", None).log_err() {
                             window.dispatch_action(action, cx);
                         }
                     }),

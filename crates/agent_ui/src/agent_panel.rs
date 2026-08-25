@@ -6085,7 +6085,7 @@ impl AgentPanel {
         let toolbar_content = {
             let new_thread_menu = PopoverMenu::new("new_thread_menu")
                 .trigger_with_tooltip(
-                    IconButton::new("new_thread_menu_btn", IconName::Plus)
+                    IconButton::new("new_thread_menu_btn", IconName::ChevronDown)
                         .icon_size(IconSize::Small),
                     {
                         move |_window, cx| {
@@ -6132,7 +6132,19 @@ impl AgentPanel {
                         .flex_none()
                         .gap_1()
                         .children(sandbox_status)
-                        .when(can_create_entries, |this| this.child(new_thread_menu))
+                        .when(can_create_entries, |this| {
+                            // `+` starts a thread outright rather than opening a
+                            // menu; the full New Thread... menu is on the chevron.
+                            this.child(
+                                IconButton::new("new_thread_btn", IconName::Plus)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("New Thread"))
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(NewThread.boxed_clone(), cx);
+                                    }),
+                            )
+                            .child(new_thread_menu)
+                        })
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
                 )

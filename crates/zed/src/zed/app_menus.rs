@@ -282,6 +282,22 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             ],
         },
         Menu {
+            name: "Terminal".into(),
+            disabled: false,
+            items: vec![
+                MenuItem::action("New Terminal", workspace::NewTerminal::default()),
+                MenuItem::action("Toggle Terminal Panel", terminal_panel::Toggle),
+                MenuItem::separator(),
+                MenuItem::action(
+                    "Spawn Task",
+                    zed_actions::Spawn::ViaModal {
+                        reveal_target: None,
+                    },
+                ),
+                MenuItem::action("Edit tasks.json\u{2026}", zed_actions::OpenProjectTasks),
+            ],
+        },
+        Menu {
             name: "Window".into(),
             disabled: false,
             items: vec![

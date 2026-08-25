@@ -34,7 +34,7 @@ if (Test-Path $srcThemes) {
 }
 
 # top-level config files land beside them (settings.json / keymap.json in Phase 3)
-foreach ($name in 'settings.json', 'keymap.json', 'acuto.bashrc') {
+foreach ($name in 'settings.json', 'keymap.json', 'acuto.bashrc', 'acuto.ps1') {
     $src = Join-Path $repoConfig $name
     if (Test-Path $src) {
         New-Item $destConfig -ItemType Directory -Force | Out-Null

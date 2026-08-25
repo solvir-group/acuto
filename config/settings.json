@@ -68,16 +68,27 @@
 
   "terminal": {
     "dock": "bottom",
-    // Git Bash rather than PowerShell: no logo/copyright banner on every new
-    // terminal, and a POSIX shell. cmd.exe is the other native option but is
-    // noisier. pwsh (PowerShell 7) is not installed on this machine.
+    // VS Code on Windows defaults to PowerShell, so this matches what that
+    // terminal feels like. -NoLogo drops the copyright banner on every new
+    // terminal, which was the "clean" part of the earlier Git Bash choice.
+    // The acuto.bashrc shim only applied to bash; the `code` override for
+    // PowerShell lives in terminal.env below instead.
     "shell": {
       "with_arguments": {
-        "program": "C:/Program Files/Git/bin/bash.exe",
-        // --rcfile scopes our shell setup to Acuto's terminal only; the rc file
-        // sources ~/.bashrc first, so the user's own config still applies.
-        "args": ["--rcfile", "C:/Users/broad/zed-fork-data/config/acuto.bashrc", "-i"]
+        "program": "powershell.exe",
+        // -NoExit keeps the session interactive after sourcing our profile, so
+        // the `code` shim applies here the way acuto.bashrc did for bash.
+        "args": [
+          "-NoLogo",
+          "-NoExit",
+          "-Command",
+          ". 'C:/Users/broad/zed-fork-data/config/acuto.ps1'"
+        ]
       }
+    },
+    // Editors spawned by git, npm and similar stay in this window.
+    "env": {
+      "EDITOR": "C:/Users/broad/zed/target/debug/zed.exe --user-data-dir C:/Users/broad/zed-fork-data --wait"
     },
     "font_family": "JetBrains Mono",
     "font_size": 14,

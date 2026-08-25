@@ -46,6 +46,10 @@ impl Launchpad {
 impl Render for Launchpad {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
+            // Without track_focus the handle returned by Focusable is not part of
+            // the element tree, so actions dispatched from these buttons have no
+            // node to bubble from and silently reach no handler.
+            .track_focus(&self.focus_handle)
             .size_full()
             .items_center()
             .justify_center()
@@ -53,11 +57,6 @@ impl Render for Launchpad {
                 v_flex()
                     .w_64()
                     .gap_1()
-                    .child(
-                        Label::new("Start something")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
                     .child(Self::entry(
                         "launchpad-file",
                         "Open a File",
