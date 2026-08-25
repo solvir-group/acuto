@@ -4095,22 +4095,19 @@ impl AgentPanel {
             tabs.push((id, view.title(cx), false));
         }
 
-        if tabs.len() < 2 {
+        if tabs.is_empty() {
             return None;
         }
 
-        let border = cx.theme().colors().border;
         let active_bg = cx.theme().colors().panel_background;
         let inactive_bg = cx.theme().colors().surface_background;
 
         Some(
             h_flex()
-                .w_full()
-                .flex_none()
-                .items_end()
-                .bg(inactive_bg)
-                .border_b_1()
-                .border_color(border)
+                .min_w_0()
+                .items_center()
+                .gap_px()
+                .overflow_hidden()
                 // Index rather than ThreadId for the element id: ThreadId wraps a
                 // private uuid and implements neither Display nor Into<ElementId>.
                 // The index is unique and stable within a single render.
@@ -6155,6 +6152,12 @@ impl AgentPanel {
             .flex_none()
             .justify_between();
 
+        // Computed up front: this borrows cx mutably, so calling it inside the
+        // builder chain below would conflict with the other arms' use of cx.
+        let thread_tabs = self
+            .render_thread_tabs(cx)
+            .map(|tabs| tabs.into_any_element());
+
         let empty_thread_title = matches!(mode, ToolbarMode::EmptyThread).then(|| {
             Label::new(format!("New {} Thread", selected_agent_label))
                 .color(Color::Muted)
@@ -6200,9 +6203,15 @@ impl AgentPanel {
                         .gap(DynamicSpacing::Base04.rems(cx))
                         .pl(DynamicSpacing::Base04.rems(cx))
                         .child(selected_agent.into_any_element())
-                        .child(match empty_thread_title {
-                            Some(title) => title,
-                            None => self.render_title_view(window, cx),
+                        // Thread tabs live in the toolbar itself, in the slot the
+                        // thread title used to occupy. The title is redundant once
+                        // every thread is named on its own tab.
+                        .child(match thread_tabs {
+                            Some(tabs) => tabs,
+                            None => match empty_thread_title {
+                                Some(title) => title,
+                                None => self.render_title_view(window, cx),
+                            },
                         }),
                 )
                 .child(
@@ -6572,7 +6581,6 @@ impl Render for AgentPanel {
                 }
             }))
             .child(self.render_toolbar(window, cx))
-            .children(self.render_thread_tabs(cx))
             .children(self.render_new_user_onboarding(window, cx))
             .map(|parent| match self.visible_surface() {
                 VisibleSurface::Uninitialized if !self.has_open_project(cx) => {
