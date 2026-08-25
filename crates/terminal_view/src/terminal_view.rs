@@ -1,3 +1,4 @@
+mod command_suggest;
 mod persistence;
 pub mod terminal_element;
 pub mod terminal_panel;
@@ -150,6 +151,7 @@ pub struct TerminalView {
     show_breadcrumbs: bool,
     block_below_cursor: Option<Rc<BlockProperties>>,
     scroll_top: Pixels,
+    command_suggester: command_suggest::CommandSuggester,
     scroll_handle: TerminalScrollHandle,
     ime_state: Option<ImeState>,
     self_handle: WeakEntity<Self>,
@@ -295,6 +297,7 @@ impl TerminalView {
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
+            command_suggester: command_suggest::CommandSuggester::default(),
             scroll_handle,
             needs_serialize: false,
             custom_title: None,
@@ -1289,8 +1292,38 @@ impl TerminalView {
         self.clear_bell(cx);
         self.pause_cursor_blinking(window, cx);
 
+        // Right arrow at the end of a suggested line accepts it, the way fish
+        // and zsh-autosuggestions do. Only when a suggestion is actually
+        // showing — otherwise the arrow belongs to the shell, and swallowing it
+        // would break cursor movement.
+        if event.keystroke.key == "right"
+            && !event.keystroke.modifiers.modified()
+            && self.command_suggester.completion().is_some()
+        {
+            if let Some(completion) = self.command_suggester.accept() {
+                self.terminal.update(cx, |terminal, _| {
+                    terminal.input(completion.into_bytes());
+                });
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
+
+        let suggestion_changed = self.command_suggester.observe(
+            event.keystroke.key.as_str(),
+            event.keystroke.modifiers.modified(),
+        );
+
         if self.process_keystroke(&event.keystroke, cx) {
             cx.stop_propagation();
+        }
+
+        if suggestion_changed {
+            let working_directory = self.terminal.read(cx).working_directory();
+            self.command_suggester
+                .set_working_directory(working_directory);
+            cx.notify();
         }
     }
 
@@ -1321,6 +1354,42 @@ impl TerminalView {
             terminal.set_cursor_shape(CursorShape::Hollow);
         });
         cx.notify();
+    }
+}
+
+impl TerminalView {
+    /// A floating hint showing the suggested command and how to take it.
+    fn render_command_suggestion(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let suggestion = self.command_suggester.suggestion()?;
+        let colors = cx.theme().colors();
+
+        Some(
+            div()
+                .absolute()
+                .bottom_1()
+                .right_2()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(colors.elevated_surface_background)
+                        .border_1()
+                        .border_color(colors.border)
+                        .child(
+                            Label::new(command_suggest::display_suggestion(suggestion, 60))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new("→")
+                                .size(LabelSize::Small)
+                                .color(Color::Accent),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -1434,6 +1503,12 @@ impl Render for TerminalView {
                 )
                 .with_priority(1)
             }))
+            // Anchored to the pane rather than drawn inline after the cursor:
+            // the suggestion is only ever as accurate as the reconstructed
+            // input line, and a floating hint that can be ignored is the
+            // honest presentation of something that might be wrong. Inline
+            // ghost text reads as the shell's own certainty.
+            .children(focused.then(|| self.render_command_suggestion(cx)).flatten())
     }
 }
 
