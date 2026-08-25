@@ -253,6 +253,7 @@ dependencies = [
  "clock",
  "cloud_api_types",
  "cloud_llm_client",
+ "codebase_index",
  "collections",
  "context_server",
  "ctor",
@@ -3304,6 +3305,23 @@ dependencies = [
  "core-graphics-types 0.2.0",
  "libc",
  "objc",
+]
+
+[[package]]
+name = "codebase_index"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures 0.3.32",
+ "gpui",
+ "http_client",
+ "log",
+ "paths",
+ "project",
+ "serde",
+ "serde_json",
+ "sha2",
+ "util",
 ]
 
 [[package]]

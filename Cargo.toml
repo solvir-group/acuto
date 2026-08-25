@@ -32,6 +32,7 @@ members = [
     "crates/cloud_api_types",
     "crates/cloud_llm_client",
     "crates/codestral",
+    "crates/codebase_index",
     "crates/collab",
     "crates/collab_ui",
     "crates/collections",
@@ -305,6 +306,7 @@ cloud_llm_client = { path = "crates/cloud_llm_client" }
 codestral = { path = "crates/codestral" }
 collab = { path = "crates/collab" }
 collab_ui = { path = "crates/collab_ui" }
+codebase_index = { path = "crates/codebase_index" }
 collections = { path = "crates/collections", version = "0.1.0" }
 command_palette = { path = "crates/command_palette" }
 command_palette_hooks = { path = "crates/command_palette_hooks" }
