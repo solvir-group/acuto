@@ -390,6 +390,7 @@ impl Render for TitleBar {
                             ),
                     )
                 })
+                .child(self.render_title_bar_trailing_tools())
                 .when(TitleBarSettings::get_global(cx).show_user_menu, |this| {
                     this.child(self.render_user_menu_button(cx))
                 })
@@ -947,6 +948,16 @@ impl TitleBar {
                         }
                     }),
             )
+    }
+
+    /// Agent toggle and settings, rendered on the trailing side of the bar.
+    ///
+    /// Split from the git and terminal controls deliberately: those relate to the
+    /// project shown on the left, while these are application-level and belong
+    /// with the other trailing controls.
+    fn render_title_bar_trailing_tools(&self) -> impl IntoElement {
+        h_flex()
+            .gap_0p5()
             .child(
                 IconButton::new("title-bar-agent", IconName::Chat)
                     .tooltip(Tooltip::text("Toggle Agent Sidebar"))

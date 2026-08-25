@@ -4067,6 +4067,63 @@ impl AgentPanel {
         })
     }
 
+    /// A tab strip across the top of the agent panel, one tab per live thread.
+    ///
+    /// The panel already keeps threads alive in `retained_threads` while showing
+    /// only one of them, so several agents can be working at once with no way to
+    /// see or reach them. This surfaces that set: the active thread plus every
+    /// retained one, switchable by click.
+    ///
+    /// Rendered only when more than one thread exists, since a single tab is
+    /// noise.
+    fn render_thread_tabs(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let active_id = self
+            .active_conversation_view()
+            .map(|view| view.read(cx).thread_id);
+
+        let mut tabs: Vec<(ThreadId, SharedString, bool)> = Vec::new();
+        if let Some(view) = self.active_conversation_view() {
+            let view = view.read(cx);
+            tabs.push((view.thread_id, view.title(cx), true));
+        }
+        for view in self.retained_threads.values() {
+            let view = view.read(cx);
+            let id = view.thread_id;
+            if Some(id) == active_id {
+                continue;
+            }
+            tabs.push((id, view.title(cx), false));
+        }
+
+        if tabs.len() < 2 {
+            return None;
+        }
+
+        Some(
+            h_flex()
+                .w_full()
+                .flex_none()
+                .gap_1()
+                .px_2()
+                .pt_1()
+                .pb_0p5()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                // Index rather than ThreadId for the element id: ThreadId wraps a
+                // private uuid and implements neither Display nor Into<ElementId>.
+                // The index is unique and stable within a single render.
+                .children(tabs.into_iter().enumerate().map(|(ix, (id, title, is_active))| {
+                    Button::new(("agent-thread-tab", ix), title)
+                        .label_size(LabelSize::Small)
+                        .color(if is_active { Color::Default } else { Color::Muted })
+                        .toggle_state(is_active)
+                        .on_click(cx.listener(move |panel, _, window, cx| {
+                            panel.activate_retained_thread(id, true, window, cx);
+                        }))
+                })),
+        )
+    }
+
     pub fn conversation_views(&self) -> Vec<Entity<ConversationView>> {
         self.active_conversation_view()
             .into_iter()
@@ -6492,6 +6549,7 @@ impl Render for AgentPanel {
                 }
             }))
             .child(self.render_toolbar(window, cx))
+            .children(self.render_thread_tabs(cx))
             .children(self.render_new_user_onboarding(window, cx))
             .map(|parent| match self.visible_surface() {
                 VisibleSurface::Uninitialized if !self.has_open_project(cx) => {
