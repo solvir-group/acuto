@@ -1,0 +1,87 @@
+From 8b1cacde875d2dd2e95e2e10d2309e8b42e4df79 Mon Sep 17 00:00:00 2001
+From: procoder30001 <wycherleydrew@gmail.com>
+Date: Wed, 26 Aug 2026 20:09:51 +1200
+Subject: [PATCH] Forward application-addressed OSC sequences to the event
+ listener
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Shell integration markers (OSC 133, and VS Code's OSC 633 variant) and
+working directory reports (OSC 7) are addressed to the application
+embedding the terminal, not to the emulator. They carry no rendering
+semantics, so the parser correctly has nothing to do with them — but
+dropping them silently means an embedder cannot observe them at all
+without tapping the byte stream ahead of the parser and reimplementing
+OSC framing.
+
+Adds `Event::Osc`, forwarded from the new `Handler::osc_passthrough` hook
+for the small allowlist vte exposes. The sequence is still dispatched
+normally afterwards; this is an observation, not a redirection.
+
+Requires the corresponding vte change adding `Handler::osc_passthrough`.
+---
+ alacritty_terminal/src/event.rs    | 16 ++++++++++++++++
+ alacritty_terminal/src/term/mod.rs | 12 ++++++++++++
+ 2 files changed, 28 insertions(+)
+
+diff --git a/alacritty_terminal/src/event.rs b/alacritty_terminal/src/event.rs
+index 922cf1d0..b821ad91 100644
+--- a/alacritty_terminal/src/event.rs
++++ b/alacritty_terminal/src/event.rs
+@@ -15,6 +15,15 @@ pub enum Event {
+     /// Grid has changed possibly requiring a mouse cursor shape change.
+     MouseCursorDirty,
+ 
++    /// An OSC sequence addressed to the embedding application rather than to
++    /// the emulator.
++    ///
++    /// Carries the raw parameters for the small allowlist in
++    /// [`vte::ansi::OSC_PASSTHROUGH`] — shell integration markers and working
++    /// directory reports. The emulator still interprets the sequence normally;
++    /// this is an observation, not a redirection.
++    Osc(Vec<Vec<u8>>),
++
+     /// Window title change.
+     Title(String),
+ 
+@@ -66,6 +75,13 @@ impl Debug for Event {
+             Event::TextAreaSizeRequest(_) => write!(f, "TextAreaSizeRequest"),
+             Event::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
+             Event::PtyWrite(text) => write!(f, "PtyWrite({text})"),
++            Event::Osc(params) => {
++                let rendered: Vec<String> = params
++                    .iter()
++                    .map(|param| String::from_utf8_lossy(param).into_owned())
++                    .collect();
++                write!(f, "Osc({})", rendered.join(";"))
++            },
+             Event::Title(title) => write!(f, "Title({title})"),
+             Event::CursorBlinkingChange => write!(f, "CursorBlinkingChange"),
+             Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),
+diff --git a/alacritty_terminal/src/term/mod.rs b/alacritty_terminal/src/term/mod.rs
+index 8eb67975..38d12df2 100644
+--- a/alacritty_terminal/src/term/mod.rs
++++ b/alacritty_terminal/src/term/mod.rs
+@@ -1057,6 +1057,18 @@ impl<T> Dimensions for Term<T> {
+ }
+ 
+ impl<T: EventListener> Handler for Term<T> {
++    /// Forwards application-addressed OSC sequences to the event listener.
++    ///
++    /// Copied rather than borrowed because the parser's slices do not outlive
++    /// the dispatch, and these sequences are rare and short — a shell emits a
++    /// handful per prompt.
++    #[inline]
++    fn osc_passthrough(&mut self, params: &[&[u8]], _bell_terminated: bool) {
++        self.event_proxy.send_event(Event::Osc(
++            params.iter().map(|param| param.to_vec()).collect(),
++        ));
++    }
++
+     /// A character to be displayed.
+     #[inline(never)]
+     fn input(&mut self, c: char) {
+-- 
+2.53.0.windows.3
+

@@ -302,6 +302,7 @@ impl Dimensions for TerminalBounds {
 impl From<AlacTermEvent> for TerminalBackendEvent {
     fn from(event: AlacTermEvent) -> Self {
         match event {
+            AlacTermEvent::Osc(params) => Self::Osc(params),
             AlacTermEvent::MouseCursorDirty => Self::MouseCursorDirty,
             AlacTermEvent::Title(title) => Self::Title(title),
             AlacTermEvent::ResetTitle => Self::ResetTitle,

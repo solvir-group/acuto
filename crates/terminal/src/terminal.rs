@@ -201,6 +201,30 @@ pub fn parse_ansi_text(input: &[u8]) -> ParsedAnsiText {
     handler.finish()
 }
 
+/// Collects OSC sequences forwarded by the parser.
+///
+/// Exists for [`the passthrough test`](tests::osc_passthrough_reaches_the_handler),
+/// which is the standing proof that the fork's seam is intact: the sequences
+/// shell integration depends on are dropped by an unpatched parser, and nothing
+/// downstream would fail loudly if that regressed.
+#[cfg(test)]
+#[derive(Default)]
+struct OscCollector {
+    seen: Vec<Vec<String>>,
+}
+
+#[cfg(test)]
+impl Handler for OscCollector {
+    fn osc_passthrough(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        self.seen.push(
+            params
+                .iter()
+                .map(|param| String::from_utf8_lossy(param).into_owned())
+                .collect(),
+        );
+    }
+}
+
 pub fn strip_ansi_text(input: &[u8]) -> String {
     let mut handler = PlainAnsiTextHandler::default();
     let mut processor = Processor::<StdSyncHandler>::default();
@@ -722,6 +746,10 @@ type TextAreaSizeFormatter = Arc<dyn Fn(TerminalBounds) -> String + Sync + Send 
 
 #[derive(Clone)]
 pub(crate) enum TerminalBackendEvent {
+    /// An OSC sequence addressed to the editor rather than the emulator:
+    /// shell integration markers (133/633) and working directory reports (7).
+    /// Consumed by `ShellState`; see docs/terminal-autocomplete-plan.md.
+    Osc(Vec<Vec<u8>>),
     MouseCursorDirty,
     Title(String),
     ResetTitle,
@@ -740,6 +768,13 @@ pub(crate) enum TerminalBackendEvent {
 impl fmt::Debug for TerminalBackendEvent {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Osc(params) => {
+                let rendered: Vec<String> = params
+                    .iter()
+                    .map(|param| String::from_utf8_lossy(param).into_owned())
+                    .collect();
+                write!(f, "Osc({})", rendered.join(";"))
+            }
             Self::MouseCursorDirty => f.write_str("MouseCursorDirty"),
             Self::Title(title) => write!(f, "Title({title})"),
             Self::ResetTitle => f.write_str("ResetTitle"),
@@ -1562,6 +1597,10 @@ impl Terminal {
 
     fn process_event(&mut self, event: TerminalBackendEvent, cx: &mut Context<Self>) {
         match event {
+            TerminalBackendEvent::Osc(_params) => {
+                // Consumed by ShellState in phase 1b; the passthrough seam
+                // itself is covered by osc_passthrough_tests.
+            }
             TerminalBackendEvent::Title(title) => {
                 // ignore default shell program title change as windows always sends those events
                 // and it would end up showing the shell executable path in breadcrumbs
@@ -5848,5 +5887,74 @@ mod tests {
 
         assert!(terminal.cwd_history.is_empty());
         assert_eq!(terminal.pending_cwd_boundary, None);
+    }
+}
+
+#[cfg(test)]
+mod osc_passthrough_tests {
+    use super::*;
+
+    fn collect(input: &[u8]) -> Vec<Vec<String>> {
+        let mut handler = OscCollector::default();
+        let mut processor = Processor::<StdSyncHandler>::default();
+        processor.advance(&mut handler, input);
+        handler.seen
+    }
+
+    /// Phase 1a acceptance: an OSC addressed to the editor reaches Zed code.
+    ///
+    /// Without the fork this returns nothing at all — vte parses these
+    /// sequences, finds no rule for them, and drops them before `Term` is ever
+    /// consulted. Everything in terminal completion depends on this not being
+    /// silently true again after a dependency bump, which is why the proof is a
+    /// test rather than a log line seen once.
+    #[test]
+    fn osc_passthrough_reaches_the_handler() {
+        // Prompt start, both bell- and ST-terminated.
+        assert_eq!(
+            collect(b"\x1b]133;A\x07"),
+            vec![vec!["133".to_string(), "A".to_string()]],
+        );
+        assert_eq!(
+            collect(b"\x1b]133;D;0\x1b\\"),
+            vec![vec!["133".to_string(), "D".to_string(), "0".to_string()]],
+        );
+
+        // VS Code's variant, so an existing VS Code shell integration works
+        // with no injection of our own.
+        assert_eq!(
+            collect(b"\x1b]633;A\x07"),
+            vec![vec!["633".to_string(), "A".to_string()]],
+        );
+
+        // Working directory reports.
+        assert_eq!(
+            collect(b"\x1b]7;file:///tmp\x07"),
+            vec![vec!["7".to_string(), "file:///tmp".to_string()]],
+        );
+    }
+
+    /// The allowlist is a fixed set, not "everything unhandled".
+    ///
+    /// A generic tap would hand the editor every unrecognised sequence a
+    /// program happens to emit, which is a much larger surface than the
+    /// handful this feature needs.
+    #[test]
+    fn osc_passthrough_ignores_sequences_outside_the_allowlist() {
+        // Window title — handled by the emulator, not our business.
+        assert!(collect(b"\x1b]0;some title\x07").is_empty());
+        // Clipboard.
+        assert!(collect(b"\x1b]52;c;aGk=\x07").is_empty());
+    }
+
+    /// Passthrough observes; it must not consume.
+    #[test]
+    fn osc_passthrough_does_not_suppress_normal_dispatch() {
+        // A title set after a passthrough sequence still lands, proving the
+        // parser carried on through the same byte stream.
+        let mut handler = StyledAnsiTextHandler::default();
+        let mut processor = Processor::<StdSyncHandler>::default();
+        processor.advance(&mut handler, b"\x1b]133;A\x07hello");
+        assert_eq!(handler.finish().text, "hello");
     }
 }

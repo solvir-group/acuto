@@ -971,6 +971,9 @@ impl VsCodeSettings {
             });
 
         ProjectTerminalSettingsContent {
+            // VS Code has no equivalent; the fork's own defaults apply.
+            completion: None,
+            shell_integration: None,
             // TODO: handle arguments
             shell: self
                 .read_string(&format!("terminal.integrated.{platform}Exec"))

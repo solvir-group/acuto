@@ -2,7 +2,7 @@ use crate::{
     ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
-    SemanticSearchTool,
+    RunIdeActionTool, SemanticSearchTool, UpdateIdeSettingTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
     ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
@@ -2153,6 +2153,11 @@ impl Thread {
         // Sits beside grep deliberately: the two answer different questions,
         // and the model picks between them from their descriptions.
         self.add_tool(SemanticSearchTool::new(self.project.clone()));
+        // The editor's own commands and settings, so the agent can change the
+        // workspace instead of describing which menu to open. Both prompt
+        // before acting.
+        self.add_tool(RunIdeActionTool);
+        self.add_tool(UpdateIdeSettingTool);
         self.add_tool(ListDirectoryTool::new(self.project.clone()));
         self.add_tool(MovePathTool::new(self.project.clone()));
         self.add_tool(ReadFileTool::new(

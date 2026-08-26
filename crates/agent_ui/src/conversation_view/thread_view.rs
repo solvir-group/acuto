@@ -7491,6 +7491,18 @@ impl ThreadView {
 
         let panel_bg = cx.theme().colors().panel_background;
 
+        // Only the thought currently being written shimmers. Every completed
+        // thought in the transcript keeps the same header, and animating all of
+        // them would suggest the model is still working on all of them.
+        let thread = self.thread.read(cx);
+        let is_thinking_now = thread.status() == ThreadStatus::Generating
+            && thread.entries().len().saturating_sub(1) == entry_ix
+            && matches!(
+                thread.entries().get(entry_ix),
+                Some(AgentThreadEntry::AssistantMessage(message))
+                    if message.chunks.len().saturating_sub(1) == chunk_ix
+            );
+
         v_flex()
             .gap_1()
             .child(
@@ -7515,7 +7527,16 @@ impl ThreadView {
                                 div()
                                     .text_size(self.tool_name_font_size())
                                     .text_color(cx.theme().colors().text_muted)
-                                    .child("Thinking"),
+                                    .child(if is_thinking_now {
+                                        render_shimmer_text(
+                                            "Thinking",
+                                            ("thinking-shimmer", entry_ix),
+                                            cx.theme().colors().text_muted,
+                                            cx.theme().colors().text,
+                                        )
+                                    } else {
+                                        "Thinking".into_any_element()
+                                    }),
                             ),
                     )
                     .child(
@@ -13011,4 +13032,53 @@ pub(crate) fn reset_fast_mode_warnings(cx: &mut App) {
             .log_err();
     })
     .detach();
+}
+
+/// Sweeps a bright band across the characters of `text`, left to right, on a
+/// loop.
+///
+/// GPUI has no masked-gradient text fill, so the sweep is built from one span
+/// per character with its colour interpolated by distance from the moving band.
+/// That is only reasonable for short labels — it costs an element per character
+/// — which is why this takes a `&'static str` rather than arbitrary content.
+///
+/// The children are added inside the animator rather than up front because the
+/// animator receives a freshly built element each frame; colouring them once at
+/// construction would freeze the sweep on its first position.
+fn render_shimmer_text(
+    text: &'static str,
+    id: impl Into<ElementId>,
+    base: Hsla,
+    highlight: Hsla,
+) -> AnyElement {
+    /// How many characters wide the bright band is.
+    const BAND: f32 = 3.0;
+
+    let characters: Vec<String> = text.chars().map(|character| character.to_string()).collect();
+    let count = characters.len().max(1) as f32;
+
+    h_flex()
+        .with_animation(
+            id.into(),
+            Animation::new(Duration::from_millis(1600)).repeat(),
+            move |this, delta| {
+                // Starts off the left edge and finishes off the right, so the
+                // band enters and leaves rather than popping in at full
+                // brightness.
+                let position = delta * (count + BAND * 2.0) - BAND;
+
+                this.children(characters.iter().enumerate().map(|(index, character)| {
+                    let distance = (index as f32 - position).abs();
+                    let intensity = (1.0 - distance / BAND).clamp(0.0, 1.0);
+                    let color = Hsla {
+                        h: base.h,
+                        s: base.s + (highlight.s - base.s) * intensity,
+                        l: base.l + (highlight.l - base.l) * intensity,
+                        a: base.a + (highlight.a - base.a) * intensity,
+                    };
+                    div().text_color(color).child(character.clone())
+                }))
+            },
+        )
+        .into_any_element()
 }

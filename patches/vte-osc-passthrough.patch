@@ -1,0 +1,83 @@
+From 299157cc8bddbaf350d6beb512be3e909339c734 Mon Sep 17 00:00:00 2001
+From: procoder30001 <wycherleydrew@gmail.com>
+Date: Wed, 26 Aug 2026 20:10:05 +1200
+Subject: [PATCH] Add Handler::osc_passthrough for application-addressed OSC
+ sequences
+
+An emulator embedded in a larger application increasingly needs to
+observe OSC sequences addressed to that application rather than to the
+terminal: shell integration markers (OSC 133, and VS Code's OSC 633
+variant) and working directory reports (OSC 7). The parser has nothing
+to do with them, so they are currently dropped, and an embedder wanting
+to see them has to tap the byte stream ahead of the parser and
+reimplement OSC framing.
+
+`osc_passthrough` is called before normal dispatch and only for the fixed
+`OSC_PASSTHROUGH` allowlist, so observing a sequence never changes how it
+is subsequently interpreted. A fixed allowlist rather than "everything
+unhandled" keeps this a narrow hook rather than a generic tap.
+
+The trait method defaults to a no-op, so this is additive for every
+existing implementor.
+---
+ src/ansi.rs | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/src/ansi.rs b/src/ansi.rs
+index 592266e..313712b 100644
+--- a/src/ansi.rs
++++ b/src/ansi.rs
+@@ -492,7 +492,37 @@ pub trait Timeout: Default {
+ ///
+ /// XXX Should probably not provide default impls for everything, but it makes
+ /// writing specific handler impls for tests far easier.
++/// OSC numbers forwarded to [`Handler::osc_passthrough`].
++///
++/// Deliberately a fixed allowlist rather than "everything unhandled": the point
++/// is to expose the handful of sequences that address the embedding application,
++/// not to turn the parser into a generic tap.
++///
++/// * `7`   — working directory report
++/// * `133` — semantic prompt markers (FinalTerm)
++/// * `633` — VS Code's shell-integration variant of the above
++pub const OSC_PASSTHROUGH: &[&[u8]] = &[b"7", b"133", b"633"];
++
+ pub trait Handler {
++    /// Raw OSC passthrough for sequences this parser does not interpret itself.
++    ///
++    /// Terminal emulators embedded in a larger application increasingly need to
++    /// observe OSC sequences that are addressed to the application rather than
++    /// to the emulator: shell integration markers (OSC 133, and VS Code's
++    /// OSC 633 variant) and working-directory reports (OSC 7). Those carry no
++    /// rendering semantics, so the parser has nothing to do with them, but
++    /// dropping them silently means an embedder cannot see them at all without
++    /// tapping the byte stream ahead of the parser and re-implementing OSC
++    /// framing.
++    ///
++    /// Called before the sequence is dispatched normally, and only for the
++    /// small allowlist in [`OSC_PASSTHROUGH`], so that a handler observing a
++    /// sequence never changes how it is subsequently interpreted.
++    ///
++    /// The default implementation does nothing, so this is additive for every
++    /// existing implementor.
++    fn osc_passthrough(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
++
+     /// OSC to set window title.
+     fn set_title(&mut self, _: Option<String>) {}
+ 
+@@ -1345,6 +1375,12 @@ where
+             return;
+         }
+ 
++        // Observed before dispatch, never instead of it: an embedder seeing a
++        // sequence must not change how the emulator goes on to treat it.
++        if OSC_PASSTHROUGH.contains(&params[0]) {
++            self.handler.osc_passthrough(params, bell_terminated);
++        }
++
+         match params[0] {
+             // Set window title.
+             b"0" | b"2" => {
+-- 
+2.53.0.windows.3
+

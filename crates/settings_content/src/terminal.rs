@@ -63,6 +63,112 @@ pub struct ProjectTerminalSettingsContent {
     ///
     /// Default: 1
     pub path_hyperlink_timeout_ms: Option<u64>,
+    /// How shell integration is installed.
+    ///
+    /// Shell integration emits OSC 133 markers so the editor can tell where a
+    /// prompt begins and whether a command is running. Completions stay dark
+    /// without it; there is no heuristic fallback, because a prompt detector
+    /// that guesses is wrong constantly and in ways users cannot predict.
+    ///
+    /// Default: auto
+    pub shell_integration: Option<ShellIntegrationMode>,
+    /// Completion behaviour in the terminal.
+    pub completion: Option<TerminalCompletionSettingsContent>,
+}
+
+/// How the shell integration script is installed.
+#[derive(
+    Copy, Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellIntegrationMode {
+    /// Injected automatically when a terminal starts, without ever modifying
+    /// the user's own rc files. A failed load must leave the shell working.
+    #[default]
+    Auto,
+    /// Not injected. The user sources it themselves; `acuto shell-integration
+    /// <shell>` prints the script to stdout for that purpose.
+    Manual,
+    /// Never injected, and completions that depend on it stay off.
+    Off,
+}
+
+/// Terminal completion settings.
+///
+/// Declared in full up front rather than accreting per feature: this crate sits
+/// near the root of the dependency graph, so every change here rebuilds most of
+/// the workspace.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct TerminalCompletionSettingsContent {
+    /// Master switch for every completion surface.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+    /// Ghost text after the cursor suggesting a command from history.
+    ///
+    /// Default: true
+    pub inline_suggestions: Option<bool>,
+    /// The suggestion list shown above or below the cursor.
+    ///
+    /// Default: true
+    pub popup: Option<bool>,
+    /// Individual completion sources.
+    pub sources: Option<CompletionSourcesContent>,
+    /// Milliseconds of quiet after the last keystroke before sources are
+    /// queried.
+    ///
+    /// A keystroke never waits on a completion source; this only controls how
+    /// long the editor waits before asking.
+    ///
+    /// Default: 50
+    pub debounce_ms: Option<u64>,
+    /// How many commands to keep in terminal history.
+    ///
+    /// Default: 10000
+    pub history_limit: Option<usize>,
+    /// Key that accepts the whole inline suggestion.
+    ///
+    /// Default: "right"
+    pub accept_inline_key: Option<String>,
+    /// Key that accepts one word of the inline suggestion.
+    ///
+    /// Default: "alt-right"
+    pub accept_word_key: Option<String>,
+}
+
+/// Completion sources, each independently switchable.
+///
+/// Precedence where several sources answer for the same command: native
+/// generator, then Fig static spec, then carapace, then help scraping.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct CompletionSourcesContent {
+    /// Previously run commands, ranked by directory and frecency.
+    ///
+    /// Default: true
+    pub history: Option<bool>,
+    /// Files and directories, ranked with editor state taken into account.
+    ///
+    /// Default: true
+    pub path: Option<bool>,
+    /// Hand-written generators for git, cargo, npm, docker, make and kubectl.
+    ///
+    /// Default: true
+    pub native: Option<bool>,
+    /// Static command trees derived from Fig's specs at build time.
+    ///
+    /// Default: true
+    pub fig: Option<bool>,
+    /// The `carapace` binary, when it is on PATH. Silent when absent.
+    ///
+    /// Default: true
+    pub carapace: Option<bool>,
+    /// Parsing `<command> --help` for binaries no other source covers.
+    ///
+    /// Off by default: it runs unknown binaries, which is a different risk
+    /// class from reading a spec.
+    ///
+    /// Default: false
+    pub help: Option<bool>,
 }
 
 #[with_fallible_options]

@@ -730,7 +730,96 @@ impl Render for AgentDiffPane {
                         ),
                 )
             })
-            .when(!is_empty, |el| el.child(self.editor.clone()))
+            .when(!is_empty, |el| {
+                el.flex_col()
+                    .items_stretch()
+                    .justify_start()
+                    .children(self.render_rejected_hunks(cx))
+                    .child(self.editor.clone())
+            })
+    }
+}
+
+impl AgentDiffPane {
+    /// A strip of rejections that are still recoverable.
+    ///
+    /// Rejecting used to remove a hunk from the review entirely, so a mistaken
+    /// rejection was unrecoverable and — worse — invisible. Keeping them here,
+    /// muted and individually restorable, is the difference between "rejected"
+    /// and "silently discarded".
+    fn render_rejected_hunks(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let action_log = self.thread.read(cx).action_log().clone();
+        let rejected: Vec<(action_log::RejectedHunkId, String)> = action_log
+            .read(cx)
+            .rejected_hunks()
+            .iter()
+            .map(|hunk| {
+                let preview = hunk
+                    .agent_text
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                (hunk.id, preview)
+            })
+            .collect();
+
+        if rejected.is_empty() {
+            return None;
+        }
+
+        let colors = cx.theme().colors();
+
+        Some(
+            v_flex()
+                .flex_none()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_0p5()
+                .bg(colors.editor_background)
+                .border_b_1()
+                .border_color(colors.border)
+                .child(
+                    Label::new(format!("{} rejected", rejected.len()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .children(rejected.into_iter().enumerate().map(|(index, (id, preview))| {
+                    h_flex()
+                        .w_full()
+                        .gap_1()
+                        .justify_between()
+                        .child(
+                            Label::new(if preview.is_empty() {
+                                "(blank line)".to_string()
+                            } else {
+                                preview
+                            })
+                            // Muted and struck through: still present, plainly
+                            // not applied.
+                            .size(LabelSize::XSmall)
+                            .color(Color::Hidden)
+                            .strikethrough()
+                            .single_line(),
+                        )
+                        .child(
+                            Button::new(("restore-rejected", index), "Restore")
+                                .label_size(LabelSize::XSmall)
+                                .on_click({
+                                    let action_log = action_log.clone();
+                                    cx.listener(move |_this, _event, _window, cx| {
+                                        action_log.update(cx, |log, cx| {
+                                            log.restore_rejected_hunk(id, cx);
+                                        });
+                                        cx.notify();
+                                    })
+                                }),
+                        )
+                }))
+                .into_any_element(),
+        )
     }
 }
 
