@@ -1414,6 +1414,13 @@ struct FakeFsState {
     metadata_call_count: usize,
     read_dir_call_count: usize,
     path_write_counts: std::collections::HashMap<PathBuf, usize>,
+    /// Paths whose next writes should fail, and how many times each.
+    ///
+    /// Exists so tests can reproduce the failure that matters for batched
+    /// edits: some files in a multi-file change are written and one is not. A
+    /// filesystem that never fails cannot exercise the partial-application
+    /// paths, which is exactly where a review UI desynchronises from disk.
+    write_failures: std::collections::HashMap<PathBuf, usize>,
     moves: std::collections::HashMap<u64, PathBuf>,
     job_event_subscribers: Arc<Mutex<Vec<JobEventSender>>>,
     trash: Mutex<SlotMap<TrashId, (TrashedEntry, FakeFsEntry)>>,
@@ -1748,6 +1755,7 @@ impl FakeFs {
                 read_dir_call_count: 0,
                 metadata_call_count: 0,
                 path_write_counts: Default::default(),
+                write_failures: Default::default(),
                 moves: Default::default(),
                 job_event_subscribers: Arc::new(Mutex::new(Vec::new())),
                 trash: Mutex::new(SlotMap::with_key()),
@@ -1776,6 +1784,26 @@ impl FakeFs {
     /// Configures whether the fake filesystem reports as case-sensitive.
     pub fn set_case_sensitive(&self, case_sensitive: bool) {
         self.state.lock().case_sensitive = case_sensitive;
+    }
+
+    /// Makes the next `times` writes to `path` fail.
+    ///
+    /// The file is left untouched, so a caller that ignores the error sees the
+    /// old contents rather than a truncated file.
+    pub fn fail_writes_to(&self, path: impl AsRef<Path>, times: usize) {
+        let path = normalize_path(path.as_ref());
+        let mut state = self.state.lock();
+        if times == 0 {
+            state.write_failures.remove(&path);
+        } else {
+            state.write_failures.insert(path, times);
+        }
+    }
+
+    /// Whether a path still has injected failures pending.
+    pub fn has_pending_write_failures(&self, path: impl AsRef<Path>) -> bool {
+        let path = normalize_path(path.as_ref());
+        self.state.lock().write_failures.contains_key(&path)
     }
 
     pub fn set_next_mtime(&self, next_mtime: SystemTime) {
@@ -1853,6 +1881,23 @@ impl FakeFs {
             recreate_inode: bool,
         ) -> Result<()> {
             let mut state = this.state.lock();
+
+            // Checked before anything is mutated, so an injected failure leaves
+            // the file exactly as it was — a write that fails must not leave a
+            // half-written file behind, which is the whole point of testing it.
+            if let Some(remaining) = state.write_failures.get_mut(path) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    let normalized = path.to_path_buf();
+                    if *remaining == 0 {
+                        state.write_failures.remove(&normalized);
+                    }
+                    anyhow::bail!(
+                        "injected write failure for {}",
+                        normalized.display()
+                    );
+                }
+            }
             let path_buf = path.to_path_buf();
             *state.path_write_counts.entry(path_buf).or_insert(0) += 1;
             let new_inode = state.get_and_increment_inode();

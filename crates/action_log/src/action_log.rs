@@ -1722,6 +1722,141 @@ mod tests {
         });
     }
 
+    /// P1a — a failed write during a multi-file rejection must surface.
+    ///
+    /// This is the failure the pitch is actually about. Cursor's documented bug
+    /// is not "one buffer computed the wrong bytes" — it is forty files where
+    /// some apply and some do not, and a review UI that then disagrees with
+    /// disk. Single-buffer correctness cannot reach it: it needs more than one
+    /// file and a write that fails.
+    ///
+    /// **The assertion here is deliberately narrow**: a rejection whose save
+    /// fails must report an error. That is unambiguous — reporting success for
+    /// a write that did not happen is indefensible under any specification.
+    ///
+    /// What should happen to the *review state* afterwards is a different
+    /// question — whether the hunk stays in review, or is marked rejected with
+    /// a warning — and it is a spec decision, not something this test may settle
+    /// by adopting whatever the implementation currently does. The observed
+    /// behaviour is printed rather than asserted, so it informs that decision
+    /// without pre-empting it.
+    #[gpui::test]
+    async fn test_failed_write_during_multi_file_reject_surfaces(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "a.txt": "alpha0\nalpha1\nalpha2\n",
+                // Same line width as a.txt, so one column range is valid in both.
+                "b.txt": "beta00\nbeta01\nbeta02\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+
+        let mut buffers = Vec::new();
+        for name in ["dir/a.txt", "dir/b.txt"] {
+            let file_path = project
+                .read_with(cx, |project, cx| project.find_project_path(name, cx))
+                .unwrap();
+            buffers.push(
+                project
+                    .update(cx, |project, cx| project.open_buffer(file_path, cx))
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // The agent edits both files.
+        cx.update(|cx| {
+            for (index, buffer) in buffers.iter().enumerate() {
+                action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+                buffer.update(cx, |buffer, cx| {
+                    buffer
+                        .edit(
+                            [(Point::new(1, 0)..Point::new(1, 6), format!("AGENT{index}"))],
+                            None,
+                            cx,
+                        )
+                        .unwrap()
+                });
+                action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+            }
+        });
+        cx.run_until_parked();
+
+        // Persist the agent's edits first. Without this, disk still holds the
+        // original bytes and the blocked write would only have rewritten what
+        // was already there — the assertions below would pass while testing
+        // nothing. The dangerous case is disk holding the agent's version at
+        // the moment the restore fails.
+        for buffer in &buffers {
+            project
+                .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+                .await
+                .unwrap();
+        }
+        cx.run_until_parked();
+
+        // The second file cannot be written.
+        fs.fail_writes_to(path!("/dir/b.txt"), 1);
+
+        let mut outcomes = Vec::new();
+        for buffer in &buffers {
+            let task = action_log.update(cx, |log, cx| {
+                let (task, _undo) = log.reject_edits_in_ranges(
+                    buffer.clone(),
+                    vec![Point::new(1, 0)..Point::new(1, 6)],
+                    None,
+                    cx,
+                );
+                task
+            });
+            outcomes.push(task.await);
+            cx.run_until_parked();
+        }
+
+        let on_disk_a = fs.load(path!("/dir/a.txt").as_ref()).await.unwrap();
+        let on_disk_b = fs.load(path!("/dir/b.txt").as_ref()).await.unwrap();
+
+        eprintln!(
+            "\n--- multi-file reject with an injected write failure ---\n\
+             reject a.txt -> {:?}\n\
+             reject b.txt -> {:?}\n\
+             a.txt on disk = {on_disk_a:?}\n\
+             b.txt on disk = {on_disk_b:?}\n\
+             rejections retained = {}\n",
+            outcomes[0].as_ref().map(|_| "Ok"),
+            outcomes[1].as_ref().map(|_| "Ok"),
+            action_log.read_with(cx, |log, _| log.rejected_hunks().len()),
+        );
+
+        // The file that could be written is back to its original bytes.
+        assert_eq!(
+            on_disk_a, "alpha0\nalpha1\nalpha2\n",
+            "the writable file should have been restored on disk"
+        );
+
+        // And the file that could not be written still holds the agent's
+        // version. This divergence between review state and disk is the thing
+        // the feature exists to make impossible to miss.
+        assert_eq!(
+            on_disk_b, "beta00\nAGENT1\nbeta02\n",
+            "the unwritable file should still hold the agent's text on disk"
+        );
+
+        // The one assertion that no specification can excuse.
+        assert!(
+            outcomes[1].is_err(),
+            "rejecting a file whose write failed reported success; \
+             a review UI trusting this would show the change reverted while \
+             disk still holds the agent's version"
+        );
+    }
+
     /// P1a property test — accept/reject round-trips to byte equality.
     ///
     /// Phase one of the corpus, deliberately: **pure accept/reject permutations,
