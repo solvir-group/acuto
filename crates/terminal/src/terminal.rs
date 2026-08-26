@@ -2,6 +2,7 @@ mod mappings;
 
 mod alacritty;
 mod pty_info;
+pub mod shell_state;
 pub mod terminal_settings;
 
 #[cfg(not(windows))]
@@ -1017,6 +1018,7 @@ impl TerminalBuilder {
             output_processor: Processor::<StdSyncHandler>::new(),
             title_override: None,
             events: VecDeque::with_capacity(10),
+            shell_state: Default::default(),
             last_content: Content {
                 terminal_bounds,
                 ..Default::default()
@@ -1295,6 +1297,7 @@ impl TerminalBuilder {
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
+                shell_state: Default::default(),
                 last_mouse: None,
                 mouse_down_position: None,
                 matches: Vec::new(),
@@ -1493,6 +1496,7 @@ pub struct Terminal {
     mouse_down_position: Option<GpuiPoint<Pixels>>,
     pub matches: Vec<Range>,
     pub last_content: Content,
+    shell_state: shell_state::ShellState,
     pub selection_head: Option<Point>,
 
     pub breadcrumb_text: String,
@@ -1597,9 +1601,19 @@ impl Terminal {
 
     fn process_event(&mut self, event: TerminalBackendEvent, cx: &mut Context<Self>) {
         match event {
-            TerminalBackendEvent::Osc(_params) => {
-                // Consumed by ShellState in phase 1b; the passthrough seam
-                // itself is covered by osc_passthrough_tests.
+            TerminalBackendEvent::Osc(params) => {
+                // The cursor at the moment `133;B` arrives is where the user's
+                // input begins, so it is read here rather than looked up later:
+                // by the time anything asks, the shell has printed more.
+                let cursor = shell_state::GridPoint {
+                    line: self.last_content.cursor.point.line,
+                    column: self.last_content.cursor.point.column,
+                };
+                self.shell_state
+                    .set_alt_screen(self.last_content.mode.contains(Modes::ALT_SCREEN));
+                if self.shell_state.handle_osc(&params, cursor) {
+                    cx.notify();
+                }
             }
             TerminalBackendEvent::Title(title) => {
                 // ignore default shell program title change as windows always sends those events
@@ -1944,6 +1958,58 @@ impl Terminal {
         drop(term);
         self.detect_init_command_startup_marker();
         cx.emit(Event::Wakeup);
+    }
+
+    /// Read-only view of what the shell has reported about itself.
+    pub fn shell_state(&self) -> &shell_state::ShellState {
+        &self.shell_state
+    }
+
+    /// The text the user has typed at the current prompt, and the byte offset
+    /// of the cursor within it.
+    ///
+    /// Read out of the grid rather than reconstructed from keystrokes. The grid
+    /// is what the shell actually produced, so this stays correct through the
+    /// shell's own completion, history recall, line editing and anything else
+    /// that rewrites the line without the editor seeing a keystroke for it.
+    ///
+    /// `None` whenever completions are not allowed, so callers cannot act on a
+    /// buffer read outside a prompt.
+    pub fn edit_buffer(&self) -> Option<(String, usize)> {
+        if !self.shell_state.completions_allowed() {
+            return None;
+        }
+        let start = self.shell_state.command_start()?;
+        let cursor = self.last_content.cursor.point;
+
+        // A cursor before the reported start means the grid has scrolled or
+        // been redrawn since the marker arrived; the anchor is stale and
+        // guessing from it would produce a plausible, wrong line.
+        if (cursor.line, cursor.column) < (start.line, start.column) {
+            return None;
+        }
+
+        let mut text = String::new();
+        for cell in &self.last_content.cells {
+            let point = cell.point;
+            let after_start = (point.line, point.column) >= (start.line, start.column);
+            let before_cursor = (point.line, point.column) < (cursor.line, cursor.column);
+            if after_start && before_cursor {
+                // Wide characters occupy a second, spacer cell carrying no
+                // glyph; skipping it keeps the byte offset aligned with what
+                // the user sees.
+                let character = cell.cell.character();
+                if character != '\0' {
+                    text.push(character);
+                }
+            }
+        }
+
+        // Trailing spaces are grid padding to the end of a line, not typed
+        // input, and would break prefix matching against history.
+        let trimmed = text.trim_end().to_string();
+        let cursor_offset = trimmed.len();
+        Some((trimmed, cursor_offset))
     }
 
     pub fn total_lines(&self) -> usize {
