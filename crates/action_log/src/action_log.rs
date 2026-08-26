@@ -1330,6 +1330,477 @@ mod tests {
         });
     }
 
+    /// A deliberately dumb model of what hunk review must produce.
+    ///
+    /// Plain `String`, flat byte ranges, offset arithmetic done by hand. It
+    /// shares nothing with the code under test — no rope, no anchors, no diff
+    /// engine, no `TrackedBuffer`. That is the entire point: an oracle built
+    /// from the machinery under test only proves self-consistency, and a
+    /// consistently-wrong implementation satisfies it.
+    ///
+    /// This is not hypothetical. `test_random_diffs` in this file asserts that
+    /// `diff_base` with `unreviewed_edits` applied equals the buffer — both
+    /// sides are state under test, so it cannot distinguish "correct" from
+    /// "wrong in the same way twice".
+    ///
+    /// Slow and ugly is fine. It never ships.
+    #[derive(Debug, Clone)]
+    struct ReferenceCorpus {
+        original: String,
+        /// Sorted by start, non-overlapping, byte ranges into `original`.
+        hunks: Vec<ReferenceHunk>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct ReferenceHunk {
+        range: Range<usize>,
+        replacement: String,
+    }
+
+    /// Shapes the generator must actually produce. Checked after generation,
+    /// because a generator that only emits tidy well-separated hunks yields a
+    /// confident green that means nothing.
+    #[derive(Debug, Default, Clone, Copy)]
+    struct CorpusCoverage {
+        adjacent_hunks: usize,
+        starts_at_zero: usize,
+        ends_at_eof: usize,
+        pure_deletion: usize,
+        pure_insertion: usize,
+    }
+
+    impl ReferenceCorpus {
+        /// Splices `original`, taking each hunk's replacement in order.
+        fn splice(&self, replacement_for: impl Fn(usize, &ReferenceHunk) -> String) -> String {
+            let mut out = String::new();
+            let mut cursor = 0usize;
+            for (index, hunk) in self.hunks.iter().enumerate() {
+                out.push_str(&self.original[cursor..hunk.range.start]);
+                out.push_str(&replacement_for(index, hunk));
+                cursor = hunk.range.end;
+            }
+            out.push_str(&self.original[cursor..]);
+            out
+        }
+
+        /// The text as the agent leaves it: every hunk applied.
+        fn agent_text(&self) -> String {
+            self.splice(|_, hunk| hunk.replacement.clone())
+        }
+
+        /// The text review must produce: accepted hunks keep the agent's bytes,
+        /// rejected hunks are back to the original bytes exactly.
+        fn expected(&self, accepted: &[bool]) -> String {
+            self.splice(|index, hunk| {
+                if accepted.get(index).copied().unwrap_or(false) {
+                    hunk.replacement.clone()
+                } else {
+                    self.original[hunk.range.clone()].to_string()
+                }
+            })
+        }
+
+        /// Where each hunk sits in `agent_text`, by hand-carried delta.
+        fn agent_ranges(&self) -> Vec<Range<usize>> {
+            let mut ranges = Vec::with_capacity(self.hunks.len());
+            let mut delta: isize = 0;
+            for hunk in &self.hunks {
+                let start = (hunk.range.start as isize + delta) as usize;
+                let end = start + hunk.replacement.len();
+                delta += hunk.replacement.len() as isize - hunk.range.len() as isize;
+                ranges.push(start..end);
+            }
+            ranges
+        }
+
+        fn coverage(&self) -> CorpusCoverage {
+            let mut coverage = CorpusCoverage::default();
+            for (index, hunk) in self.hunks.iter().enumerate() {
+                if hunk.range.start == 0 {
+                    coverage.starts_at_zero += 1;
+                }
+                if hunk.range.end == self.original.len() {
+                    coverage.ends_at_eof += 1;
+                }
+                if hunk.replacement.is_empty() && !hunk.range.is_empty() {
+                    coverage.pure_deletion += 1;
+                }
+                if hunk.range.is_empty() && !hunk.replacement.is_empty() {
+                    coverage.pure_insertion += 1;
+                }
+                if index > 0
+                    && self
+                        .hunks
+                        .get(index - 1)
+                        .is_some_and(|previous| previous.range.end == hunk.range.start)
+                {
+                    coverage.adjacent_hunks += 1;
+                }
+            }
+            coverage
+        }
+    }
+
+    /// Builds a corpus biased towards the shapes that break naive
+    /// implementations, rather than uniformly random tidy ones.
+    fn generate_corpus(rng: &mut StdRng) -> ReferenceCorpus {
+        let line_count = rng.random_range(4..14);
+        let mut original = String::new();
+        for line in 0..line_count {
+            // Distinct per line, so a misplaced boundary shows as wrong content
+            // rather than as coincidentally equal text.
+            original.push_str(&format!("line{line:02}\n"));
+        }
+
+        let mut hunks: Vec<ReferenceHunk> = Vec::new();
+        let mut cursor = 0usize;
+
+        while cursor < original.len() {
+            // Zero gap on purpose sometimes: adjacent hunks with no context
+            // between them are a classic boundary bug.
+            let gap = if rng.random_bool(0.35) {
+                0
+            } else {
+                rng.random_range(1..8)
+            };
+            let start = (cursor + gap).min(original.len());
+            if start > original.len() {
+                break;
+            }
+
+            let remaining = original.len() - start;
+            let (range, replacement) = match rng.random_range(0..10) {
+                0..2 if remaining > 0 => {
+                    // Pure deletion.
+                    let length = rng.random_range(1..=remaining.min(6));
+                    (start..start + length, String::new())
+                }
+                2..4 => {
+                    // Pure insertion.
+                    (start..start, format!("INS{}", rng.random_range(0..100)))
+                }
+                _ if remaining > 0 => {
+                    let length = rng.random_range(1..=remaining.min(6));
+                    (
+                        start..start + length,
+                        format!("R{}", rng.random_range(0..1000)),
+                    )
+                }
+                _ => break,
+            };
+
+            // Never split a UTF-8 boundary; the generated text is ASCII, so a
+            // byte range is always a char range, but assert rather than assume.
+            assert!(original.is_char_boundary(range.start));
+            assert!(original.is_char_boundary(range.end));
+
+            cursor = range.end.max(range.start + 1);
+            hunks.push(ReferenceHunk { range, replacement });
+
+            if hunks.len() >= 6 {
+                break;
+            }
+        }
+
+        ReferenceCorpus { original, hunks }
+    }
+
+    /// P1a property test — accept/reject round-trips to byte equality.
+    ///
+    /// Phase one of the corpus, deliberately: **pure accept/reject permutations,
+    /// no interleaved user edits.** An edit landing inside a pending hunk has no
+    /// unambiguous correct outcome, so including it here would let the test
+    /// settle a specification question by adopting whatever the implementation
+    /// already does. That phase waits until the semantics are written down.
+    ///
+    /// This phase is still worth running: it covers decision *order* over
+    /// adjacent, zero-context, boundary and empty-range hunks, which is where
+    /// offset arithmetic goes wrong.
+    ///
+    /// Expected bytes come from [`ReferenceCorpus`], which shares nothing with
+    /// the code under test.
+    #[gpui::test(iterations = 50)]
+    async fn test_accept_reject_round_trips_to_byte_equality(
+        mut rng: StdRng,
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let corpus = generate_corpus(&mut rng);
+        if corpus.hunks.is_empty() {
+            return;
+        }
+
+        let coverage = corpus.coverage();
+        let agent_text = corpus.agent_text();
+        let agent_ranges = corpus.agent_ranges();
+
+        let accepted: Vec<bool> = (0..corpus.hunks.len())
+            .map(|_| rng.random_bool(0.5))
+            .collect();
+        let mut order: Vec<usize> = (0..corpus.hunks.len()).collect();
+        for index in (1..order.len()).rev() {
+            order.swap(index, rng.random_range(0..=index));
+        }
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": corpus.original.clone()}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+
+        // One batched edit, so every range stays in original coordinates and the
+        // agent's text is produced in a single step.
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                corpus
+                    .hunks
+                    .iter()
+                    .map(|hunk| (hunk.range.clone(), hunk.replacement.clone())),
+                None,
+                cx,
+            );
+        });
+        action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+        cx.run_until_parked();
+
+        buffer.read_with(cx, |buffer, _| {
+            pretty_assertions::assert_eq!(
+                buffer.text(),
+                agent_text,
+                "agent edits did not produce the reference agent text"
+            );
+        });
+
+        // Positions carried by hand as decisions land, the same way the
+        // reference model does everything else.
+        let mut pending: Vec<Option<Range<usize>>> =
+            agent_ranges.iter().cloned().map(Some).collect();
+
+        for &index in &order {
+            let Some(range) = pending.get(index).cloned().flatten() else {
+                continue;
+            };
+
+            if accepted[index] {
+                action_log.update(cx, |log, cx| {
+                    log.keep_edits_in_range(buffer.clone(), range.clone(), None, cx);
+                });
+                cx.run_until_parked();
+            } else {
+                let task = action_log.update(cx, |log, cx| {
+                    let (task, _undo) =
+                        log.reject_edits_in_ranges(buffer.clone(), vec![range.clone()], None, cx);
+                    task
+                });
+                task.await.unwrap();
+                cx.run_until_parked();
+
+                // Rejection puts the original slice back, so everything after it
+                // shifts by the length difference.
+                let original_len = corpus.hunks[index].range.len();
+                let delta = original_len as isize - range.len() as isize;
+                for (other, slot) in pending.iter_mut().enumerate() {
+                    if other == index {
+                        continue;
+                    }
+                    if let Some(other_range) = slot
+                        && other_range.start >= range.end
+                    {
+                        *slot = Some(
+                            (other_range.start as isize + delta) as usize
+                                ..(other_range.end as isize + delta) as usize,
+                        );
+                    }
+                }
+            }
+
+            if let Some(slot) = pending.get_mut(index) {
+                *slot = None;
+            }
+        }
+
+        let expected = corpus.expected(&accepted);
+        buffer.read_with(cx, |buffer, _| {
+            pretty_assertions::assert_eq!(
+                buffer.text(),
+                expected,
+                "review result did not match the reference model (corpus {:?}, accepted {:?}, order {:?}, coverage {:?})",
+                corpus,
+                accepted,
+                order,
+                coverage
+            );
+        });
+    }
+
+    /// Guards the corpus generator itself.
+    ///
+    /// A generator that only ever emits tidy, well-separated hunks makes
+    /// [`test_accept_reject_round_trips_to_byte_equality`] pass for reasons that
+    /// have nothing to do with the implementation being correct. This asserts
+    /// the nasty shapes actually occur.
+    #[gpui::test]
+    async fn test_corpus_generator_produces_hard_shapes(_cx: &mut TestAppContext) {
+        let mut rng = StdRng::seed_from_u64(0);
+        let mut total = CorpusCoverage::default();
+        let mut hunks_seen = 0usize;
+
+        for _ in 0..400 {
+            let corpus = generate_corpus(&mut rng);
+            hunks_seen += corpus.hunks.len();
+            let coverage = corpus.coverage();
+            total.adjacent_hunks += coverage.adjacent_hunks;
+            total.starts_at_zero += coverage.starts_at_zero;
+            total.ends_at_eof += coverage.ends_at_eof;
+            total.pure_deletion += coverage.pure_deletion;
+            total.pure_insertion += coverage.pure_insertion;
+        }
+
+        assert!(
+            hunks_seen > 400,
+            "generator produced too few hunks: {hunks_seen}"
+        );
+        assert!(
+            total.adjacent_hunks > 20,
+            "generator rarely emits zero-context adjacent hunks: {total:?}"
+        );
+        assert!(
+            total.starts_at_zero > 5,
+            "generator rarely emits a hunk at byte 0: {total:?}"
+        );
+        assert!(
+            total.ends_at_eof > 5,
+            "generator rarely emits a hunk ending at EOF: {total:?}"
+        );
+        assert!(
+            total.pure_deletion > 20,
+            "generator rarely emits pure deletions: {total:?}"
+        );
+        assert!(
+            total.pure_insertion > 20,
+            "generator rarely emits pure insertions: {total:?}"
+        );
+    }
+
+    /// P1a — accept/reject stays byte-exact when a user edit lands *between*
+    /// pending hunks.
+    ///
+    /// Scope is deliberately limited to a user edit that falls **outside every
+    /// pending hunk's range**, which has one obvious right answer: the decision
+    /// must not disturb it. An edit *inside* a pending hunk has no obvious
+    /// answer — restoring original bytes silently destroys the user's work,
+    /// keeping their bytes means "reject" did not reject — and that is a
+    /// specification decision, not something a test may settle by discovering
+    /// whatever the implementation happens to do. Those cases are excluded here
+    /// and from the corpus below until the semantics are written down.
+    ///
+    /// What this still catches: the user edit shifts the anchors of the second
+    /// hunk before it is reviewed, so an implementation tracking offsets rather
+    /// than anchors passes the trivial case and fails this one.
+    #[gpui::test(iterations = 25)]
+    async fn test_accept_reject_survives_user_edit_between_hunks(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        // Distinct per line so a misplaced hunk boundary shows up as wrong
+        // content rather than coincidentally-equal text.
+        const ORIGINAL: &str = "line0
+line1
+line2
+line3
+line4
+line5
+line6
+line7
+";
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": ORIGINAL})).await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+
+        let file_path = project
+            .read_with(cx, |project, cx| {
+                project.find_project_path("dir/file", cx)
+            })
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        // The agent rewrites two widely separated lines, producing two hunks
+        // with untouched context between them.
+        action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [
+                    (Point::new(1, 0)..Point::new(1, 5), "AGENT_ONE"),
+                    (Point::new(5, 0)..Point::new(5, 5), "AGENT_TWO"),
+                ],
+                None,
+                cx,
+            );
+        });
+        action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+        cx.run_until_parked();
+
+        // A manual edit between the two hunks, before either is reviewed. This
+        // is what shifts the anchors of the second hunk.
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(Point::new(3, 0)..Point::new(3, 5), "USER_EDIT")], None, cx);
+        });
+        cx.run_until_parked();
+
+        // Accept the first hunk and reject the second. Order is deliberate:
+        // the rejection happens after an accept has already mutated review
+        // state, which is the interleaving the brief asks about.
+        action_log.update(cx, |log, cx| {
+            log.keep_edits_in_range(buffer.clone(), Point::new(1, 0)..Point::new(1, 9), None, cx);
+        });
+        cx.run_until_parked();
+
+        let (reject, _undo) = action_log.update(cx, |log, cx| {
+            log.reject_edits_in_ranges(
+                buffer.clone(),
+                vec![Point::new(5, 0)..Point::new(5, 9)],
+                None,
+                cx,
+            )
+        });
+        reject.await.unwrap();
+        cx.run_until_parked();
+
+        // Expected: the accepted hunk keeps the agent's bytes, the rejected one
+        // is back to the original bytes, and the user's own edit is untouched
+        // by either decision.
+        let expected = "line0
+AGENT_ONE
+line2
+USER_EDIT
+line4
+line5
+line6
+line7
+";
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(
+                buffer.text(),
+                expected,
+                "accept/reject did not produce byte-exact content under interleaving"
+            );
+        });
+    }
+
     #[gpui::test(iterations = 10)]
     async fn test_keep_edits(cx: &mut TestAppContext) {
         init_test(cx);
