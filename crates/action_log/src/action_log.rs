@@ -49,6 +49,29 @@ pub struct LastRejectUndo {
 }
 
 /// Tracks actions performed by tools in a thread
+/// A rejection that is kept rather than discarded.
+///
+/// The brief's rule is that a rejected hunk must never disappear silently: it
+/// stays in the review list, greyed, and can be taken back. Everything needed
+/// for that is already computed while rejecting — the range the restored
+/// original now occupies, and the agent text that was displaced — it was simply
+/// handed back to the caller and dropped. This retains it.
+#[derive(Clone, Debug)]
+pub struct RejectedHunk {
+    /// Stable across list mutations, so the UI can identify a row without
+    /// depending on its position.
+    pub id: RejectedHunkId,
+    pub buffer: WeakEntity<Buffer>,
+    /// Where the restored original text sits now. An anchor range, so it
+    /// survives later edits elsewhere in the buffer.
+    pub range: Range<Anchor>,
+    /// What the agent had proposed, so rejection can be taken back.
+    pub agent_text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RejectedHunkId(pub usize);
+
 pub struct ActionLog {
     /// Buffers that we want to notify the model about when they change.
     tracked_buffers: BTreeMap<Entity<Buffer>, TrackedBuffer>,
@@ -60,6 +83,10 @@ pub struct ActionLog {
     linked_action_log: Option<Entity<ActionLog>>,
     /// Stores undo information for the most recent reject operation
     last_reject_undo: Option<LastRejectUndo>,
+    /// Rejections kept so they stay visible and can be taken back, rather than
+    /// vanishing from the review list the moment they are made.
+    rejected_hunks: Vec<RejectedHunk>,
+    next_rejected_hunk_id: usize,
     /// Tracks the last time files were read by the agent, to detect external modifications
     file_read_times: HashMap<PathBuf, MTime>,
 }
@@ -72,6 +99,8 @@ impl ActionLog {
             project,
             linked_action_log: None,
             last_reject_undo: None,
+            rejected_hunks: Vec::new(),
+            next_rejected_hunk_id: 0,
             file_read_times: HashMap::default(),
         }
     }
@@ -883,7 +912,84 @@ impl ActionLog {
         if let Some(telemetry) = telemetry {
             telemetry_report_rejected_edits(&telemetry, metrics);
         }
+
+        // Retained before the task is returned, so a rejection is recorded even
+        // if the caller discards the undo handle — which every caller currently
+        // does.
+        if let Some(undo) = &undo_info {
+            self.retain_rejection(undo, cx);
+        }
+
         (task, undo_info)
+    }
+
+    /// Records a rejection so it stays visible and re-acceptable.
+    fn retain_rejection(&mut self, undo: &PerBufferUndo, cx: &mut Context<Self>) {
+        for (range, agent_text) in &undo.edits_to_restore {
+            let id = RejectedHunkId(self.next_rejected_hunk_id);
+            self.next_rejected_hunk_id += 1;
+            self.rejected_hunks.push(RejectedHunk {
+                id,
+                buffer: undo.buffer.clone(),
+                range: range.clone(),
+                agent_text: agent_text.clone(),
+            });
+        }
+        cx.notify();
+    }
+
+    /// Rejections made so far, oldest first.
+    pub fn rejected_hunks(&self) -> &[RejectedHunk] {
+        &self.rejected_hunks
+    }
+
+    /// Rejections recorded against one buffer.
+    pub fn rejected_hunks_for_buffer(
+        &self,
+        buffer: &Entity<Buffer>,
+    ) -> impl Iterator<Item = &RejectedHunk> {
+        self.rejected_hunks
+            .iter()
+            .filter(move |hunk| hunk.buffer.entity_id() == buffer.entity_id())
+    }
+
+    /// Takes a rejection back, putting the agent's text where the original was
+    /// restored and returning the hunk to review.
+    ///
+    /// Returns whether the rejection was found and applied.
+    pub fn restore_rejected_hunk(
+        &mut self,
+        id: RejectedHunkId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(index) = self.rejected_hunks.iter().position(|hunk| hunk.id == id) else {
+            return false;
+        };
+        let hunk = self.rejected_hunks.remove(index);
+        let Some(buffer) = hunk.buffer.upgrade() else {
+            // The buffer is gone; dropping the record is the only option left,
+            // and it is better than keeping a row that can never be acted on.
+            cx.notify();
+            return false;
+        };
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(hunk.range.clone(), hunk.agent_text.clone())], None, cx);
+        });
+        // Re-tracked as an agent edit, so the restored hunk reappears in review
+        // rather than being mistaken for something the user typed.
+        self.buffer_edited(buffer, cx);
+        cx.notify();
+        true
+    }
+
+    /// Forgets retained rejections. Called when a review session ends, so a new
+    /// one does not inherit the previous one's list.
+    pub fn clear_rejected_hunks(&mut self, cx: &mut Context<Self>) {
+        if !self.rejected_hunks.is_empty() {
+            self.rejected_hunks.clear();
+            cx.notify();
+        }
     }
 
     pub fn keep_all_edits(
@@ -1518,6 +1624,102 @@ mod tests {
         }
 
         ReferenceCorpus { original, hunks }
+    }
+
+    /// P1a — a rejected hunk is kept, not lost, and can be taken back.
+    ///
+    /// The brief's rule is that a rejection never disappears silently: it stays
+    /// in the review list and remains re-acceptable. Upstream computed
+    /// everything needed for that while rejecting and handed it to the caller,
+    /// which discarded it, so a rejection was unrecoverable in practice.
+    #[gpui::test]
+    async fn test_rejected_hunks_are_retained_and_restorable(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({"file": "line0\nline1\nline2\nline3\nline4\n"}),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        // Single `cx.update`: effects must not flush between the read, the edit
+        // and `buffer_edited`, or the edit is attributed to the user.
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+            buffer.update(cx, |buffer, cx| {
+                buffer
+                    .edit(
+                        [(Point::new(1, 0)..Point::new(1, 5), "AGENT_ONE")],
+                        None,
+                        cx,
+                    )
+                    .unwrap()
+            });
+            action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+        });
+        cx.run_until_parked();
+
+        let task = action_log.update(cx, |log, cx| {
+            let (task, _undo) = log.reject_edits_in_ranges(
+                buffer.clone(),
+                vec![Point::new(1, 0)..Point::new(1, 9)],
+                None,
+                cx,
+            );
+            task
+        });
+        task.await.unwrap();
+        cx.run_until_parked();
+
+        // The original is back in the buffer...
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "line0\nline1\nline2\nline3\nline4\n");
+        });
+
+        // ...and the rejection is still on the books, carrying what the agent
+        // had proposed.
+        let rejected_id = action_log.read_with(cx, |log, _| {
+            let rejected = log.rejected_hunks();
+            assert_eq!(
+                rejected.len(),
+                1,
+                "rejection was dropped instead of retained"
+            );
+            // Line-granular: the hunk spans the whole line, newline included.
+            assert_eq!(rejected[0].agent_text, "AGENT_ONE
+");
+            rejected[0].id
+        });
+
+        let restored =
+            action_log.update(cx, |log, cx| log.restore_rejected_hunk(rejected_id, cx));
+        assert!(restored, "restoring a retained rejection should succeed");
+        cx.run_until_parked();
+
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(
+                buffer.text(),
+                "line0\nAGENT_ONE\nline2\nline3\nline4\n",
+                "taking a rejection back should restore the agent's text exactly"
+            );
+        });
+
+        action_log.read_with(cx, |log, _| {
+            assert!(
+                log.rejected_hunks().is_empty(),
+                "a restored rejection should leave the rejected list"
+            );
+        });
     }
 
     /// P1a property test — accept/reject round-trips to byte equality.
