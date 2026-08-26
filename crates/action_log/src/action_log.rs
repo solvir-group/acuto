@@ -1362,11 +1362,14 @@ mod tests {
     /// confident green that means nothing.
     #[derive(Debug, Default, Clone, Copy)]
     struct CorpusCoverage {
-        adjacent_hunks: usize,
-        starts_at_zero: usize,
-        ends_at_eof: usize,
+        /// Consecutive hunks with exactly one untouched line between them —
+        /// the tightest packing that still yields two distinct diff hunks.
+        minimally_separated: usize,
+        touches_first_line: usize,
+        touches_last_line: usize,
         pure_deletion: usize,
         pure_insertion: usize,
+        partial_line: usize,
     }
 
     impl ReferenceCorpus {
@@ -1415,12 +1418,13 @@ mod tests {
 
         fn coverage(&self) -> CorpusCoverage {
             let mut coverage = CorpusCoverage::default();
+            let last_line_start = self.original.rfind('\n').map(|index| index + 1);
             for (index, hunk) in self.hunks.iter().enumerate() {
-                if hunk.range.start == 0 {
-                    coverage.starts_at_zero += 1;
+                if hunk.range.start < 7 {
+                    coverage.touches_first_line += 1;
                 }
-                if hunk.range.end == self.original.len() {
-                    coverage.ends_at_eof += 1;
+                if last_line_start.is_some_and(|start| hunk.range.start >= start.saturating_sub(7)) {
+                    coverage.touches_last_line += 1;
                 }
                 if hunk.replacement.is_empty() && !hunk.range.is_empty() {
                     coverage.pure_deletion += 1;
@@ -1428,13 +1432,16 @@ mod tests {
                 if hunk.range.is_empty() && !hunk.replacement.is_empty() {
                     coverage.pure_insertion += 1;
                 }
+                if !hunk.range.is_empty() && hunk.range.len() < 6 {
+                    coverage.partial_line += 1;
+                }
                 if index > 0
-                    && self
-                        .hunks
-                        .get(index - 1)
-                        .is_some_and(|previous| previous.range.end == hunk.range.start)
+                    && let Some(previous) = self.hunks.get(index - 1)
                 {
-                    coverage.adjacent_hunks += 1;
+                    let between = &self.original[previous.range.end..hunk.range.start];
+                    if between.matches('\n').count() == 2 { // two newlines = exactly one untouched line between hunks
+                        coverage.minimally_separated += 1;
+                    }
                 }
             }
             coverage
@@ -1442,64 +1449,72 @@ mod tests {
     }
 
     /// Builds a corpus biased towards the shapes that break naive
-    /// implementations, rather than uniformly random tidy ones.
+    /// implementations.
+    ///
+    /// **Hunks are separated by at least one untouched line, deliberately.**
+    /// The review unit is a coalesced, line-aligned diff hunk, not a byte
+    /// range: two edits with no untouched line between them merge into a single
+    /// hunk, and "accept the first, reject the second" is then not an operation
+    /// the product has. Generating those cases tested something that cannot be
+    /// expressed rather than something that is broken.
+    ///
+    /// This is a correction to the *unit*, not a relaxation of the property.
+    /// Sub-line ranges, deletions, insertions and first/last-line placement all
+    /// remain, and separation is still allowed to be the tightest legal value.
     fn generate_corpus(rng: &mut StdRng) -> ReferenceCorpus {
-        let line_count = rng.random_range(4..14);
+        let line_count = rng.random_range(6..16);
+        let line_width = 7; // "lineNN\n"
         let mut original = String::new();
         for line in 0..line_count {
-            // Distinct per line, so a misplaced boundary shows as wrong content
-            // rather than as coincidentally equal text.
             original.push_str(&format!("line{line:02}\n"));
         }
 
         let mut hunks: Vec<ReferenceHunk> = Vec::new();
-        let mut cursor = 0usize;
+        let mut line = rng.random_range(0..2);
 
-        while cursor < original.len() {
-            // Zero gap on purpose sometimes: adjacent hunks with no context
-            // between them are a classic boundary bug.
-            let gap = if rng.random_bool(0.35) {
-                0
-            } else {
-                rng.random_range(1..8)
-            };
-            let start = (cursor + gap).min(original.len());
-            if start > original.len() {
-                break;
-            }
-
-            let remaining = original.len() - start;
+        while line < line_count && hunks.len() < 5 {
+            let line_start = line * line_width;
+            // Column range within the line's text, excluding its newline.
             let (range, replacement) = match rng.random_range(0..10) {
-                0..2 if remaining > 0 => {
-                    // Pure deletion.
-                    let length = rng.random_range(1..=remaining.min(6));
-                    (start..start + length, String::new())
+                0..2 => {
+                    let column = rng.random_range(0..6);
+                    (
+                        line_start + column..line_start + column,
+                        format!("INS{}", rng.random_range(0..100)),
+                    )
                 }
                 2..4 => {
-                    // Pure insertion.
-                    (start..start, format!("INS{}", rng.random_range(0..100)))
-                }
-                _ if remaining > 0 => {
-                    let length = rng.random_range(1..=remaining.min(6));
+                    let start_column = rng.random_range(0..5);
+                    let end_column = rng.random_range(start_column + 1..=6);
                     (
-                        start..start + length,
+                        line_start + start_column..line_start + end_column,
+                        String::new(),
+                    )
+                }
+                4..7 => {
+                    let start_column = rng.random_range(0..5);
+                    let end_column = rng.random_range(start_column + 1..=6);
+                    (
+                        line_start + start_column..line_start + end_column,
                         format!("R{}", rng.random_range(0..1000)),
                     )
                 }
-                _ => break,
+                _ => (
+                    line_start..line_start + 6,
+                    format!("WHOLE{}", rng.random_range(0..100)),
+                ),
             };
 
-            // Never split a UTF-8 boundary; the generated text is ASCII, so a
-            // byte range is always a char range, but assert rather than assume.
             assert!(original.is_char_boundary(range.start));
             assert!(original.is_char_boundary(range.end));
-
-            cursor = range.end.max(range.start + 1);
             hunks.push(ReferenceHunk { range, replacement });
 
-            if hunks.len() >= 6 {
-                break;
-            }
+            // At least one untouched line before the next hunk.
+            line += if rng.random_bool(0.5) {
+                2
+            } else {
+                rng.random_range(2..4)
+            };
         }
 
         ReferenceCorpus { original, hunks }
@@ -1556,21 +1571,28 @@ mod tests {
             .await
             .unwrap();
 
-        action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
-
-        // One batched edit, so every range stays in original coordinates and the
-        // agent's text is produced in a single step.
-        buffer.update(cx, |buffer, cx| {
-            buffer.edit(
-                corpus
-                    .hunks
-                    .iter()
-                    .map(|hunk| (hunk.range.clone(), hunk.replacement.clone())),
-                None,
-                cx,
-            );
+        // Read, edit and edited must happen inside ONE `cx.update`. Split across
+        // separate context calls, GPUI flushes effects between them, the
+        // buffer's change event reaches the action log before `buffer_edited`
+        // does, and the edits are attributed to the user — leaving nothing
+        // recorded as an agent hunk and every rejection a silent no-op.
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+            // One batched edit, so every range stays in original coordinates.
+            buffer.update(cx, |buffer, cx| {
+                buffer
+                    .edit(
+                        corpus
+                            .hunks
+                            .iter()
+                            .map(|hunk| (hunk.range.clone(), hunk.replacement.clone())),
+                        None,
+                        cx,
+                    )
+                    .unwrap()
+            });
+            action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
         });
-        action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
         cx.run_until_parked();
 
         buffer.read_with(cx, |buffer, _| {
@@ -1659,11 +1681,12 @@ mod tests {
             let corpus = generate_corpus(&mut rng);
             hunks_seen += corpus.hunks.len();
             let coverage = corpus.coverage();
-            total.adjacent_hunks += coverage.adjacent_hunks;
-            total.starts_at_zero += coverage.starts_at_zero;
-            total.ends_at_eof += coverage.ends_at_eof;
+            total.minimally_separated += coverage.minimally_separated;
+            total.touches_first_line += coverage.touches_first_line;
+            total.touches_last_line += coverage.touches_last_line;
             total.pure_deletion += coverage.pure_deletion;
             total.pure_insertion += coverage.pure_insertion;
+            total.partial_line += coverage.partial_line;
         }
 
         assert!(
@@ -1671,16 +1694,16 @@ mod tests {
             "generator produced too few hunks: {hunks_seen}"
         );
         assert!(
-            total.adjacent_hunks > 20,
-            "generator rarely emits zero-context adjacent hunks: {total:?}"
+            total.minimally_separated > 40,
+            "generator rarely emits minimally separated hunks: {total:?}"
         );
         assert!(
-            total.starts_at_zero > 5,
-            "generator rarely emits a hunk at byte 0: {total:?}"
+            total.touches_first_line > 5,
+            "generator rarely touches the first line: {total:?}"
         );
         assert!(
-            total.ends_at_eof > 5,
-            "generator rarely emits a hunk ending at EOF: {total:?}"
+            total.touches_last_line > 5,
+            "generator rarely touches the last line: {total:?}"
         );
         assert!(
             total.pure_deletion > 20,
@@ -1689,6 +1712,10 @@ mod tests {
         assert!(
             total.pure_insertion > 20,
             "generator rarely emits pure insertions: {total:?}"
+        );
+        assert!(
+            total.partial_line > 20,
+            "generator rarely emits partial-line edits: {total:?}"
         );
     }
 
@@ -1740,18 +1767,23 @@ line7
 
         // The agent rewrites two widely separated lines, producing two hunks
         // with untouched context between them.
-        action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
-        buffer.update(cx, |buffer, cx| {
-            buffer.edit(
-                [
-                    (Point::new(1, 0)..Point::new(1, 5), "AGENT_ONE"),
-                    (Point::new(5, 0)..Point::new(5, 5), "AGENT_TWO"),
-                ],
-                None,
-                cx,
-            );
+        // Single `cx.update`: see the note in the property test below.
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
+            buffer.update(cx, |buffer, cx| {
+                buffer
+                    .edit(
+                        [
+                            (Point::new(1, 0)..Point::new(1, 5), "AGENT_ONE"),
+                            (Point::new(5, 0)..Point::new(5, 5), "AGENT_TWO"),
+                        ],
+                        None,
+                        cx,
+                    )
+                    .unwrap()
+            });
+            action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
         });
-        action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
         cx.run_until_parked();
 
         // A manual edit between the two hunks, before either is reviewed. This
