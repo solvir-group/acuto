@@ -981,14 +981,19 @@ webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev 
 split-debuginfo = "unpacked"
 incremental = true
 codegen-units = 16
-debug = "limited"
+# Fork change: "limited" upstream. Set durably here rather than through
+# CARGO_PROFILE_DEV_DEBUG, because an env var only covers the commands that
+# remember to set it — `cargo check` and `cargo test` runs without it were
+# still emitting the larger form and filling the disk. File+line survives, so
+# backtraces stay usable.
+debug = "line-tables-only"
 
 # mirror configuration for crates compiled for the build platform
 # (without this cargo will compile ~400 crates twice)
 [profile.dev.build-override]
 codegen-units = 16
 split-debuginfo = "unpacked"
-debug = "limited"
+debug = "line-tables-only"
 
 # "debug" is a reserved profile name.
 [profile.dbg]
