@@ -310,10 +310,24 @@ impl TerminalView {
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
-            history: terminal_completion::HistoryStore::new(
-                uuid::Uuid::new_v4().to_string(),
-                terminal_completion::DEFAULT_HISTORY_LIMIT,
-            ),
+            history: {
+                let mut history = terminal_completion::HistoryStore::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    terminal_completion::DEFAULT_HISTORY_LIMIT,
+                );
+                // Seeded so the very first prompt already suggests. Nothing is
+                // written back to the shell's file; it belongs to the shell.
+                let program = TerminalSettings::get_global(cx).shell.program();
+                if let Some(kind) = terminal_completion::ShellHistoryKind::from_program(&program) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_secs() as i64)
+                        .unwrap_or_default();
+                    let seeded = history.seed_from_shell_history(kind, now);
+                    log::info!("terminal completion: seeded {seeded} commands from {kind:?}");
+                }
+                history
+            },
             suggestion: None,
             suggestion_dismissed_for: None,
             scroll_handle,
@@ -1431,6 +1445,28 @@ impl TerminalView {
 
         if previous != self.suggestion {
             cx.notify();
+        }
+
+        // TEMPORARY: written to disk because the app writes no log here, and
+        // six bugs in this feature were each invisible to a passing test suite.
+        if std::env::var_os("ACUTO_COMPLETION_DEBUG").is_some() {
+            let line = format!(
+                "phase={:?} allowed={} typed={:?} history={} suggestion={:?}\n",
+                self.terminal.read(cx).shell_state().phase(),
+                self.terminal.read(cx).shell_state().completions_allowed(),
+                self.suggestion.as_ref().map(|(typed, _)| typed.clone()),
+                self.history.entries().len(),
+                self.suggestion.as_ref().map(|(_, s)| s.command.clone()),
+            );
+            let path = paths::logs_dir().join("completion-debug.log");
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = file.write_all(line.as_bytes());
+            }
         }
     }
 

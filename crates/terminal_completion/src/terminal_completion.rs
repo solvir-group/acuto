@@ -23,9 +23,11 @@
 //!    whatever you are doing now is the best predictor of what you will do next.
 
 pub mod history;
+pub mod shell_history;
 
 /// Commands kept per terminal. Large enough to cover a long working session,
 /// small enough that ranking over it stays instant.
 pub const DEFAULT_HISTORY_LIMIT: usize = 10_000;
 
 pub use history::{HistoryEntry, HistoryStore, Suggestion};
+pub use shell_history::ShellHistoryKind;

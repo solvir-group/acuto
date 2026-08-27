@@ -18157,6 +18157,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "async-channel 2.5.0",
+ "base64 0.22.1",
  "collections",
  "dirs",
  "futures 0.3.32",
@@ -18193,6 +18194,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "db",
+ "dirs",
  "gpui",
  "indoc",
  "sqlez",
@@ -18227,6 +18229,7 @@ dependencies = [
  "language",
  "log",
  "menu",
+ "paths",
  "pretty_assertions",
  "project",
  "regex",

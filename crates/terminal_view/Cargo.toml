@@ -40,6 +40,7 @@ serde_json.workspace = true
 settings.workspace = true
 shellexpand.workspace = true
 shlex.workspace = true
+paths.workspace = true
 terminal_completion.workspace = true
 terminal.workspace = true
 theme.workspace = true

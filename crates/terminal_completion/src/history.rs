@@ -20,6 +20,12 @@ const DECAY_PER_DAY: f64 = 0.933;
 /// Multiplier for a command recorded in this session.
 const SESSION_BOOST: f64 = 2.0;
 
+/// Session id given to entries read out of the shell's own history file.
+///
+/// Distinct so they never receive the session boost: a command actually
+/// observed running now is better evidence than a line in a file.
+pub const SEEDED_SESSION: &str = "shell-history";
+
 /// Multiplier for an exact working-directory match.
 const EXACT_DIRECTORY_BOOST: f64 = 4.0;
 
@@ -103,6 +109,37 @@ impl HistoryStore {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Fills the store from the shell's own history file.
+    ///
+    /// Without this the first prompt of every session has nothing to suggest,
+    /// which is exactly when someone decides whether the feature works. The
+    /// shell has been recording this for years and the file is already there.
+    ///
+    /// Seeded entries carry no directory and no exit code: the file records
+    /// neither. That places them below anything observed directly, which is the
+    /// correct ranking — a command seen running in this directory is better
+    /// evidence than a line in a flat list.
+    pub fn seed_from_shell_history(&mut self, kind: crate::ShellHistoryKind, now: i64) -> usize {
+        let commands = kind.read();
+        let count = commands.len();
+
+        // Oldest first, and back-dated in order, so the decay curve still
+        // prefers the more recent of two seeded commands.
+        for (index, command) in commands.into_iter().enumerate() {
+            let age = (count - index) as i64;
+            self.record(HistoryEntry {
+                command,
+                cwd: None,
+                exit_code: None,
+                started_at: now - age,
+                duration_ms: 0,
+                session_id: SEEDED_SESSION.to_string(),
+            });
+        }
+
+        count
     }
 
     /// Records a finished command.
