@@ -62,11 +62,14 @@ pub struct ShellState {
     /// integration installed" from "integration installed, currently between
     /// prompts". Only the former warrants an install prompt.
     integration_seen: bool,
-    /// The command captured at `133;C`, held until `133;D` reports how it went.
+    /// The last non-empty line seen at the prompt.
     ///
-    /// Captured on the way in rather than read back on the way out: by the time
-    /// the command finishes the shell has printed its output and possibly
-    /// scrolled, so the line is no longer where it was.
+    /// Recorded continuously while the user types rather than captured at a
+    /// start-of-execution marker, because PowerShell has no dependable
+    /// pre-execution hook — its only one is a PSReadLine key handler, which
+    /// does not fire over a pty. By the time a command finishes its output has
+    /// scrolled the line away, so the only way to know what ran is to have been
+    /// watching.
     running_command: Option<String>,
     /// Unix seconds when the running command started.
     started_at: Option<i64>,
@@ -126,6 +129,25 @@ impl ShellState {
 
     pub fn set_alt_screen(&mut self, alt_screen: bool) {
         self.alt_screen = alt_screen;
+    }
+
+    /// Remembers what is currently typed at the prompt.
+    ///
+    /// Blank lines are ignored so that pressing Enter at an empty prompt, or
+    /// the prompt being redrawn, does not erase the command that is about to
+    /// run.
+    pub fn observe_prompt_line(&mut self, line: &str, now: i64) {
+        if self.phase != PromptPhase::AtPrompt {
+            return;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        if self.running_command.as_deref() != Some(line) {
+            self.running_command = Some(line.to_string());
+            self.started_at = Some(now);
+        }
     }
 
     /// Folds one passthrough OSC into the state.
@@ -188,15 +210,12 @@ impl ShellState {
             }
             b"C" => {
                 self.integration_seen = true;
+                // A last chance to capture the line, for shells that do report
+                // execution start. Nothing depends on this arriving.
+                if let Some(line) = typed_line {
+                    self.observe_prompt_line(line, now);
+                }
                 self.phase = PromptPhase::Executing;
-                // Captured now, while the line is still on screen where it was
-                // typed. After the command runs, its output has scrolled the
-                // grid and the line is no longer recoverable.
-                self.running_command = typed_line
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_string);
-                self.started_at = Some(now);
                 Some(HandledOsc::Changed)
             }
             b"D" => {
@@ -221,9 +240,9 @@ impl ShellState {
                             cwd: self.cwd.clone(),
                         }))
                     }
-                    // A D with no preceding C — the first prompt of a session,
-                    // or a shell that reports inconsistently. Nothing ran, so
-                    // nothing is recorded.
+                    // Nothing was typed at the previous prompt — the first
+                    // prompt of a session, or a bare Enter. The shell reports D
+                    // unconditionally, so this is the common case, not an error.
                     _ => Some(HandledOsc::Changed),
                 }
             }

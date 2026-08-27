@@ -315,6 +315,13 @@ fn merge_powershell_args(existing: &[String], script: &str) -> Vec<String> {
     args
 }
 
+/// The arguments a PowerShell terminal is actually launched with, for tests
+/// that need to spawn the real thing.
+#[cfg(any(test, feature = "test-support"))]
+pub fn powershell_args_for_test(script: &str) -> Vec<String> {
+    merge_powershell_args(&[], script)
+}
+
 /// Encodes a script the way `-EncodedCommand` expects: base64 of UTF-16LE.
 ///
 /// UTF-16 rather than UTF-8 because that is what PowerShell decodes to; feeding

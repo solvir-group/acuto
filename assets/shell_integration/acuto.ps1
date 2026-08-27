@@ -73,10 +73,15 @@ try {
         __Acuto-ArmEnterHandler
 
         # D before A: the previous command finished, then a new prompt starts.
-        if ($env:ACUTO_COMMAND_RUNNING) {
-            __Acuto-Osc "133;D;$exitCode"
-            $env:ACUTO_COMMAND_RUNNING = $null
-        }
+        #
+        # Emitted unconditionally rather than gated on having seen a command
+        # start. The only pre-execution hook PowerShell offers is a PSReadLine
+        # key handler, and that does not fire reliably — over a pty it does not
+        # fire at all. Hanging the entire feature off it meant no command was
+        # ever recorded. The editor ignores a D it has no command for, so a
+        # spurious one at the first prompt costs nothing.
+        __Acuto-Osc "133;D;$exitCode"
+        $env:ACUTO_COMMAND_RUNNING = $null
 
         __Acuto-ReportCwd
         __Acuto-Osc "133;A"
@@ -95,14 +100,12 @@ try {
         "$rendered$([char]27)]133;B$([char]7)"
     }
 
-    # PSReadLine is where a command actually begins executing, and its Enter
-    # handler is the only reliable pre-execution hook PowerShell offers.
-    #
-    # Re-armed from `prompt` rather than installed once: this script runs before
-    # the interactive session starts, and PSReadLine initialises afterwards,
-    # replacing whatever handlers were set. Installing once looks like it works
-    # and then silently does nothing, which costs the C marker and therefore
-    # every recorded command.
+    # Best-effort only. The C marker tells the editor a command is running so
+    # it can suppress completions, which is worth having — but nothing depends
+    # on it: the command itself is recovered from the D marker and the line the
+    # editor already watched the user type. PSReadLine is optional, its key
+    # handlers are replaced when it initialises, and over a pty this does not
+    # fire at all.
     function global:__Acuto-ArmEnterHandler {
         try {
             $existing = Get-PSReadLineKeyHandler -Bound |

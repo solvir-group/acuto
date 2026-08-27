@@ -31,6 +31,7 @@ use pty_info::{ProcessIdGetter, PtyProcessInfo};
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use task::{HideStrategy, Shell, ShellKind, SpawnInTerminal};
+use alacritty_terminal::term::cell::Flags as AlacFlags;
 use terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape, TerminalSettings};
 use settings::ShellIntegrationMode;
 use theme::{ActiveTheme, Theme};
@@ -1788,6 +1789,10 @@ impl Terminal {
             }
             TerminalBackendEvent::Wakeup => {
                 self.detect_init_command_startup_marker();
+                // Output arrived, which at a prompt means the shell has echoed
+                // what was typed. Reading the buffer here is what records the
+                // line, so history does not depend on a view existing to ask.
+                let _ = self.edit_buffer();
                 cx.emit(Event::Wakeup);
 
                 if let TerminalType::Pty { info, .. } = &self.terminal_type {
@@ -2127,19 +2132,50 @@ impl Terminal {
             return None;
         }
 
-        let mut text = String::new();
+        // Collected per row, because the input line ends at the first row that
+        // is not a continuation of it. Scanning straight through to the cursor
+        // swallows the command's own output: after Enter the shell prints
+        // results while the phase is still `AtPrompt`, and each refresh would
+        // otherwise return a longer and longer string.
+        let mut rows: Vec<(i32, String, bool)> = Vec::new();
         for cell in &self.last_content.cells {
             let point = cell.point;
-            let after_start = (point.line, point.column) >= (start.line, start.column);
-            let before_cursor = (point.line, point.column) < (cursor.line, cursor.column);
-            if after_start && before_cursor {
-                // Wide characters occupy a second, spacer cell carrying no
-                // glyph; skipping it keeps the byte offset aligned with what
-                // the user sees.
-                let character = cell.cell.character();
-                if character != '\0' {
-                    text.push(character);
+            if (point.line, point.column) < (start.line, start.column) {
+                continue;
+            }
+            if (point.line, point.column) >= (cursor.line, cursor.column) {
+                break;
+            }
+
+            // Wide characters occupy a second, spacer cell carrying no glyph;
+            // skipping it keeps the byte offset aligned with what is displayed.
+            let character = cell.cell.character();
+            let wrapped = cell.cell.cell.flags.contains(AlacFlags::WRAPLINE);
+
+            match rows.last_mut() {
+                Some((line, text, row_wrapped)) if *line == point.line => {
+                    if character != '\0' {
+                        text.push(character);
+                    }
+                    *row_wrapped = wrapped;
                 }
+                _ => {
+                    let mut text = String::new();
+                    if character != '\0' {
+                        text.push(character);
+                    }
+                    rows.push((point.line, text, wrapped));
+                }
+            }
+        }
+
+        let mut text = String::new();
+        for (index, (_, row, wrapped)) in rows.iter().enumerate() {
+            text.push_str(row);
+            // A row that does not wrap ends the input, and any row after it is
+            // output rather than something the user typed.
+            if !wrapped && index + 1 < rows.len() {
+                break;
             }
         }
 
@@ -2147,6 +2183,16 @@ impl Terminal {
         // input, and would break prefix matching against history.
         let trimmed = text.trim_end().to_string();
         let cursor_offset = trimmed.len();
+
+        // Remembered as it is read: this is the only opportunity. Once the
+        // command runs, its output scrolls the line away, and PowerShell offers
+        // no hook that fires in between.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or_default();
+        self.shell_state.observe_prompt_line(&trimmed, now);
+
         Some((trimmed, cursor_offset))
     }
 
@@ -3843,6 +3889,110 @@ mod tests {
 
     /// Helper to build a test terminal running a shell command.
     /// Returns the terminal entity and a receiver for the completion signal.
+    /// A command is recorded even though no `133;C` ever arrives.
+    ///
+    /// PowerShell has no dependable pre-execution hook — its only one is a
+    /// PSReadLine key handler, which does not fire over a pty — so the C marker
+    /// cannot be relied on. Hanging history off it meant nothing was ever
+    /// recorded, and therefore nothing could ever be suggested.
+    ///
+    /// The line is instead remembered as the user types it, and the D marker
+    /// alone closes the command out.
+    #[gpui::test]
+    async fn test_command_is_recorded_without_a_c_marker(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["setup"]).await;
+        cx.run_until_parked();
+
+        // Prompt, then the user types. No C marker, exactly as PowerShell
+        // behaves.
+        terminal.update(cx, |term, cx| {
+            term.write_output(b"\x1b]133;A\x07PS> \x1b]133;B\x07git status", cx);
+        });
+        cx.run_until_parked();
+
+        // Reading the buffer is what records the line, and the view does this
+        // on every wakeup.
+        let typed = terminal.update(cx, |term, _| term.edit_buffer());
+        assert_eq!(typed, Some(("git status".to_string(), "git status".len())));
+
+        // The command runs and the next prompt reports how it went.
+        terminal.update(cx, |term, cx| {
+            term.write_output(b"\r\nOn branch main\r\n\x1b]133;D;0\x07\x1b]133;A\x07PS> \x1b]133;B\x07", cx);
+        });
+        cx.run_until_parked();
+
+        let finished = terminal.update(cx, |term, _| term.take_finished_commands());
+        assert_eq!(
+            finished.len(),
+            1,
+            "the command must be recorded from D alone, with no C marker"
+        );
+        assert_eq!(finished[0].command, "git status");
+        assert_eq!(finished[0].exit_code, Some(0));
+    }
+
+    /// The real path: an actual shell, an actual pty, alacritty's own event
+    /// loop, and the integration script the editor really injects.
+    ///
+    /// The other end-to-end test drives `write_output`, which is the
+    /// display-only path — Zed's own parser feeding the term directly. That is
+    /// not how shell output arrives. This spawns the shell exactly as the
+    /// terminal does and asks whether the markers make it all the way through.
+    #[cfg(windows)]
+    #[gpui::test]
+    async fn test_shell_integration_reaches_shell_state_over_a_pty(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let shell = crate::shell_integration::IntegrationShell::PowerShell;
+        let args = crate::shell_integration::powershell_args_for_test(shell.script());
+
+        let (terminal, _completion_rx) =
+            build_test_terminal_with_arguments(cx, "powershell.exe".to_string(), args).await;
+
+        // Waits for `AtPrompt` rather than for any marker at all: `A` arrives
+        // before `B`, so a loop that stops at the first marker races the one
+        // that actually matters.
+        for _ in 0..400 {
+            let at_prompt = terminal.update(cx, |term, _| {
+                term.shell_state().phase() == shell_state::PromptPhase::AtPrompt
+            });
+            if at_prompt {
+                break;
+            }
+            cx.background_executor
+                .timer(Duration::from_millis(25))
+                .await;
+        }
+
+        let (seen, phase, content) = terminal.update(cx, |term, _| {
+            (
+                term.shell_state().integration_seen(),
+                term.shell_state().phase(),
+                term.get_content(),
+            )
+        });
+
+        assert!(
+            seen,
+            "no OSC 133 marker reached ShellState over a real pty. \
+             terminal content was:\n{content}"
+        );
+        assert_eq!(
+            phase,
+            shell_state::PromptPhase::AtPrompt,
+            "the shell should be sitting at a prompt awaiting input"
+        );
+
+        // Command execution is not asserted here: this harness gives PowerShell
+        // a pty without a real console, and it sits in a continuation prompt
+        // rather than running anything. What this test establishes is that the
+        // markers cross a real pty at all, which is the part that cannot be
+        // checked any other way. The record-and-suggest logic is covered
+        // deterministically by `test_command_is_recorded_without_a_c_marker`.
+    }
+
     async fn build_test_terminal(
         cx: &mut TestAppContext,
         command: &str,
