@@ -102,8 +102,14 @@ pub fn script_for(shell: IntegrationShell) -> &'static str {
 /// How a shell should be started so it loads the integration.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Injection {
-    /// Arguments to insert before any the user configured.
+    /// Arguments for the child.
     pub args: Vec<String>,
+    /// Whether [`Self::args`] replaces the user's arguments or precedes them.
+    ///
+    /// PowerShell has to replace them: `-Command` consumes the remainder of the
+    /// command line, so a second one cannot follow the first. Everything else
+    /// prepends, which keeps the user's arguments untouched.
+    pub replaces_args: bool,
     /// Environment to set for the child.
     pub env: Vec<(String, String)>,
 }
@@ -141,6 +147,7 @@ pub fn prepare(
     mode: ShellIntegrationMode,
     data_dir: &Path,
     user_home: Option<&Path>,
+    existing_args: &[String],
 ) -> Option<Injection> {
     if mode != ShellIntegrationMode::Auto {
         return None;
@@ -189,7 +196,11 @@ unset ACUTO_PREVIOUS_ZDOTDIR
                 "ZDOTDIR".to_string(),
                 shim_dir.display().to_string(),
             ));
-            Some(Injection { args: Vec::new(), env })
+            Some(Injection {
+                args: Vec::new(),
+                replaces_args: false,
+                env,
+            })
         }
 
         IntegrationShell::Bash => {
@@ -211,6 +222,7 @@ unset ACUTO_PREVIOUS_ZDOTDIR
 
             Some(Injection {
                 args: vec!["--init-file".to_string(), script.display().to_string()],
+                replaces_args: false,
                 env,
             })
         }
@@ -231,21 +243,62 @@ unset ACUTO_PREVIOUS_ZDOTDIR
                 _ => base,
             };
             env.push(("XDG_DATA_DIRS".to_string(), combined));
-            Some(Injection { args: Vec::new(), env })
+            Some(Injection {
+                args: Vec::new(),
+                replaces_args: false,
+                env,
+            })
         }
 
         IntegrationShell::PowerShell => {
             // Inline, not a file: ExecutionPolicy blocks unsigned .ps1 by
             // default on Windows, and would take the integration with it.
-            // -NoExit keeps the session interactive after the command runs.
             Some(Injection {
-                args: vec![
-                    "-NoExit".to_string(),
-                    "-Command".to_string(),
-                    POWERSHELL_SCRIPT.to_string(),
-                ],
+                args: merge_powershell_args(existing_args, POWERSHELL_SCRIPT),
+                replaces_args: true,
                 env,
             })
+        }
+    }
+}
+
+/// Builds a PowerShell command line that runs the integration and then
+/// whatever the user configured.
+///
+/// `-Command` consumes the entire remainder of the command line, so prepending
+/// a second one produces a command line PowerShell reads as one giant script
+/// argument — the user's own command silently never runs. The two have to be
+/// merged into a single `-Command` instead, with the integration first so the
+/// prompt it installs is in place before the user's profile customises it.
+fn merge_powershell_args(existing: &[String], script: &str) -> Vec<String> {
+    let command_at = existing
+        .iter()
+        .position(|arg| arg.eq_ignore_ascii_case("-Command") || arg.eq_ignore_ascii_case("-c"));
+
+    match command_at {
+        Some(index) => {
+            let mut args: Vec<String> = existing[..index].to_vec();
+            // Everything after -Command is the user's command, however many
+            // argv entries it happens to occupy.
+            let user_command = existing[index + 1..].join(" ");
+            args.push("-Command".to_string());
+            args.push(if user_command.trim().is_empty() {
+                script.to_string()
+            } else {
+                format!("{script}\n{user_command}")
+            });
+            args
+        }
+        None => {
+            let mut args: Vec<String> = existing.to_vec();
+            // Only added when absent: passing it twice is harmless but makes
+            // the command line confusing to read in a process list.
+            if !args.iter().any(|arg| arg.eq_ignore_ascii_case("-NoExit")) {
+                args.push("-NoExit".to_string());
+            }
+            args.push("-Command".to_string());
+            args.push(script.to_string());
+            args
         }
     }
 }
@@ -260,12 +313,56 @@ mod tests {
         dir
     }
 
+
+    #[test]
+    fn powershell_merges_into_a_single_command() {
+        // The shape this fork actually ships: the user already passes -Command
+        // to source their own profile.
+        let existing: Vec<String> = ["-NoLogo", "-NoExit", "-Command", ". 'C:/x/acuto.ps1'"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+
+        let merged = merge_powershell_args(&existing, "INTEGRATION");
+
+        assert_eq!(
+            merged.iter().filter(|arg| arg.eq_ignore_ascii_case("-Command")).count(),
+            1,
+            "-Command consumes the rest of the command line; a second one is unreachable"
+        );
+        assert_eq!(merged[0], "-NoLogo", "the user's other flags survive");
+        assert_eq!(merged[1], "-NoExit");
+
+        let command = merged.last().expect("a command");
+        assert!(command.starts_with("INTEGRATION"), "integration installs first");
+        assert!(
+            command.contains(". 'C:/x/acuto.ps1'"),
+            "the user's own command must still run"
+        );
+    }
+
+    #[test]
+    fn powershell_without_an_existing_command_gets_its_own() {
+        let merged = merge_powershell_args(&["-NoLogo".to_string()], "INTEGRATION");
+        assert_eq!(merged, vec!["-NoLogo", "-NoExit", "-Command", "INTEGRATION"]);
+    }
+
+    #[test]
+    fn powershell_does_not_duplicate_no_exit() {
+        let existing: Vec<String> = ["-NoExit".to_string()].to_vec();
+        let merged = merge_powershell_args(&existing, "INTEGRATION");
+        assert_eq!(
+            merged.iter().filter(|arg| arg.eq_ignore_ascii_case("-NoExit")).count(),
+            1
+        );
+    }
+
     #[test]
     fn disabled_modes_never_inject() {
         let dir = temp_dir("disabled");
         for mode in [ShellIntegrationMode::Manual, ShellIntegrationMode::Off] {
             assert!(
-                prepare(IntegrationShell::Zsh, mode, &dir, Some(Path::new("/home/dev"))).is_none(),
+                prepare(IntegrationShell::Zsh, mode, &dir, Some(Path::new("/home/dev")), &[]).is_none(),
                 "{mode:?} must not inject"
             );
         }
@@ -279,6 +376,7 @@ mod tests {
             ShellIntegrationMode::Auto,
             &dir,
             Some(Path::new("/home/dev")),
+            &[],
         )
         .expect("zsh is supported");
 
@@ -313,6 +411,7 @@ mod tests {
             ShellIntegrationMode::Auto,
             &dir,
             Some(Path::new("/home/dev")),
+            &[],
         )
         .expect("bash is supported");
 
@@ -333,6 +432,7 @@ mod tests {
             ShellIntegrationMode::Auto,
             &dir,
             Some(Path::new("C:/Users/dev")),
+            &[],
         )
         .expect("powershell is supported");
 
@@ -358,6 +458,7 @@ mod tests {
             ShellIntegrationMode::Auto,
             &dir,
             Some(Path::new("/home/dev")),
+            &[],
         )
         .expect("fish is supported");
 

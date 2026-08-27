@@ -1206,6 +1206,10 @@ impl TerminalBuilder {
                     shell_integration_mode,
                     paths::data_dir(),
                     dirs::home_dir().as_deref(),
+                    shell_params
+                        .as_ref()
+                        .and_then(|params| params.args.as_deref())
+                        .unwrap_or_default(),
                 ) {
                     for (key, value) in injection.env {
                         env.insert(key, value);
@@ -1213,9 +1217,16 @@ impl TerminalBuilder {
                     if !injection.args.is_empty() {
                         match shell_params.as_mut() {
                             Some(params) => {
-                                let mut args = injection.args;
-                                args.extend(params.args.take().unwrap_or_default());
-                                params.args = Some(args);
+                                params.args = Some(if injection.replaces_args {
+                                    // PowerShell: the merge already folded the
+                                    // user's own arguments in, so appending
+                                    // them again would duplicate them.
+                                    injection.args
+                                } else {
+                                    let mut args = injection.args;
+                                    args.extend(params.args.take().unwrap_or_default());
+                                    args
+                                });
                             }
                             None => {
                                 shell_params = Some(ShellParams::new(
