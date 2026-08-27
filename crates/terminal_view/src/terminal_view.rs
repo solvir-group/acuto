@@ -150,6 +150,16 @@ pub struct TerminalView {
     show_breadcrumbs: bool,
     block_below_cursor: Option<Rc<BlockProperties>>,
     scroll_top: Pixels,
+    /// Command history and the suggestion drawn from it.
+    ///
+    /// Per view rather than global: two terminals in different directories
+    /// should suggest different things, and the ranking is directory-first.
+    history: terminal_completion::HistoryStore,
+    /// The suggestion currently shown as ghost text, if any.
+    suggestion: Option<terminal_completion::Suggestion>,
+    /// Set by Escape, cleared when the typed line changes. Without it, Escape
+    /// would dismiss a suggestion that reappears on the very next keystroke.
+    suggestion_dismissed_for: Option<String>,
     scroll_handle: TerminalScrollHandle,
     ime_state: Option<ImeState>,
     self_handle: WeakEntity<Self>,
@@ -295,6 +305,12 @@ impl TerminalView {
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
+            history: terminal_completion::HistoryStore::new(
+                uuid::Uuid::new_v4().to_string(),
+                terminal_completion::DEFAULT_HISTORY_LIMIT,
+            ),
+            suggestion: None,
+            suggestion_dismissed_for: None,
             scroll_handle,
             needs_serialize: false,
             custom_title: None,
@@ -1289,8 +1305,126 @@ impl TerminalView {
         self.clear_bell(cx);
         self.pause_cursor_blinking(window, cx);
 
+        // Accepting a suggestion only intercepts a key while one is showing.
+        // Otherwise the arrow belongs to the shell, and swallowing it would
+        // break cursor movement — the single most annoying way this feature
+        // could fail.
+        if self.suggestion.is_some() && !event.keystroke.modifiers.modified() {
+            match event.keystroke.key.as_str() {
+                "right" | "end" => {
+                    if self.accept_suggestion(None, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
+                "escape" => {
+                    if let Some((typed, _)) = self.terminal.read(cx).edit_buffer() {
+                        self.suggestion_dismissed_for = Some(typed);
+                    }
+                    self.suggestion = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // One word at a time, for when the suggestion is nearly right.
+        if self.suggestion.is_some()
+            && event.keystroke.key == "right"
+            && event.keystroke.modifiers.alt
+            && self.accept_suggestion(Some(1), cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
+
         if self.process_keystroke(&event.keystroke, cx) {
             cx.stop_propagation();
+        }
+
+        // Recomputed after the keystroke reaches the shell, because the grid is
+        // what the suggestion is derived from and it has only just changed.
+        self.refresh_suggestion(cx);
+    }
+
+    /// Writes the suggested remainder to the pty.
+    ///
+    /// Sent as input rather than spliced into our own model of the line: the
+    /// shell owns the line, and anything else would desynchronise the moment
+    /// the user edits it.
+    fn accept_suggestion(&mut self, words: Option<usize>, cx: &mut Context<Self>) -> bool {
+        let Some((typed, _)) = self.terminal.read(cx).edit_buffer() else {
+            return false;
+        };
+        let Some(suggestion) = self.suggestion.as_ref() else {
+            return false;
+        };
+        let Some(remainder) = suggestion.completion_after(&typed) else {
+            return false;
+        };
+
+        let accepted = match words {
+            None => remainder.to_string(),
+            Some(count) => take_words(remainder, count),
+        };
+        if accepted.is_empty() {
+            return false;
+        }
+
+        self.terminal.update(cx, |terminal, _| {
+            terminal.input(accepted.into_bytes());
+        });
+        cx.notify();
+        true
+    }
+
+    /// Drains finished commands into history and recomputes the suggestion.
+    fn refresh_suggestion(&mut self, cx: &mut Context<Self>) {
+        let (finished, edit_buffer, cwd) = self.terminal.update(cx, |terminal, _| {
+            (
+                terminal.take_finished_commands(),
+                terminal.edit_buffer(),
+                terminal.shell_state().cwd().cloned(),
+            )
+        });
+
+        let session_id = self.history.session_id().to_string();
+        for command in finished {
+            self.history.record(terminal_completion::HistoryEntry {
+                command: command.command,
+                cwd: command.cwd,
+                exit_code: command.exit_code,
+                started_at: command.started_at,
+                duration_ms: command.duration_ms,
+                session_id: session_id.clone(),
+            });
+        }
+
+        let previous = self.suggestion.take();
+
+        self.suggestion = match edit_buffer {
+            Some((typed, _)) => {
+                // Escape dismisses for the line as typed; typing more brings
+                // suggestions back, which is what a user expects from a
+                // dismissal rather than a mode.
+                if self.suggestion_dismissed_for.as_deref() == Some(typed.as_str()) {
+                    None
+                } else {
+                    self.suggestion_dismissed_for = None;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_secs() as i64)
+                        .unwrap_or_default();
+                    self.history.suggest(&typed, cwd.as_deref(), now)
+                }
+            }
+            None => None,
+        };
+
+        if previous != self.suggestion {
+            cx.notify();
         }
     }
 
@@ -1321,6 +1455,109 @@ impl TerminalView {
             terminal.set_cursor_shape(CursorShape::Hollow);
         });
         cx.notify();
+    }
+}
+
+/// Splits `count` whitespace-delimited words off the front, keeping the
+/// leading whitespace so accepting a word at a time reproduces the original
+/// spacing exactly.
+fn take_words(remainder: &str, count: usize) -> String {
+    let mut taken = String::new();
+    let mut rest = remainder;
+
+    for _ in 0..count {
+        let leading: String = rest.chars().take_while(|c| c.is_whitespace()).collect();
+        rest = &rest[leading.len()..];
+        let word: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
+        if leading.is_empty() && word.is_empty() {
+            break;
+        }
+        taken.push_str(&leading);
+        taken.push_str(&word);
+        rest = &rest[word.len()..];
+    }
+
+    taken
+}
+
+#[cfg(test)]
+mod ghost_text_tests {
+    use super::take_words;
+
+    #[test]
+    fn accepting_one_word_keeps_the_original_spacing() {
+        // Leading whitespace travels with the word, so accepting piecemeal
+        // reproduces the command exactly rather than collapsing its spacing.
+        assert_eq!(take_words(" build --release", 1), " build");
+        assert_eq!(take_words(" build --release", 2), " build --release");
+        assert_eq!(take_words("go build", 1), "go");
+    }
+
+    #[test]
+    fn accepting_more_words_than_exist_takes_what_is_there() {
+        assert_eq!(take_words(" one", 5), " one");
+        assert_eq!(take_words("", 1), "");
+    }
+}
+
+impl TerminalView {
+    /// The suggested remainder, drawn after the cursor in the terminal's own
+    /// font at reduced alpha.
+    ///
+    /// Positioned from the grid rather than laid out inline: the terminal is a
+    /// character grid, so the cursor's pixel position is arithmetic, and
+    /// anything else would drift from the text it is supposed to continue.
+    fn render_ghost_text(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let suggestion = self.suggestion.as_ref()?;
+        let terminal = self.terminal.read(cx);
+
+        // Every guard lives on the shell state, so a surface cannot skip one by
+        // forgetting to check it here.
+        if !terminal.shell_state().completions_allowed() {
+            return None;
+        }
+
+        let (typed, _) = terminal.edit_buffer()?;
+        let remainder = suggestion.completion_after(&typed)?;
+
+        let content = &terminal.last_content;
+        let bounds = content.terminal_bounds;
+        let cursor = content.cursor.point;
+
+        // Lines above the viewport are scrolled out; drawing there would paint
+        // the suggestion over unrelated scrollback.
+        let row = cursor.line - content.display_offset as i32;
+        if row < 0 || row as usize >= content.screen_lines {
+            return None;
+        }
+
+        let settings = theme_settings::ThemeSettings::get_global(cx);
+        let font_size = TerminalSettings::get_global(cx)
+            .font_size
+            .unwrap_or(settings.buffer_font_size(cx));
+        let font_family = TerminalSettings::get_global(cx)
+            .font_family
+            .clone()
+            .map(|name| SharedString::from(name.0))
+            .unwrap_or_else(|| settings.buffer_font.family.clone());
+
+        Some(
+            div()
+                .absolute()
+                .left(bounds.cell_width() * cursor.column as f32)
+                .top(bounds.line_height() * row as f32)
+                .child(
+                    div()
+                        .font_family(font_family)
+                        .text_size(font_size)
+                        // Reduced alpha rather than a theme colour: the ghost
+                        // has to read as "not yet typed" against whatever
+                        // colours the shell is already painting.
+                        .text_color(cx.theme().colors().text.opacity(0.4))
+                        .child(remainder.to_string()),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -1425,6 +1662,7 @@ impl Render for TerminalView {
                         )
                     }),
             )
+            .children(self.render_ghost_text(cx))
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
                     anchored()
