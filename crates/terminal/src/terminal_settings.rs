@@ -50,6 +50,7 @@ pub struct TerminalSettings {
     pub minimum_contrast: f32,
     pub path_hyperlink_regexes: Vec<String>,
     pub path_hyperlink_timeout_ms: u64,
+    pub shell_integration: settings::ShellIntegrationMode,
     pub show_count_badge: bool,
     pub bell: TerminalBell,
 }
@@ -134,6 +135,7 @@ impl settings::Settings for TerminalSettings {
                 })
                 .collect(),
             path_hyperlink_timeout_ms: project_content.path_hyperlink_timeout_ms.unwrap(),
+            shell_integration: project_content.shell_integration.unwrap_or_default(),
             show_count_badge: user_content.show_count_badge.unwrap(),
             bell: user_content.bell.unwrap(),
         }

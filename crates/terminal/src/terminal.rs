@@ -3,6 +3,7 @@ mod mappings;
 mod alacritty;
 mod pty_info;
 pub mod shell_state;
+pub mod shell_integration;
 pub mod terminal_settings;
 
 #[cfg(not(windows))]
@@ -31,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use settings::Settings;
 use task::{HideStrategy, Shell, ShellKind, SpawnInTerminal};
 use terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape, TerminalSettings};
+use settings::ShellIntegrationMode;
 use theme::{ActiveTheme, Theme};
 use urlencoding;
 use util::{ResultExt as _, paths::PathStyle, truncate_and_trailoff};
@@ -683,7 +685,9 @@ pub fn insert_zed_terminal_env(
     version: &impl std::fmt::Display,
 ) {
     env.insert("ZED_TERM".to_string(), "true".to_string());
-    env.insert("TERM_PROGRAM".to_string(), "zed".to_string());
+    // The shell integration scripts gate on this, and they are inert in any
+    // terminal that is not this one.
+    env.insert("TERM_PROGRAM".to_string(), "Acuto".to_string());
     env.insert("TERM".to_string(), "xterm-256color".to_string());
     env.insert("COLORTERM".to_string(), "truecolor".to_string());
     env.insert("TERM_PROGRAM_VERSION".to_string(), version.to_string());
@@ -1092,6 +1096,22 @@ impl TerminalBuilder {
         path_style: PathStyle,
     ) -> Task<Result<TerminalBuilder>> {
         let version = release_channel::AppVersion::global(cx);
+        // Read here rather than inside the spawned task: `cx` is not available
+        // there, and a remote terminal must never be instrumented with local
+        // paths regardless of the setting.
+        //
+        // Read through `try_global` rather than `TerminalSettings::get_global`,
+        // which panics when no settings store is registered. Terminals are
+        // constructed in tests and headless contexts where none is, and a
+        // missing setting must degrade to "no integration", never to a panic
+        // in terminal startup.
+        let shell_integration_mode = if is_remote_terminal {
+            ShellIntegrationMode::Off
+        } else {
+            cx.try_global::<settings::SettingsStore>()
+                .map(|_| TerminalSettings::get_global(cx).shell_integration)
+                .unwrap_or(ShellIntegrationMode::Off)
+        };
         let background_executor = cx.background_executor().clone();
         // Headless hosts (e.g. the eval CLI) have no controlling TTY, so PTY
         // allocation / acquiring a controlling terminal fails with `ENOTTY`.
@@ -1163,6 +1183,50 @@ impl TerminalBuilder {
             };
             let terminal_title_override =
                 shell_params.as_ref().and_then(|e| e.title_override.clone());
+
+            // Shell integration is installed by changing how the shell starts,
+            // never by editing the user's rc files. Every failure path inside
+            // `prepare` returns None, so a terminal that cannot be instrumented
+            // still opens normally — the feature going missing is acceptable,
+            // the shell failing to start is not.
+            let mut shell_params = shell_params;
+            {
+                let integration_program = shell_params
+                    .as_ref()
+                    .map(|params| params.program.clone())
+                    .unwrap_or_else(util::shell::get_system_shell);
+                let integration_kind = ShellKind::new(&integration_program, false);
+
+                if let Some(shell) = shell_integration::IntegrationShell::detect(
+                    &integration_program,
+                    integration_kind,
+                ) && let Some(injection) = shell_integration::prepare(
+                    shell,
+                    shell_integration_mode,
+                    paths::data_dir(),
+                    dirs::home_dir().as_deref(),
+                ) {
+                    for (key, value) in injection.env {
+                        env.insert(key, value);
+                    }
+                    if !injection.args.is_empty() {
+                        match shell_params.as_mut() {
+                            Some(params) => {
+                                let mut args = injection.args;
+                                args.extend(params.args.take().unwrap_or_default());
+                                params.args = Some(args);
+                            }
+                            None => {
+                                shell_params = Some(ShellParams::new(
+                                    integration_program,
+                                    Some(injection.args),
+                                    None,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
 
             #[cfg(windows)]
             let shell_program = shell_params.as_ref().map(|params| {
