@@ -18158,6 +18158,7 @@ dependencies = [
  "anyhow",
  "async-channel 2.5.0",
  "collections",
+ "dirs",
  "futures 0.3.32",
  "futures-lite 1.13.0",
  "gpui",
@@ -18165,6 +18166,7 @@ dependencies = [
  "libc",
  "log",
  "parking_lot",
+ "paths",
  "percent-encoding",
  "rand 0.9.4",
  "regex",
@@ -18183,6 +18185,19 @@ dependencies = [
  "util_macros",
  "vte",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "terminal_completion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "db",
+ "gpui",
+ "indoc",
+ "sqlez",
+ "util",
+ "workspace",
 ]
 
 [[package]]

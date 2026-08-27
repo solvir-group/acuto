@@ -1,0 +1,27 @@
+[package]
+name = "terminal_completion"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/terminal_completion.rs"
+
+[dependencies]
+anyhow.workspace = true
+db.workspace = true
+indoc.workspace = true
+gpui.workspace = true
+sqlez.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+# `db::static_connection!` generates an `open_test_db` constructor under cfg(test),
+# which only exists with this feature.
+db = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
