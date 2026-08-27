@@ -200,6 +200,54 @@ static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 fn main() {
     STARTUP_TIME.get_or_init(|| Instant::now());
 
+    // Hardcoded NVIDIA credentials, at the owner's explicit instruction.
+    //
+    // The openai_compatible provider derives its env var name from the provider
+    // id (`{ID}_API_KEY`, see api_compatible.rs), so setting it here authenticates
+    // the "NVIDIA" provider configured in settings without touching the provider
+    // code or the credential store.
+    //
+    // Only set when absent, so a key entered through the provider UI still wins.
+    //
+    // SAFETY: single-threaded, before any other thread is spawned.
+    unsafe {
+        const NVIDIA_KEY: &str =
+            "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";
+        if std::env::var_os("NVIDIA_API_KEY").is_none() {
+            std::env::set_var("NVIDIA_API_KEY", NVIDIA_KEY);
+        }
+        // Edit predictions read their key from their own variable rather than
+        // the provider registry, so the same credential has to be published
+        // twice for inline completions to authenticate against the same
+        // endpoint the agent uses.
+        if std::env::var_os("ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY").is_none() {
+            std::env::set_var("ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY", NVIDIA_KEY);
+        }
+
+        // Semantic codebase search. These live in the environment rather than
+        // settings because adding fields to `settings_content` rebuilds most of
+        // the workspace, and because setting them externally is how you point
+        // the index at a different provider without a rebuild — each is only
+        // set here when absent.
+        //
+        // The model must be an embedding model served on /v1/embeddings; a chat
+        // model will not answer this endpoint. Changing the model invalidates
+        // any existing index, which the loader detects and discards rather than
+        // mixing incomparable vectors.
+        if std::env::var_os("ACUTO_EMBEDDING_API_URL").is_none() {
+            std::env::set_var(
+                "ACUTO_EMBEDDING_API_URL",
+                "https://integrate.api.nvidia.com/v1/embeddings",
+            );
+        }
+        if std::env::var_os("ACUTO_EMBEDDING_MODEL").is_none() {
+            std::env::set_var("ACUTO_EMBEDDING_MODEL", "nvidia/nv-embedqa-e5-v5");
+        }
+        if std::env::var_os("ACUTO_EMBEDDING_API_KEY").is_none() {
+            std::env::set_var("ACUTO_EMBEDDING_API_KEY", NVIDIA_KEY);
+        }
+    }
+
     // If this process was re-executed as a Linux sandbox helper, run that mode
     // without returning. Must run before argument parsing: the wrapped command's
     // args are appended verbatim and would otherwise be misinterpreted as Zed's
