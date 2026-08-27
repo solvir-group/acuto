@@ -1690,6 +1690,19 @@ impl Terminal {
                     line: self.last_content.cursor.point.line,
                     column: self.last_content.cursor.point.column,
                 };
+                // Refreshed before the cursor is read: `last_content` is
+                // updated during the element's prepaint, so at this point it
+                // predates the output that carried this sequence — including
+                // the prompt whose end the marker is reporting. Recording a
+                // stale cursor would make `command_start` point above the
+                // user's input, and the edit buffer would then include the
+                // prompt text and match nothing in history.
+                let refreshed = {
+                    let term = self.term.lock();
+                    crate::alacritty::make_content(&term, &self.last_content)
+                };
+                self.last_content = refreshed;
+
                 self.shell_state
                     .set_alt_screen(self.last_content.mode.contains(Modes::ALT_SCREEN));
 
@@ -2080,10 +2093,21 @@ impl Terminal {
     ///
     /// `None` whenever completions are not allowed, so callers cannot act on a
     /// buffer read outside a prompt.
-    pub fn edit_buffer(&self) -> Option<(String, usize)> {
+    pub fn edit_buffer(&mut self) -> Option<(String, usize)> {
         if !self.shell_state.completions_allowed() {
             return None;
         }
+
+        // `last_content` is refreshed during the element's prepaint, which runs
+        // after the view has already rendered. Every caller of this is therefore
+        // a frame behind unless the snapshot is refreshed here — and a frame
+        // behind means the character just typed is missing, so the very first
+        // keystroke of a line produces nothing at all.
+        let refreshed = {
+            let term = self.term.lock();
+            crate::alacritty::make_content(&term, &self.last_content)
+        };
+        self.last_content = refreshed;
         let start = self.shell_state.command_start()?;
         let cursor = self.last_content.cursor.point;
 

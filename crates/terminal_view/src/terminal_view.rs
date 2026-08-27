@@ -155,8 +155,13 @@ pub struct TerminalView {
     /// Per view rather than global: two terminals in different directories
     /// should suggest different things, and the ranking is directory-first.
     history: terminal_completion::HistoryStore,
-    /// The suggestion currently shown as ghost text, if any.
-    suggestion: Option<terminal_completion::Suggestion>,
+    /// The suggestion currently shown as ghost text, and the line it was
+    /// computed against.
+    ///
+    /// Both are cached rather than recomputed while rendering, because reading
+    /// the edit buffer refreshes the terminal's snapshot and rendering only has
+    /// shared access.
+    suggestion: Option<(String, terminal_completion::Suggestion)>,
     /// Set by Escape, cleared when the typed line changes. Without it, Escape
     /// would dismiss a suggestion that reappears on the very next keystroke.
     suggestion_dismissed_for: Option<String>,
@@ -1324,8 +1329,8 @@ impl TerminalView {
                     }
                 }
                 "escape" => {
-                    if let Some((typed, _)) = self.terminal.read(cx).edit_buffer() {
-                        self.suggestion_dismissed_for = Some(typed);
+                    if let Some((typed, _)) = self.suggestion.as_ref() {
+                        self.suggestion_dismissed_for = Some(typed.clone());
                     }
                     self.suggestion = None;
                     cx.notify();
@@ -1357,13 +1362,10 @@ impl TerminalView {
     /// shell owns the line, and anything else would desynchronise the moment
     /// the user edits it.
     fn accept_suggestion(&mut self, words: Option<usize>, cx: &mut Context<Self>) -> bool {
-        let Some((typed, _)) = self.terminal.read(cx).edit_buffer() else {
+        let Some((typed, suggestion)) = self.suggestion.as_ref() else {
             return false;
         };
-        let Some(suggestion) = self.suggestion.as_ref() else {
-            return false;
-        };
-        let Some(remainder) = suggestion.completion_after(&typed) else {
+        let Some(remainder) = suggestion.completion_after(typed) else {
             return false;
         };
 
@@ -1419,7 +1421,9 @@ impl TerminalView {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|elapsed| elapsed.as_secs() as i64)
                         .unwrap_or_default();
-                    self.history.suggest(&typed, cwd.as_deref(), now)
+                    self.history
+                        .suggest(&typed, cwd.as_deref(), now)
+                        .map(|suggestion| (typed, suggestion))
                 }
             }
             None => None,
@@ -1510,7 +1514,7 @@ impl TerminalView {
     /// character grid, so the cursor's pixel position is arithmetic, and
     /// anything else would drift from the text it is supposed to continue.
     fn render_ghost_text(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let suggestion = self.suggestion.as_ref()?;
+        let (typed, suggestion) = self.suggestion.as_ref()?;
         let terminal = self.terminal.read(cx);
 
         // Every guard lives on the shell state, so a surface cannot skip one by
@@ -1519,8 +1523,7 @@ impl TerminalView {
             return None;
         }
 
-        let (typed, _) = terminal.edit_buffer()?;
-        let remainder = suggestion.completion_after(&typed)?;
+        let remainder = suggestion.completion_after(typed)?;
 
         let content = &terminal.last_content;
         let bounds = content.terminal_bounds;
