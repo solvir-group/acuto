@@ -754,7 +754,16 @@ pub(crate) enum TerminalBackendEvent {
     /// An OSC sequence addressed to the editor rather than the emulator:
     /// shell integration markers (133/633) and working directory reports (7).
     /// Consumed by `ShellState`; see docs/terminal-autocomplete-plan.md.
-    Osc(Vec<Vec<u8>>),
+    ///
+    /// `cursor` is where the cursor stood when the sequence was parsed. Events
+    /// arrive asynchronously, so by the time this is handled the grid has moved
+    /// on — past everything typed since — and reading the cursor here would
+    /// place the prompt boundary at the end of the user's input rather than the
+    /// start.
+    Osc {
+        params: Vec<Vec<u8>>,
+        cursor: Point,
+    },
     MouseCursorDirty,
     Title(String),
     ResetTitle,
@@ -773,12 +782,12 @@ pub(crate) enum TerminalBackendEvent {
 impl fmt::Debug for TerminalBackendEvent {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Osc(params) => {
+            Self::Osc { params, cursor } => {
                 let rendered: Vec<String> = params
                     .iter()
                     .map(|param| String::from_utf8_lossy(param).into_owned())
                     .collect();
-                write!(f, "Osc({})", rendered.join(";"))
+                write!(f, "Osc({} at {cursor:?})", rendered.join(";"))
             }
             Self::MouseCursorDirty => f.write_str("MouseCursorDirty"),
             Self::Title(title) => write!(f, "Title({title})"),
@@ -1682,13 +1691,13 @@ impl Terminal {
 
     fn process_event(&mut self, event: TerminalBackendEvent, cx: &mut Context<Self>) {
         match event {
-            TerminalBackendEvent::Osc(params) => {
+            TerminalBackendEvent::Osc { params, cursor } => {
                 // The cursor at the moment `133;B` arrives is where the user's
                 // input begins, so it is read here rather than looked up later:
                 // by the time anything asks, the shell has printed more.
                 let cursor = shell_state::GridPoint {
-                    line: self.last_content.cursor.point.line,
-                    column: self.last_content.cursor.point.column,
+                    line: cursor.line,
+                    column: cursor.column,
                 };
                 // Refreshed before the cursor is read: `last_content` is
                 // updated during the element's prepaint, so at this point it
@@ -4251,6 +4260,69 @@ mod tests {
     }
 
     #[gpui::test]
+    /// End-to-end: real bytes through the real parser, into the real state.
+    ///
+    /// Every unit test in this feature passed while the feature did not work,
+    /// three separate times, because each asserted on a model of the system
+    /// rather than on the system. This one feeds the exact bytes a shell emits
+    /// through the actual parser and event path and asks the actual question:
+    /// what does `edit_buffer` return?
+    #[gpui::test]
+    async fn test_osc_133_produces_an_edit_buffer(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let (terminal, _completion_rx) = build_test_terminal(cx, "echo", &["setup"]).await;
+        cx.run_until_parked();
+
+        // A prompt exactly as a shell writes one: start marker, the prompt
+        // itself, the marker saying input begins here, then what the user typed.
+        terminal.update(cx, |term, cx| {
+            term.write_output(b"\x1b]133;A\x07PS C:\\work> \x1b]133;B\x07cargo bu", cx);
+        });
+        cx.run_until_parked();
+
+        let (phase, buffer) = terminal.update(cx, |term, _| {
+            (term.shell_state().phase(), term.edit_buffer())
+        });
+
+        assert_eq!(
+            phase,
+            shell_state::PromptPhase::AtPrompt,
+            "the B marker should have put the shell at a prompt"
+        );
+        assert_eq!(
+            buffer,
+            Some(("cargo bu".to_string(), "cargo bu".len())),
+            "the edit buffer must be what the user typed, without the prompt"
+        );
+
+        // Running a command suppresses completions and captures the line.
+        terminal.update(cx, |term, cx| {
+            term.write_output(b"\x1b]133;C\x07", cx);
+        });
+        cx.run_until_parked();
+
+        let (phase, buffer) = terminal.update(cx, |term, _| {
+            (term.shell_state().phase(), term.edit_buffer())
+        });
+        assert_eq!(phase, shell_state::PromptPhase::Executing);
+        assert_eq!(
+            buffer, None,
+            "keystrokes during a command belong to the program, not a prompt"
+        );
+
+        // Finishing reports the command and its outcome for history.
+        terminal.update(cx, |term, cx| {
+            term.write_output(b"\x1b]133;D;0\x07", cx);
+        });
+        cx.run_until_parked();
+
+        let finished = terminal.update(cx, |term, _| term.take_finished_commands());
+        assert_eq!(finished.len(), 1, "one command ran, so one is recorded");
+        assert_eq!(finished[0].command, "cargo bu");
+        assert_eq!(finished[0].exit_code, Some(0));
+    }
+
     async fn test_basic_terminal(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
 

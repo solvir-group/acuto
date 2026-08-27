@@ -1,4 +1,4 @@
-From 8b1cacde875d2dd2e95e2e10d2309e8b42e4df79 Mon Sep 17 00:00:00 2001
+From fddf0e9ae8354c1b4ba553d7f3255ec30eed7989 Mon Sep 17 00:00:00 2001
 From: procoder30001 <wycherleydrew@gmail.com>
 Date: Wed, 26 Aug 2026 20:09:51 +1200
 Subject: [PATCH] Forward application-addressed OSC sequences to the event
@@ -21,15 +21,23 @@ normally afterwards; this is an observation, not a redirection.
 
 Requires the corresponding vte change adding `Handler::osc_passthrough`.
 ---
- alacritty_terminal/src/event.rs    | 16 ++++++++++++++++
- alacritty_terminal/src/term/mod.rs | 12 ++++++++++++
- 2 files changed, 28 insertions(+)
+ alacritty_terminal/src/event.rs    | 23 +++++++++++++++++++++++
+ alacritty_terminal/src/term/mod.rs | 16 ++++++++++++++++
+ 2 files changed, 39 insertions(+)
 
 diff --git a/alacritty_terminal/src/event.rs b/alacritty_terminal/src/event.rs
-index 922cf1d0..b821ad91 100644
+index 922cf1d0..87542cc2 100644
 --- a/alacritty_terminal/src/event.rs
 +++ b/alacritty_terminal/src/event.rs
-@@ -15,6 +15,15 @@ pub enum Event {
+@@ -3,6 +3,7 @@ use std::fmt::{self, Debug, Formatter};
+ use std::process::ExitStatus;
+ use std::sync::Arc;
+ 
++use crate::index::Point;
+ use crate::term::ClipboardType;
+ use crate::vte::ansi::Rgb;
+ 
+@@ -15,6 +16,21 @@ pub enum Event {
      /// Grid has changed possibly requiring a mouse cursor shape change.
      MouseCursorDirty,
  
@@ -40,30 +48,36 @@ index 922cf1d0..b821ad91 100644
 +    /// [`vte::ansi::OSC_PASSTHROUGH`] — shell integration markers and working
 +    /// directory reports. The emulator still interprets the sequence normally;
 +    /// this is an observation, not a redirection.
-+    Osc(Vec<Vec<u8>>),
++    ///
++    /// `cursor` is where the cursor stood when the sequence was *parsed*, which
++    /// is the only useful moment for a shell integration marker: it is what
++    /// `OSC 133;B` is reporting. Events are delivered asynchronously, so by the
++    /// time a consumer sees this the grid has usually moved on — for a prompt
++    /// marker, past everything the user has since typed.
++    Osc { params: Vec<Vec<u8>>, cursor: Point },
 +
      /// Window title change.
      Title(String),
  
-@@ -66,6 +75,13 @@ impl Debug for Event {
+@@ -66,6 +82,13 @@ impl Debug for Event {
              Event::TextAreaSizeRequest(_) => write!(f, "TextAreaSizeRequest"),
              Event::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
              Event::PtyWrite(text) => write!(f, "PtyWrite({text})"),
-+            Event::Osc(params) => {
++            Event::Osc { params, cursor } => {
 +                let rendered: Vec<String> = params
 +                    .iter()
 +                    .map(|param| String::from_utf8_lossy(param).into_owned())
 +                    .collect();
-+                write!(f, "Osc({})", rendered.join(";"))
++                write!(f, "Osc({} at {cursor:?})", rendered.join(";"))
 +            },
              Event::Title(title) => write!(f, "Title({title})"),
              Event::CursorBlinkingChange => write!(f, "CursorBlinkingChange"),
              Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),
 diff --git a/alacritty_terminal/src/term/mod.rs b/alacritty_terminal/src/term/mod.rs
-index 8eb67975..38d12df2 100644
+index 8eb67975..be77cda7 100644
 --- a/alacritty_terminal/src/term/mod.rs
 +++ b/alacritty_terminal/src/term/mod.rs
-@@ -1057,6 +1057,18 @@ impl<T> Dimensions for Term<T> {
+@@ -1057,6 +1057,22 @@ impl<T> Dimensions for Term<T> {
  }
  
  impl<T: EventListener> Handler for Term<T> {
@@ -74,9 +88,13 @@ index 8eb67975..38d12df2 100644
 +    /// handful per prompt.
 +    #[inline]
 +    fn osc_passthrough(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-+        self.event_proxy.send_event(Event::Osc(
-+            params.iter().map(|param| param.to_vec()).collect(),
-+        ));
++        self.event_proxy.send_event(Event::Osc {
++            params: params.iter().map(|param| param.to_vec()).collect(),
++            // Read here rather than left to the consumer: events are delivered
++            // asynchronously, and a prompt marker's whole meaning is where the
++            // cursor was when it arrived.
++            cursor: self.grid.cursor.point,
++        });
 +    }
 +
      /// A character to be displayed.
