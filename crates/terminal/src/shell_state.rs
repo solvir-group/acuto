@@ -62,6 +62,33 @@ pub struct ShellState {
     /// integration installed" from "integration installed, currently between
     /// prompts". Only the former warrants an install prompt.
     integration_seen: bool,
+    /// The command captured at `133;C`, held until `133;D` reports how it went.
+    ///
+    /// Captured on the way in rather than read back on the way out: by the time
+    /// the command finishes the shell has printed its output and possibly
+    /// scrolled, so the line is no longer where it was.
+    running_command: Option<String>,
+    /// Unix seconds when the running command started.
+    started_at: Option<i64>,
+}
+
+/// What handling an OSC produced.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HandledOsc {
+    /// State the editor cares about changed; re-render.
+    Changed,
+    /// A command finished and should be written to history.
+    CommandFinished(FinishedCommand),
+}
+
+/// A command that finished, ready to be recorded in history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinishedCommand {
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub started_at: i64,
+    pub duration_ms: i64,
+    pub cwd: Option<PathBuf>,
 }
 
 impl ShellState {
@@ -105,19 +132,34 @@ impl ShellState {
     ///
     /// Returns whether anything the editor cares about changed, so callers can
     /// avoid re-rendering on the many sequences that change nothing.
-    pub fn handle_osc(&mut self, params: &[Vec<u8>], cursor: GridPoint) -> bool {
-        let Some(code) = params.first() else {
-            return false;
-        };
+    /// `typed_line` is what the grid currently shows at the prompt, supplied by
+    /// the caller because the grid lives on the terminal rather than here. It is
+    /// only meaningful at `133;C`, which is the last moment the command is still
+    /// on screen where it was typed.
+    ///
+    /// `now` is Unix seconds, passed in rather than read so the whole type stays
+    /// testable without a clock.
+    pub fn handle_osc(
+        &mut self,
+        params: &[Vec<u8>],
+        cursor: GridPoint,
+        typed_line: Option<&str>,
+        now: i64,
+    ) -> Option<HandledOsc> {
+        let code = params.first()?;
 
         match code.as_slice() {
-            b"7" => self.handle_cwd_report(params.get(1)),
+            b"7" => self
+                .handle_cwd_report(params.get(1))
+                .then_some(HandledOsc::Changed),
             // 133 and 633 carry the same letters. VS Code adds sequences of its
             // own beyond them, which fall through the match below unhandled —
             // deliberately, since acting on a half-understood dialect is worse
             // than ignoring it.
-            b"133" | b"633" => self.handle_prompt_marker(params.get(1), params.get(2), cursor),
-            _ => false,
+            b"133" | b"633" => {
+                self.handle_prompt_marker(params.get(1), params.get(2), cursor, typed_line, now)
+            }
+            _ => None,
         }
     }
 
@@ -126,28 +168,36 @@ impl ShellState {
         kind: Option<&Vec<u8>>,
         argument: Option<&Vec<u8>>,
         cursor: GridPoint,
-    ) -> bool {
-        let Some(kind) = kind else {
-            return false;
-        };
+        typed_line: Option<&str>,
+        now: i64,
+    ) -> Option<HandledOsc> {
+        let kind = kind?;
 
         match kind.as_slice() {
             b"A" => {
                 self.integration_seen = true;
                 self.phase = PromptPhase::Unknown;
                 self.command_start = None;
-                true
+                Some(HandledOsc::Changed)
             }
             b"B" => {
                 self.integration_seen = true;
                 self.phase = PromptPhase::AtPrompt;
                 self.command_start = Some(cursor);
-                true
+                Some(HandledOsc::Changed)
             }
             b"C" => {
                 self.integration_seen = true;
                 self.phase = PromptPhase::Executing;
-                true
+                // Captured now, while the line is still on screen where it was
+                // typed. After the command runs, its output has scrolled the
+                // grid and the line is no longer recoverable.
+                self.running_command = typed_line
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string);
+                self.started_at = Some(now);
+                Some(HandledOsc::Changed)
             }
             b"D" => {
                 self.integration_seen = true;
@@ -159,9 +209,25 @@ impl ShellState {
                 self.last_exit_code = argument
                     .and_then(|code| std::str::from_utf8(code).ok())
                     .and_then(|code| code.trim().parse::<i32>().ok());
-                true
+
+                let started_at = self.started_at.take();
+                match (self.running_command.take(), started_at) {
+                    (Some(command), Some(started_at)) => {
+                        Some(HandledOsc::CommandFinished(FinishedCommand {
+                            command,
+                            exit_code: self.last_exit_code,
+                            started_at,
+                            duration_ms: (now - started_at).max(0) * 1000,
+                            cwd: self.cwd.clone(),
+                        }))
+                    }
+                    // A D with no preceding C — the first prompt of a session,
+                    // or a shell that reports inconsistently. Nothing ran, so
+                    // nothing is recorded.
+                    _ => Some(HandledOsc::Changed),
+                }
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -258,6 +324,7 @@ mod tests {
     }
 
     const CURSOR: GridPoint = GridPoint { line: 4, column: 7 };
+    const NOW: i64 = 1_700_000_000;
 
     #[test]
     fn completions_stay_dark_without_integration() {
@@ -271,23 +338,23 @@ mod tests {
     fn prompt_cycle_moves_through_phases() {
         let mut state = ShellState::default();
 
-        state.handle_osc(&osc(&["133", "A"]), CURSOR);
+        state.handle_osc(&osc(&["133", "A"]), CURSOR, None, NOW);
         assert_eq!(state.phase(), PromptPhase::Unknown);
         assert!(state.integration_seen());
 
-        state.handle_osc(&osc(&["133", "B"]), CURSOR);
+        state.handle_osc(&osc(&["133", "B"]), CURSOR, None, NOW);
         assert_eq!(state.phase(), PromptPhase::AtPrompt);
         assert_eq!(state.command_start(), Some(CURSOR));
         assert!(state.completions_allowed());
 
-        state.handle_osc(&osc(&["133", "C"]), CURSOR);
+        state.handle_osc(&osc(&["133", "C"]), CURSOR, None, NOW);
         assert_eq!(state.phase(), PromptPhase::Executing);
         assert!(
             !state.completions_allowed(),
             "keystrokes during a command belong to the program"
         );
 
-        state.handle_osc(&osc(&["133", "D", "0"]), CURSOR);
+        state.handle_osc(&osc(&["133", "D", "0"]), CURSOR, None, NOW);
         assert_eq!(state.phase(), PromptPhase::Unknown);
         assert_eq!(state.last_exit_code(), Some(0));
         assert_eq!(state.command_start(), None);
@@ -296,7 +363,7 @@ mod tests {
     #[test]
     fn vscode_dialect_is_equivalent() {
         let mut state = ShellState::default();
-        state.handle_osc(&osc(&["633", "B"]), CURSOR);
+        state.handle_osc(&osc(&["633", "B"]), CURSOR, None, NOW);
         assert!(
             state.completions_allowed(),
             "an existing VS Code shell integration should work with no injection"
@@ -306,18 +373,18 @@ mod tests {
     #[test]
     fn missing_exit_code_is_unknown_not_success() {
         let mut state = ShellState::default();
-        state.handle_osc(&osc(&["133", "D"]), CURSOR);
+        state.handle_osc(&osc(&["133", "D"]), CURSOR, None, NOW);
         assert_eq!(state.last_exit_code(), None);
 
         let mut state = ShellState::default();
-        state.handle_osc(&osc(&["133", "D", "not-a-number"]), CURSOR);
+        state.handle_osc(&osc(&["133", "D", "not-a-number"]), CURSOR, None, NOW);
         assert_eq!(state.last_exit_code(), None);
     }
 
     #[test]
     fn alt_screen_suppresses_completions() {
         let mut state = ShellState::default();
-        state.handle_osc(&osc(&["133", "B"]), CURSOR);
+        state.handle_osc(&osc(&["133", "B"]), CURSOR, None, NOW);
         assert!(state.completions_allowed());
 
         state.set_alt_screen(true);
@@ -331,28 +398,28 @@ mod tests {
     fn cwd_reports_are_parsed() {
         let mut state = ShellState::default();
 
-        assert!(state.handle_osc(&osc(&["7", "file:///tmp/project"]), CURSOR));
+        assert!(state.handle_osc(&osc(&["7", "file:///tmp/project"]), CURSOR, None, NOW).is_some());
         assert_eq!(state.cwd(), Some(&PathBuf::from("/tmp/project")));
 
         // Unchanged directory is not a change.
-        assert!(!state.handle_osc(&osc(&["7", "file:///tmp/project"]), CURSOR));
+        assert!(state.handle_osc(&osc(&["7", "file:///tmp/project"]), CURSOR, None, NOW).is_none());
 
         // Percent escapes.
-        state.handle_osc(&osc(&["7", "file:///tmp/with%20space"]), CURSOR);
+        state.handle_osc(&osc(&["7", "file:///tmp/with%20space"]), CURSOR, None, NOW);
         assert_eq!(state.cwd(), Some(&PathBuf::from("/tmp/with space")));
 
         // localhost is us.
-        state.handle_osc(&osc(&["7", "file://localhost/tmp/local"]), CURSOR);
+        state.handle_osc(&osc(&["7", "file://localhost/tmp/local"]), CURSOR, None, NOW);
         assert_eq!(state.cwd(), Some(&PathBuf::from("/tmp/local")));
     }
 
     #[test]
     fn remote_cwd_reports_are_ignored() {
         let mut state = ShellState::default();
-        state.handle_osc(&osc(&["7", "file:///tmp/local"]), CURSOR);
+        state.handle_osc(&osc(&["7", "file:///tmp/local"]), CURSOR, None, NOW);
 
         assert!(
-            !state.handle_osc(&osc(&["7", "file://build-server/srv/app"]), CURSOR),
+            state.handle_osc(&osc(&["7", "file://build-server/srv/app"]), CURSOR, None, NOW).is_none(),
             "a remote path is meaningless locally and worse than none"
         );
         assert_eq!(state.cwd(), Some(&PathBuf::from("/tmp/local")));
@@ -362,17 +429,63 @@ mod tests {
     #[test]
     fn windows_drive_letters_lose_the_url_slash() {
         let mut state = ShellState::default();
-        state.handle_osc(&osc(&["7", "file:///C:/Users/dev/project"]), CURSOR);
+        state.handle_osc(&osc(&["7", "file:///C:/Users/dev/project"]), CURSOR, None, NOW);
         assert_eq!(state.cwd(), Some(&PathBuf::from("C:/Users/dev/project")));
+    }
+
+    #[test]
+    fn a_finished_command_is_reported_once_with_its_outcome() {
+        let mut state = ShellState::default();
+        state.handle_osc(&osc(&["7", "file:///work/repo"]), CURSOR, None, NOW);
+        state.handle_osc(&osc(&["133", "B"]), CURSOR, None, NOW);
+
+        // The line is captured at C, while it is still on screen.
+        assert_eq!(
+            state.handle_osc(&osc(&["133", "C"]), CURSOR, Some("cargo build "), NOW),
+            Some(HandledOsc::Changed),
+        );
+
+        let finished = state.handle_osc(&osc(&["133", "D", "0"]), CURSOR, None, NOW + 3);
+        assert_eq!(
+            finished,
+            Some(HandledOsc::CommandFinished(FinishedCommand {
+                command: "cargo build".to_string(),
+                exit_code: Some(0),
+                started_at: NOW,
+                duration_ms: 3000,
+                cwd: Some(PathBuf::from("/work/repo")),
+            })),
+            "the trimmed command, its outcome, its duration and where it ran"
+        );
+
+        // A second D reports nothing: the command was already taken, and
+        // recording it twice would double its weight in history.
+        assert_eq!(
+            state.handle_osc(&osc(&["133", "D", "0"]), CURSOR, None, NOW + 4),
+            Some(HandledOsc::Changed),
+        );
+    }
+
+    #[test]
+    fn a_prompt_with_nothing_typed_records_nothing() {
+        let mut state = ShellState::default();
+        state.handle_osc(&osc(&["133", "B"]), CURSOR, None, NOW);
+        state.handle_osc(&osc(&["133", "C"]), CURSOR, Some("   "), NOW);
+
+        assert_eq!(
+            state.handle_osc(&osc(&["133", "D", "0"]), CURSOR, None, NOW + 1),
+            Some(HandledOsc::Changed),
+            "pressing Enter at an empty prompt is not a command"
+        );
     }
 
     #[test]
     fn unknown_sequences_change_nothing() {
         let mut state = ShellState::default();
-        state.handle_osc(&osc(&["133", "B"]), CURSOR);
+        state.handle_osc(&osc(&["133", "B"]), CURSOR, None, NOW);
 
-        assert!(!state.handle_osc(&osc(&["133", "P", "Cwd=/tmp"]), CURSOR));
-        assert!(!state.handle_osc(&osc(&["0", "some title"]), CURSOR));
+        assert!(state.handle_osc(&osc(&["133", "P", "Cwd=/tmp"]), CURSOR, None, NOW).is_none());
+        assert!(state.handle_osc(&osc(&["0", "some title"]), CURSOR, None, NOW).is_none());
         assert_eq!(
             state.phase(),
             PromptPhase::AtPrompt,

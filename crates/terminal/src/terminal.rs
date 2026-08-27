@@ -1023,6 +1023,7 @@ impl TerminalBuilder {
             title_override: None,
             events: VecDeque::with_capacity(10),
             shell_state: Default::default(),
+            finished_commands: Vec::new(),
             last_content: Content {
                 terminal_bounds,
                 ..Default::default()
@@ -1362,6 +1363,7 @@ impl TerminalBuilder {
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
                 shell_state: Default::default(),
+                finished_commands: Vec::new(),
                 last_mouse: None,
                 mouse_down_position: None,
                 matches: Vec::new(),
@@ -1561,6 +1563,10 @@ pub struct Terminal {
     pub matches: Vec<Range>,
     pub last_content: Content,
     shell_state: shell_state::ShellState,
+    /// Commands that finished and are waiting to be written to history.
+    /// Drained by the view, which owns the store; the terminal itself has no
+    /// business talking to a database.
+    finished_commands: Vec<shell_state::FinishedCommand>,
     pub selection_head: Option<Point>,
 
     pub breadcrumb_text: String,
@@ -1675,8 +1681,27 @@ impl Terminal {
                 };
                 self.shell_state
                     .set_alt_screen(self.last_content.mode.contains(Modes::ALT_SCREEN));
-                if self.shell_state.handle_osc(&params, cursor) {
-                    cx.notify();
+
+                // Read before the marker is handled: at `133;C` this is the
+                // command about to run, and it is the last moment it is still
+                // on screen where it was typed.
+                let typed_line = self.edit_buffer().map(|(line, _)| line);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs() as i64)
+                    .unwrap_or_default();
+
+                match self
+                    .shell_state
+                    .handle_osc(&params, cursor, typed_line.as_deref(), now)
+                {
+                    Some(shell_state::HandledOsc::CommandFinished(finished)) => {
+                        self.finished_commands.push(finished);
+                        cx.emit(Event::Wakeup);
+                        cx.notify();
+                    }
+                    Some(shell_state::HandledOsc::Changed) => cx.notify(),
+                    None => {}
                 }
             }
             TerminalBackendEvent::Title(title) => {
@@ -2022,6 +2047,11 @@ impl Terminal {
         drop(term);
         self.detect_init_command_startup_marker();
         cx.emit(Event::Wakeup);
+    }
+
+    /// Takes the commands that have finished since the last call.
+    pub fn take_finished_commands(&mut self) -> Vec<shell_state::FinishedCommand> {
+        std::mem::take(&mut self.finished_commands)
     }
 
     /// Read-only view of what the shell has reported about itself.
