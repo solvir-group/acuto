@@ -1150,6 +1150,12 @@ fn subscribe_for_terminal_events(
 
             match event {
                 Event::Wakeup => {
+                    // The grid is only current here. `key_down` runs before the
+                    // keystroke has reached the pty, been echoed by the shell,
+                    // and been parsed — so a suggestion computed there is
+                    // always one character behind, and the first character
+                    // typed produces no suggestion at all.
+                    terminal_view.refresh_suggestion(cx);
                     cx.notify();
                     window.invalidate_character_coordinates();
                     cx.emit(Event::Wakeup);
@@ -1343,10 +1349,6 @@ impl TerminalView {
         if self.process_keystroke(&event.keystroke, cx) {
             cx.stop_propagation();
         }
-
-        // Recomputed after the keystroke reaches the shell, because the grid is
-        // what the suggestion is derived from and it has only just changed.
-        self.refresh_suggestion(cx);
     }
 
     /// Writes the suggested remainder to the pty.

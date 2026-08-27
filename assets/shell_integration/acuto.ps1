@@ -3,11 +3,15 @@
 # Emits OSC 133 semantic prompt markers and OSC 7 working-directory reports.
 # See acuto.zsh for the rationale.
 #
-# Passed inline via `-Command` rather than written to a .ps1 and dot-sourced.
+# Passed via `-EncodedCommand` rather than written to a .ps1 and dot-sourced.
 # ExecutionPolicy governs script *files*, so a restrictive policy — the default
 # on Windows for anything not signed — would block a file but not an inline
 # command. Windows is a first-class target here, so the integration cannot be
 # the one thing that silently fails on it.
+#
+# Encoded rather than passed as a plain `-Command` argument because PowerShell
+# re-parses that argument and strips the script's own double quotes, leaving
+# something that cannot parse at all.
 #
 # Hard rule: this must never break the shell. The whole body is wrapped so that
 # any failure leaves the user with a working prompt and no integration, rather
@@ -64,6 +68,10 @@ try {
     function global:prompt {
         $exitCode = __Acuto-LastExitCode
 
+        # Cheap and idempotent; PSReadLine may have replaced our handler since
+        # the last prompt.
+        __Acuto-ArmEnterHandler
+
         # D before A: the previous command finished, then a new prompt starts.
         if ($env:ACUTO_COMMAND_RUNNING) {
             __Acuto-Osc "133;D;$exitCode"
@@ -87,15 +95,32 @@ try {
         "$rendered$([char]27)]133;B$([char]7)"
     }
 
-    # PSReadLine is where a command actually begins executing. Its handler is
-    # the only reliable pre-execution hook; without it there is no C marker and
-    # the editor cannot tell typing from running.
-    if (Get-Module -ListAvailable -Name PSReadLine) {
-        Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
-            param($key, $arg)
-            $env:ACUTO_COMMAND_RUNNING = '1'
-            [Console]::Write("$([char]27)]133;C$([char]7)")
-            [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+    # PSReadLine is where a command actually begins executing, and its Enter
+    # handler is the only reliable pre-execution hook PowerShell offers.
+    #
+    # Re-armed from `prompt` rather than installed once: this script runs before
+    # the interactive session starts, and PSReadLine initialises afterwards,
+    # replacing whatever handlers were set. Installing once looks like it works
+    # and then silently does nothing, which costs the C marker and therefore
+    # every recorded command.
+    function global:__Acuto-ArmEnterHandler {
+        try {
+            $existing = Get-PSReadLineKeyHandler -Bound |
+                Where-Object { $_.Key -eq 'Enter' -and $_.Function -eq 'AcutoAcceptLine' }
+            if ($existing) { return }
+
+            Set-PSReadLineKeyHandler -Key Enter `
+                -BriefDescription 'AcutoAcceptLine' `
+                -Description 'Reports command start to Acuto, then accepts the line.' `
+                -ScriptBlock {
+                    param($key, $arg)
+                    $env:ACUTO_COMMAND_RUNNING = '1'
+                    [Console]::Write("$([char]27)]133;C$([char]7)")
+                    [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+                }
+        } catch {
+            # No PSReadLine, or a version without these cmdlets. The prompt
+            # markers still work; only command timing is lost.
         }
     }
 } catch {
