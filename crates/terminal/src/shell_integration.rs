@@ -265,47 +265,97 @@ unset ACUTO_PREVIOUS_ZDOTDIR
 /// Builds a PowerShell command line that runs the integration and then
 /// whatever the user configured.
 ///
-/// `-Command` consumes the entire remainder of the command line, so prepending
-/// a second one produces a command line PowerShell reads as one giant script
-/// argument — the user's own command silently never runs. The two have to be
-/// merged into a single `-Command` instead, with the integration first so the
-/// prompt it installs is in place before the user's profile customises it.
+/// Two constraints force the shape of this.
+///
+/// **`-Command` consumes the rest of the command line**, so a second one is not
+/// a second command — it becomes part of the first one's argument. Prepending
+/// ours would silently stop the user's own command from running.
+///
+/// **A multi-line script passed as a `-Command` argument has its quoting
+/// mangled.** PowerShell re-parses the argument and the script's own double
+/// quotes do not survive: `[Console]::Write("...")` arrives as
+/// `[Console]::Write(...)` and fails to parse. That is observed behaviour, not
+/// a theoretical risk — it is what running the script this way actually does.
+///
+/// `-EncodedCommand` solves both. It takes one base64 argument that PowerShell
+/// decodes rather than re-parses, so quoting survives intact, and it is still
+/// not a script *file*, so ExecutionPolicy does not apply.
 fn merge_powershell_args(existing: &[String], script: &str) -> Vec<String> {
-    let command_at = existing
-        .iter()
-        .position(|arg| arg.eq_ignore_ascii_case("-Command") || arg.eq_ignore_ascii_case("-c"));
+    let command_at = existing.iter().position(|arg| {
+        arg.eq_ignore_ascii_case("-Command")
+            || arg.eq_ignore_ascii_case("-c")
+            || arg.eq_ignore_ascii_case("-EncodedCommand")
+            || arg.eq_ignore_ascii_case("-e")
+    });
 
-    match command_at {
+    let (mut args, user_command) = match command_at {
         Some(index) => {
-            let mut args: Vec<String> = existing[..index].to_vec();
-            // Everything after -Command is the user's command, however many
+            // Everything after the flag is the user's command, however many
             // argv entries it happens to occupy.
             let user_command = existing[index + 1..].join(" ");
-            args.push("-Command".to_string());
-            args.push(if user_command.trim().is_empty() {
-                script.to_string()
-            } else {
-                format!("{script}\n{user_command}")
-            });
-            args
+            (existing[..index].to_vec(), user_command)
         }
-        None => {
-            let mut args: Vec<String> = existing.to_vec();
-            // Only added when absent: passing it twice is harmless but makes
-            // the command line confusing to read in a process list.
-            if !args.iter().any(|arg| arg.eq_ignore_ascii_case("-NoExit")) {
-                args.push("-NoExit".to_string());
-            }
-            args.push("-Command".to_string());
-            args.push(script.to_string());
-            args
-        }
+        None => (existing.to_vec(), String::new()),
+    };
+
+    // Only added when absent: passing it twice works but makes the command line
+    // confusing to read in a process list.
+    if !args.iter().any(|arg| arg.eq_ignore_ascii_case("-NoExit")) {
+        args.push("-NoExit".to_string());
     }
+
+    let combined = if user_command.trim().is_empty() {
+        script.to_string()
+    } else {
+        format!("{script}\n{user_command}")
+    };
+
+    args.push("-EncodedCommand".to_string());
+    args.push(encode_powershell_command(&combined));
+    args
+}
+
+/// Encodes a script the way `-EncodedCommand` expects: base64 of UTF-16LE.
+///
+/// UTF-16 rather than UTF-8 because that is what PowerShell decodes to; feeding
+/// it UTF-8 produces a script full of interleaved null characters.
+fn encode_powershell_command(script: &str) -> String {
+    use base64::Engine as _;
+
+    let utf16: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+    base64::engine::general_purpose::STANDARD.encode(utf16)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decodes what `-EncodedCommand` would receive, so tests assert on the
+    /// script PowerShell actually sees rather than on base64.
+    fn decode_for_test(encoded: &str) -> String {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("valid base64");
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16(&units).expect("valid utf-16")
+    }
+
+    #[test]
+    fn powershell_encoding_preserves_quoting() {
+        // The regression this exists for: passed as a plain -Command argument,
+        // PowerShell re-parses and the double quotes vanish, leaving a script
+        // that cannot parse.
+        let source = r#"[Console]::Write("$([char]27)]133;A$([char]7)")"#;
+        let merged = merge_powershell_args(&[], source);
+        assert_eq!(decode_for_test(merged.last().expect("encoded")), source);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("acuto-shell-integration-{name}"));
@@ -326,17 +376,20 @@ mod tests {
         let merged = merge_powershell_args(&existing, "INTEGRATION");
 
         assert_eq!(
-            merged.iter().filter(|arg| arg.eq_ignore_ascii_case("-Command")).count(),
+            merged
+                .iter()
+                .filter(|arg| arg.to_lowercase().contains("command"))
+                .count(),
             1,
             "-Command consumes the rest of the command line; a second one is unreachable"
         );
         assert_eq!(merged[0], "-NoLogo", "the user's other flags survive");
-        assert_eq!(merged[1], "-NoExit");
+        assert!(merged.iter().any(|arg| arg == "-EncodedCommand"));
 
-        let command = merged.last().expect("a command");
-        assert!(command.starts_with("INTEGRATION"), "integration installs first");
+        let decoded = decode_for_test(merged.last().expect("an encoded command"));
+        assert!(decoded.starts_with("INTEGRATION"), "integration installs first");
         assert!(
-            command.contains(". 'C:/x/acuto.ps1'"),
+            decoded.contains(". 'C:/x/acuto.ps1'"),
             "the user's own command must still run"
         );
     }
@@ -344,7 +397,10 @@ mod tests {
     #[test]
     fn powershell_without_an_existing_command_gets_its_own() {
         let merged = merge_powershell_args(&["-NoLogo".to_string()], "INTEGRATION");
-        assert_eq!(merged, vec!["-NoLogo", "-NoExit", "-Command", "INTEGRATION"]);
+        assert_eq!(merged[0], "-NoLogo");
+        assert_eq!(merged[1], "-NoExit");
+        assert_eq!(merged[2], "-EncodedCommand");
+        assert_eq!(decode_for_test(&merged[3]), "INTEGRATION");
     }
 
     #[test]
@@ -437,8 +493,8 @@ mod tests {
         .expect("powershell is supported");
 
         assert!(
-            injection.args.iter().any(|arg| arg == "-Command"),
-            "must be passed inline"
+            injection.args.iter().any(|arg| arg == "-EncodedCommand"),
+            "encoded, so the script's own quoting survives argument parsing"
         );
         assert!(
             injection.args.iter().any(|arg| arg == "-NoExit"),

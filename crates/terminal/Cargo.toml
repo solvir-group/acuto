@@ -24,6 +24,7 @@ async-channel.workspace = true
 alacritty_terminal.workspace = true
 anyhow.workspace = true
 collections.workspace = true
+base64.workspace = true
 dirs.workspace = true
 paths.workspace = true
 futures.workspace = true
