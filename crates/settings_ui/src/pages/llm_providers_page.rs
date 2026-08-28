@@ -557,6 +557,14 @@ struct ModelInput {
     supports_thinking: ToggleState,
     interleaved_reasoning: ToggleState,
     max_tokens_parameter: ToggleState,
+    /// Vendor request fields, carried rather than dropped.
+    ///
+    /// This form only adds providers today, so this is always `None` and the
+    /// field costs nothing. It exists so that the day the form learns to edit
+    /// an existing provider, it does not silently delete the
+    /// `chat_template_kwargs` that makes that provider's model think -- a
+    /// setting no control here can express and nothing would report losing.
+    extra_body: Option<serde_json::Value>,
 }
 
 impl ModelInput {
@@ -591,6 +599,7 @@ impl ModelInput {
             supports_thinking: ToggleState::Unselected,
             interleaved_reasoning: interleaved_reasoning.into(),
             max_tokens_parameter: max_tokens_parameter.into(),
+            extra_body: None,
         }
     }
 }
@@ -1056,6 +1065,7 @@ struct ModelValues {
     supports_thinking: bool,
     interleaved_reasoning: bool,
     max_tokens_parameter: bool,
+    extra_body: Option<serde_json::Value>,
 }
 
 enum ParsedModels {
@@ -1094,6 +1104,7 @@ fn save_llm_provider_form(
                     supports_thinking: model.supports_thinking.selected(),
                     interleaved_reasoning: model.interleaved_reasoning.selected(),
                     max_tokens_parameter: model.max_tokens_parameter.selected(),
+                    extra_body: model.extra_body.clone(),
                 })
                 .collect(),
         }
@@ -1283,6 +1294,7 @@ fn parse_open_ai_model(
                 && model.interleaved_reasoning,
             max_tokens_parameter: model.supports_chat_completions && model.max_tokens_parameter,
         },
+        extra_body: model.extra_body.clone(),
     })
 }
 

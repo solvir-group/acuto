@@ -52,8 +52,8 @@ use ui::{
 use update_version::UpdateVersion;
 use util::ResultExt;
 use workspace::{
-    AccessibleMode, MultiWorkspace, ToggleWorktreeSecurity, Workspace,
-    notifications::{NotifyResultExt, NotifyTaskExt as _},
+    AccessibleMode, MultiWorkspace, Toast, ToggleWorktreeSecurity, Workspace,
+    notifications::{NotificationId, NotifyResultExt, NotifyTaskExt as _},
 };
 
 use zed_actions::OpenRemote;
@@ -235,6 +235,9 @@ impl Render for TitleBar {
         let mut project_name = None;
         let mut repository = None;
         let mut linked_worktree_name = None;
+        // Read before `repository` is consumed below, so the top bar's repo
+        // button has somewhere to point.
+        let mut remote_url: Option<String> = None;
         if let Some(worktree) = self.effective_active_worktree(cx) {
             repository = self.get_repository_for_worktree(&worktree, cx);
             let worktree_abs_path = worktree.read(cx).abs_path();
@@ -244,6 +247,12 @@ impl Render for TitleBar {
                 .file_name()
                 .map(|name| SharedString::from(name.to_string()));
             if let Some(repo) = &repository {
+                let snapshot = repo.read(cx).snapshot();
+                remote_url = snapshot
+                    .remote_origin_url
+                    .clone()
+                    .or_else(|| snapshot.remote_upstream_url.clone());
+
                 let repo = repo.read(cx);
                 linked_worktree_name = repo
                     .main_worktree_abs_path()
@@ -398,12 +407,17 @@ impl Render for TitleBar {
         );
 
         if show_menus {
+            // The row is `justify_between`, so a second child sits against the
+            // right edge, inside the window controls.
+            let extras = self.render_top_bar_extras(remote_url, cx);
             self.platform_titlebar.update(cx, |this, _| {
                 this.set_button_layout(button_layout);
                 this.set_children(
                     self.application_menu
                         .clone()
-                        .map(|menu| menu.into_any_element()),
+                        .map(|menu| menu.into_any_element())
+                        .into_iter()
+                        .chain(std::iter::once(extras)),
                 );
             });
 
@@ -912,6 +926,69 @@ impl TitleBar {
                 },
             )
             .anchor(gpui::Anchor::TopLeft)
+    }
+
+    /// Where feature requests go. Empty until there is somewhere to send them,
+    /// which the button says rather than pretending otherwise.
+    const FEATURE_REQUEST_URL: &'static str = "";
+
+    /// The window-frame row: a link to the project's repository and a way to
+    /// ask for something.
+    ///
+    /// Up here rather than beside the git and terminal buttons because neither
+    /// is about the file you are editing. They are about the project and about
+    /// the editor, which is what this row is already for.
+    fn render_top_bar_extras(&self, remote_url: Option<String>, _cx: &App) -> AnyElement {
+        let repository_button = remote_url.and_then(|url| {
+            let web_url = web_url_for_remote(&url)?;
+            let icon = hosting_icon_for(&web_url);
+            let label = SharedString::from(format!("Open {web_url}"));
+            Some(
+                IconButton::new("top-bar-repository", icon)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text(label))
+                    .on_click(move |_, _, cx| cx.open_url(&web_url)),
+            )
+        });
+
+        let has_destination = !Self::FEATURE_REQUEST_URL.is_empty();
+        let workspace = self.workspace.clone();
+        let feature_request = IconButton::new("top-bar-feature-request", IconName::Envelope)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(Tooltip::text(if has_destination {
+                "Request a Feature"
+            } else {
+                "Request a Feature - not open yet"
+            }))
+            .on_click(move |_, _, cx| {
+                if has_destination {
+                    cx.open_url(Self::FEATURE_REQUEST_URL);
+                    return;
+                }
+                // A button that does nothing when clicked reads as broken. It
+                // says why instead, and becomes a link the moment the constant
+                // above has a value.
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<FeatureRequestUnavailable>(),
+                                "Feature requests are not open yet.",
+                            ),
+                            cx,
+                        );
+                    })
+                    .log_err();
+            });
+
+        h_flex()
+            .gap_0p5()
+            .pr_2()
+            .children(repository_button)
+            .child(feature_request)
+            .into_any_element()
     }
 
     /// Git and terminal controls in the title bar.
@@ -1507,5 +1584,90 @@ impl TitleBar {
                 .into()
             })
             .anchor(Anchor::TopRight)
+    }
+}
+
+
+/// A notification id for the "no feature tracker yet" toast.
+struct FeatureRequestUnavailable;
+
+/// Turns a git remote into something a browser can open.
+///
+/// Handles the two forms a remote actually takes -- `https://host/owner/repo`
+/// and `git@host:owner/repo.git` -- and refuses anything else rather than
+/// guessing, because a wrong URL opens a browser tab at a stranger's project.
+fn web_url_for_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches('/');
+    let remote = remote.strip_suffix(".git").unwrap_or(remote);
+
+    if let Some(rest) = remote.strip_prefix("git@") {
+        // `git@host:owner/repo`. The colon is a separator here, not a port.
+        let (host, path) = rest.split_once(':')?;
+        return Some(format!("https://{host}/{}", path.trim_start_matches('/')));
+    }
+
+    if let Some(rest) = remote.strip_prefix("ssh://git@") {
+        return Some(format!("https://{rest}"));
+    }
+
+    if remote.starts_with("https://") || remote.starts_with("http://") {
+        return Some(remote.to_string());
+    }
+
+    None
+}
+
+/// Picks the forge's own mark when the host is one we can name, and a generic
+/// link when it is not -- a self-hosted GitLab is not going to be recognised by
+/// its hostname, and showing GitHub's mark for it would be worse than neutral.
+fn hosting_icon_for(web_url: &str) -> IconName {
+    let host = web_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match host.as_str() {
+        "github.com" | "www.github.com" => IconName::Github,
+        "gitlab.com" | "www.gitlab.com" => IconName::Gitlab,
+        "bitbucket.org" => IconName::Bitbucket,
+        "codeberg.org" => IconName::Codeberg,
+        _ => IconName::Link,
+    }
+}
+
+#[cfg(test)]
+mod acuto_tests {
+    use super::*;
+
+    #[test]
+    fn remotes_become_browsable_urls() {
+        assert_eq!(
+            web_url_for_remote("git@github.com:acuto/acuto.git").as_deref(),
+            Some("https://github.com/acuto/acuto")
+        );
+        assert_eq!(
+            web_url_for_remote("https://gitlab.com/group/project.git").as_deref(),
+            Some("https://gitlab.com/group/project")
+        );
+        assert_eq!(
+            web_url_for_remote("ssh://git@git.example.com/team/repo.git").as_deref(),
+            Some("https://git.example.com/team/repo")
+        );
+        // Not a form we can convert, so it gets no button rather than a wrong one.
+        assert_eq!(web_url_for_remote("/srv/git/repo.git"), None);
+        assert_eq!(web_url_for_remote(""), None);
+    }
+
+    #[test]
+    fn only_recognised_hosts_get_their_own_mark() {
+        assert_eq!(hosting_icon_for("https://github.com/a/b"), IconName::Github);
+        assert_eq!(hosting_icon_for("https://gitlab.com/a/b"), IconName::Gitlab);
+        assert_eq!(
+            hosting_icon_for("https://git.internal.example/a/b"),
+            IconName::Link
+        );
     }
 }

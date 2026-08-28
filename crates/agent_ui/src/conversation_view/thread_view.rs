@@ -4462,6 +4462,7 @@ impl ThreadView {
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
+                                    .child(self.render_auto_accept_control(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
                             )
@@ -5154,6 +5155,67 @@ impl ThreadView {
             return None;
         }
         Some((provider_id, model_id, confirmation))
+    }
+
+    /// Toggles whether tool calls run without asking.
+    ///
+    /// The agent asks before nearly everything by default, which is right the
+    /// first time you use it and wrong every time after: a run that reads six
+    /// files and edits two becomes eight interruptions, and the habit it builds
+    /// is approving without reading -- which is worse than not asking.
+    ///
+    /// This writes `agent.tool_permissions.default`, the same setting the
+    /// permission prompts already consult, rather than adding a second switch
+    /// that has to be kept in agreement with it. Per-tool `always_deny` rules
+    /// still win: they are how you keep a specific thing gated while the rest
+    /// runs, and a blanket toggle that overrode them would make them useless.
+    fn render_auto_accept_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let auto_accepting = matches!(
+            AgentSettings::get_global(cx).tool_permissions.default,
+            settings::ToolPermissionMode::Allow
+        );
+
+        let (icon, color, tooltip) = if auto_accepting {
+            (
+                IconName::LockOff,
+                Color::Accent,
+                "Auto-accept is on - tool calls run without asking. Click to require confirmation.",
+            )
+        } else {
+            (
+                IconName::Lock,
+                Color::Muted,
+                "Auto-accept is off - the agent asks before each tool call. Click to let it run.",
+            )
+        };
+
+        IconButton::new("auto-accept-tools", icon)
+            .icon_size(IconSize::Small)
+            .icon_color(color)
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                let Some(project) = this.workspace.upgrade().map(|workspace| {
+                    workspace.read(cx).project().clone()
+                }) else {
+                    return;
+                };
+                let fs = project.read(cx).fs().clone();
+                let next = if auto_accepting {
+                    settings::ToolPermissionMode::Confirm
+                } else {
+                    settings::ToolPermissionMode::Allow
+                };
+                update_settings_file(fs, cx, move |settings, _| {
+                    settings
+                        .agent
+                        .get_or_insert_with(Default::default)
+                        .tool_permissions
+                        .get_or_insert_with(Default::default)
+                        .default = Some(next);
+                });
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     fn render_thinking_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

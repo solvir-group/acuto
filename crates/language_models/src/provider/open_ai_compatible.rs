@@ -259,6 +259,27 @@ impl OpenAiCompatibleLanguageModel {
     }
 }
 
+/// Merges a model's configured vendor fields into a request.
+///
+/// Existing keys win. Configuration is allowed to add fields the request type
+/// cannot express; it is not allowed to rewrite the messages, the tools or the
+/// model name, because those are what the rest of the app believes it sent.
+fn with_extra_body(
+    mut request: open_ai::Request,
+    extra: Option<&serde_json::Value>,
+) -> open_ai::Request {
+    // Anything that is not an object has no top-level fields to contribute.
+    let Some(extra) = extra.and_then(|value| value.as_object()) else {
+        return request;
+    };
+    for (key, value) in extra {
+        if !request.extra_body.contains_key(key) {
+            request.extra_body.insert(key.clone(), value.clone());
+        }
+    }
+    request
+}
+
 fn default_thinking_reasoning_effort(model: &AvailableModel) -> Option<open_ai::ReasoningEffort> {
     model
         .reasoning_effort
@@ -437,6 +458,7 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
                 Ok(request) => request,
                 Err(error) => return async move { Err(error.into()) }.boxed(),
             };
+            let request = with_extra_body(request, self.model.extra_body.as_ref());
             let completions = self.stream_completion(request, cx);
             async move {
                 let mapper = OpenAiEventMapper::new();

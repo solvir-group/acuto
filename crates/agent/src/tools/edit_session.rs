@@ -357,6 +357,9 @@ pub(crate) struct EditSession {
     parser: StreamingParser,
     pipeline: Pipeline,
     context: Arc<EditSessionContext>,
+    /// Held so no other agent thread opens a session on this file while this
+    /// one is open. Released when the session is dropped, by any route.
+    _edit_claim: crate::edit_claims::EditClaim,
     _finalize_diff_guard: Deferred<Box<dyn FnOnce()>>,
 }
 
@@ -722,6 +725,31 @@ impl EditSession {
             .await
             .map_err(|e| e.to_string())?;
 
+        // Claimed before the buffer is opened, so a refusal costs nothing and
+        // the model is told while it can still do something useful with the
+        // answer. The message names the other agent's thread rather than saying
+        // "busy", because "work on something else" is only actionable if you
+        // know what the something else is competing with.
+        let holder = context.thread.entity_id().as_u64();
+        let holder_label = context
+            .thread
+            .read_with(cx, |thread, _cx| thread.title())
+            .ok()
+            .flatten()
+            .map_or_else(|| "an untitled thread".to_string(), |title| title.to_string());
+        let edit_claim = crate::edit_claims::claim(&abs_path, holder, &holder_label).map_err(
+            |blocked| {
+                format!(
+                    "`{}` is being edited right now by another agent (\"{}\"). \
+                     Edit a different file, or wait for that agent to finish and \
+                     try again -- editing it now would overwrite work that is \
+                     still in progress.",
+                    path.to_string_lossy(),
+                    blocked.holder_label,
+                )
+            },
+        )?;
+
         let buffer = match project_path {
             Some(project_path) => context
                 .project
@@ -772,6 +800,7 @@ impl EditSession {
             parser: StreamingParser::default(),
             pipeline: Pipeline::new(mode, file_changed_since_last_read),
             context,
+            _edit_claim: edit_claim,
             _finalize_diff_guard: finalize_diff_guard,
         })
     }

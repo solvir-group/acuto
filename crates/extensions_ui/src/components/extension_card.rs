@@ -626,9 +626,14 @@ impl RenderOnce for ExtensionCard {
             v_flex()
                 .mt_4()
                 .w_full()
-                .h(rems_from_px(110_f32))
+                // Fixed, because the grid these sit in is virtualised and a
+                // uniform list measures one row and reuses that height. Tall
+                // enough for four rows: the chips moved off the title row when
+                // cards stopped being full-window width, and a card that clips
+                // its own description is not worth showing.
+                .h(rems_from_px(150_f32))
                 .p_3()
-                .gap_2()
+                .gap_1p5()
                 .bg(cx.theme().colors().elevated_surface_background.opacity(0.5))
                 .border_1()
                 .border_color(cx.theme().colors().border_variant)
@@ -663,14 +668,7 @@ impl RenderOnce for ExtensionCard {
                                 .children(installed_version.map(|installed_version| {
                                     Headline::new(format!("(v{installed_version} installed)"))
                                         .size(HeadlineSize::XSmall)
-                                }))
-                                .when(!provided_features.is_empty(), |parent| {
-                                    parent.child(
-                                        h_flex()
-                                            .gap_1()
-                                            .children(provided_features.into_iter().map(Chip::new)),
-                                    )
-                                }),
+                                })),
                         )
                         .child(
                             h_flex()
@@ -679,8 +677,20 @@ impl RenderOnce for ExtensionCard {
                                 .children(actions.into_iter().flatten()),
                         ),
                 )
+                .when(!provided_features.is_empty(), |card| {
+                    card.child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .gap_1()
+                            .overflow_hidden()
+                            .children(provided_features.into_iter().map(Chip::new)),
+                    )
+                })
                 .child(
                     h_flex()
+                        .w_full()
+                        .min_w_0()
                         .gap_2()
                         .justify_between()
                         .children(description.map(|description| {
@@ -690,11 +700,13 @@ impl RenderOnce for ExtensionCard {
                                 .truncate()
                         }))
                         .children(download_count.map(|download_count| {
-                            Label::new(format!(
-                                "Downloads: {}",
-                                download_count.to_formatted_string(&Locale::en)
-                            ))
-                            .size(LabelSize::Small)
+                            div().flex_none().child(
+                                Label::new(format!(
+                                    "Downloads: {}",
+                                    download_count.to_formatted_string(&Locale::en)
+                                ))
+                                .size(LabelSize::Small),
+                            )
                         })),
                 )
                 .child(

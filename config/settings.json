@@ -55,10 +55,14 @@
   // in the OS credential store; paste it once into the agent panel's provider
   // setup instead.
   //
-  // Note: NVIDIA's `chat_template_kwargs: {enable_thinking: true}` and the
-  // `reasoning_content` delta field are vendor extensions. Zed's OpenAI-compatible
-  // provider neither sends nor reads them, so the model runs without its
-  // reasoning stream surfaced.
+  // `extra_body` is merged into every request to this model. Nemotron produces
+  // no reasoning at all without `chat_template_kwargs.enable_thinking`, and it
+  // is a vendor field that OpenAI's own schema has no room for -- so the agent
+  // was running with its thinking switched off and no way to say otherwise.
+  // The `reasoning_content` it then streams back is already understood.
+  //
+  // Reasoning is folded away in the transcript (see `thinking_display` below),
+  // so this buys better answers without a wall of text.
   "language_models": {
     "openai_compatible": {
       "NVIDIA": {
@@ -68,7 +72,10 @@
             "name": "nvidia/nemotron-3-super-120b-a12b",
             "display_name": "Nemotron 3 Super 120B",
             "max_tokens": 16384,
-            "max_output_tokens": 16384
+            "max_output_tokens": 16384,
+            "extra_body": {
+              "chat_template_kwargs": { "enable_thinking": true }
+            }
           }
         ]
       }

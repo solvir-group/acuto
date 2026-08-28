@@ -61,10 +61,19 @@ pub fn load_open_ai_compatible_api_key_if_needed(
     return open_ai_compatible_api_token(cx).read(cx).key(&url);
 }
 
-/// The text either side of the caret, for servers that cannot be handed a
-/// fill-in-the-middle prompt directly.
+/// Everything a chat model is told about where the caret is.
+///
+/// A fill-in-the-middle model needs only the two halves of the hole; it learned
+/// the task during training. A chat model has to be told what the task is, what
+/// language it is looking at, and enough of the surrounding project to avoid
+/// inventing names -- so this carries considerably more.
 pub(crate) struct CaretContext<'a> {
     pub path: &'a str,
+    /// The buffer's language, when the buffer has one.
+    pub language: Option<&'a str>,
+    /// Excerpts from elsewhere in the project, already formatted. Empty when
+    /// retrieval found nothing.
+    pub related: &'a str,
     pub prefix: &'a str,
     pub suffix: &'a str,
 }
@@ -169,14 +178,27 @@ pub(crate) async fn send_custom_server_request(
 const CARET_MARKER: &str = "<|caret|>";
 
 const COMPLETION_SYSTEM_PROMPT: &str = concat!(
-    "You are a code completion engine inside a text editor. ",
-    "The user sends one file with the caret position marked <|caret|>. ",
-    "Reply with ONLY the exact characters to insert at the caret. ",
-    "Never repeat text that already appears before or after the caret. ",
-    "Never wrap the reply in markdown code fences. ",
-    "Never explain, comment on, or restate the task. ",
-    "Complete the current expression or statement and stop; do not write the rest of the file. ",
-    "If no completion is appropriate, reply with nothing at all.",
+    "You are a code completion engine inside a text editor.\n\n",
+    "The user sends the file being edited with the caret marked <|caret|>, and \
+     may send excerpts from elsewhere in the same project first. Reply with the \
+     exact characters to insert at the caret, and nothing else.\n\n",
+    "Rules:\n",
+    "1. Output raw code. No markdown fences, no prose, no explanation, no \
+     restating the task.\n",
+    "2. Never repeat text that already appears immediately before or after the \
+     caret. Your output is inserted between them verbatim.\n",
+    "3. Complete the current expression, statement or block and stop. Do not \
+     write the rest of the file.\n",
+    "4. Use only identifiers that appear in the file or in the project excerpts \
+     you were given. If you need something that does not exist, stop instead of \
+     inventing a name.\n",
+    "5. Match the surrounding code: its language, its indentation width and \
+     character, its quote style, and whether it uses semicolons.\n",
+    "6. Continue the current line before starting a new one. If the caret sits \
+     mid-line, your first character continues that line.\n",
+    "7. If you cannot complete confidently, reply with nothing at all. An empty \
+     reply is correct and costs the user nothing; a wrong one costs them a \
+     read and an undo.",
 );
 
 /// Asks a chat model to fill in at the caret.
@@ -193,10 +215,22 @@ async fn send_chat_completion_request(
     api_key: Option<Arc<str>>,
     http_client: &Arc<dyn http_client::HttpClient>,
 ) -> Result<(String, String)> {
-    let user_message = format!(
-        "File: {}\n\n{}{CARET_MARKER}{}",
+    let mut user_message = String::new();
+    if !caret.related.is_empty() {
+        user_message.push_str(
+            "Excerpts from elsewhere in this project, for reference only. Do not \
+             continue these; they are not where the caret is.\n\n",
+        );
+        user_message.push_str(caret.related);
+        user_message.push('\n');
+    }
+    if let Some(language) = caret.language {
+        user_message.push_str(&format!("Language: {language}\n"));
+    }
+    user_message.push_str(&format!(
+        "File being edited: {}\n\n{}{CARET_MARKER}{}",
         caret.path, caret.prefix, caret.suffix
-    );
+    ));
 
     let body = serde_json::json!({
         "model": settings.model,
@@ -260,7 +294,76 @@ async fn send_chat_completion_request(
         .unwrap_or_default()
         .to_string();
 
-    Ok((clean_chat_completion(text), request_id))
+    Ok((
+        trim_overlap_with_buffer(clean_chat_completion(text), caret.prefix, caret.suffix),
+        request_id,
+    ))
+}
+
+/// Removes the parts of a completion that duplicate what is already in the
+/// buffer.
+///
+/// Told not to repeat the surrounding text, a chat model does it anyway often
+/// enough to matter: it restates the line it is completing, or closes a block
+/// that the text after the caret already closes. The completion is inserted
+/// between the two halves verbatim, so either one produces visibly broken code
+/// the moment it is accepted.
+fn trim_overlap_with_buffer(completion: String, prefix: &str, suffix: &str) -> String {
+    /// A single character in common is coincidence: a completion may honestly
+    /// begin with the same bracket the preceding text ended with.
+    const MIN_OVERLAP: usize = 2;
+    /// How far into the surrounding text to look. Beyond this the model is not
+    /// repeating itself, it is rewriting the file, and that is a different
+    /// failure -- one this cannot repair by trimming.
+    const WINDOW: usize = 400;
+
+    let mut completion = completion;
+
+    // Opening by re-typing what is already behind the caret.
+    if let Some(overlap) = longest_overlap(window_end(prefix, WINDOW), &completion, MIN_OVERLAP) {
+        completion = completion[overlap..].to_string();
+    }
+
+    // Closing by re-typing what is already ahead of it.
+    if let Some(overlap) = longest_overlap(&completion, window_start(suffix, WINDOW), MIN_OVERLAP) {
+        let keep = completion.len() - overlap;
+        completion.truncate(keep);
+    }
+
+    completion
+}
+
+/// The length in bytes of the longest string that both ends `left` and starts
+/// `right`, or `None` if the longest is shorter than `minimum`.
+fn longest_overlap(left: &str, right: &str, minimum: usize) -> Option<usize> {
+    let max = left.len().min(right.len());
+    if max < minimum {
+        return None;
+    }
+    (minimum..=max).rev().find(|&length| {
+        let split = left.len() - length;
+        left.is_char_boundary(split)
+            && right.is_char_boundary(length)
+            && left[split..] == right[..length]
+    })
+}
+
+/// The last `max` bytes of `text`, moved forward to a character boundary.
+fn window_end(text: &str, max: usize) -> &str {
+    let mut start = text.len().saturating_sub(max);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+/// The first `max` bytes of `text`, moved back to a character boundary.
+fn window_start(text: &str, max: usize) -> &str {
+    let mut end = max.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Strips the shapes a chat model reaches for even when told not to.
@@ -315,6 +418,54 @@ mod tests {
         assert_eq!(clean_chat_completion("```rust\n.sum()"), ".sum()");
         // A fence with nothing after it says nothing.
         assert_eq!(clean_chat_completion("```"), "");
+    }
+
+    #[test]
+    fn a_completion_that_retypes_the_buffer_is_trimmed() {
+        // Restates what is already behind the caret.
+        assert_eq!(
+            trim_overlap_with_buffer("total.sum()".into(), "    let x = total", ""),
+            ".sum()"
+        );
+        // Closes a block the text ahead of the caret already closes.
+        assert_eq!(
+            trim_overlap_with_buffer("a + b;\n}".into(), "    return ", "\n}"),
+            "a + b;"
+        );
+        // Wholly duplicated: everything it offered is already there.
+        assert_eq!(trim_overlap_with_buffer(");".into(), "    foo(bar", ");"), "");
+        // Nothing in common survives untouched.
+        assert_eq!(
+            trim_overlap_with_buffer("a + b".into(), "    return ", "\n"),
+            "a + b"
+        );
+        // One character in common is coincidence, not repetition.
+        assert_eq!(trim_overlap_with_buffer("(x)".into(), "foo(", ""), "(x)");
+    }
+
+    #[test]
+    fn overlap_is_measured_across_lines_not_just_the_current_one() {
+        // The duplicated part spans a newline, which a line-at-a-time
+        // comparison would miss entirely.
+        assert_eq!(
+            trim_overlap_with_buffer(
+                "value;\n    }\n}".into(),
+                "        return ",
+                "\n    }\n}"
+            ),
+            "value;"
+        );
+    }
+
+    #[test]
+    fn trimming_never_splits_a_character() {
+        // A multi-byte character on the overlap boundary must not be cut
+        // through. Rust would panic on a non-boundary slice, so reaching the
+        // assertion at all is the property under test.
+        let trimmed = trim_overlap_with_buffer("é_value".into(), "let café", "");
+        assert!(trimmed.is_char_boundary(0));
+        let trimmed = trim_overlap_with_buffer("value_é".into(), "", "é_rest");
+        assert!(trimmed.is_char_boundary(0));
     }
 
     #[test]

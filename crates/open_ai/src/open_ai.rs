@@ -558,6 +558,15 @@ pub struct Request {
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<ServiceTier>,
+
+    /// Vendor fields that are not part of OpenAI's own schema.
+    ///
+    /// Flattened, so an empty map serializes to nothing and the request is
+    /// byte-identical to what it was before this existed. Providers that talk
+    /// to a compatible-but-extended server fill this from configuration; the
+    /// OpenAI provider itself never does.
+    #[serde(default, flatten)]
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Service tier for OpenAI requests. Maps to the top-level `service_tier`

@@ -1,4 +1,5 @@
 mod db;
+mod edit_claims;
 mod legacy_thread;
 mod native_agent_server;
 pub mod outline;

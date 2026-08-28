@@ -61,7 +61,12 @@ impl EditPredictionDelegate for ZedEditPredictionDelegate {
     }
 
     fn show_tab_accept_marker() -> bool {
-        true
+        // Fork change: true upstream. The marker is a floating "Accept" pill at
+        // the end of the line, which is a second thing to read on every
+        // keystroke to say what the ghost text already says. Turning it off
+        // routes single-line predictions down `EditDisplayMode::Inline`, which
+        // draws the ghost text and nothing else. Tab still accepts.
+        false
     }
 
     fn icons(&self, cx: &App) -> EditPredictionIconSet {

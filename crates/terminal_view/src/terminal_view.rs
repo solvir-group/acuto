@@ -1331,12 +1331,16 @@ impl TerminalView {
         self.pause_cursor_blinking(window, cx);
 
         // Accepting a suggestion only intercepts a key while one is showing.
-        // Otherwise the arrow belongs to the shell, and swallowing it would
-        // break cursor movement — the single most annoying way this feature
-        // could fail.
+        // Otherwise tab belongs to the shell -- it is the shell's own
+        // completion key, and swallowing it unconditionally would be the single
+        // most annoying way this feature could fail.
+        //
+        // Tab rather than the right arrow: the arrow is how you move the cursor
+        // inside a line you are editing, and taking it over means the feature
+        // fights ordinary line editing every time a suggestion happens to be up.
         if self.suggestion.is_some() && !event.keystroke.modifiers.modified() {
             match event.keystroke.key.as_str() {
-                "right" | "end" => {
+                "tab" => {
                     if self.accept_suggestion(None, cx) {
                         cx.stop_propagation();
                         return;

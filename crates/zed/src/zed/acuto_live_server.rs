@@ -18,7 +18,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -51,14 +51,39 @@ const WATCH_LATENCY: Duration = Duration::from_millis(150);
 /// somehow receives two copies of the script only runs one loop.
 const RELOAD_SCRIPT: &str = r#"<script id="acuto-live-reload">
 (function () {
-  let since = window.__acutoReloadSince || 0;
+  if (window.__acutoLiveReload) { return; }
+  window.__acutoLiveReload = true;
+
+  let since = 0;
+
+  // Stylesheets are re-fetched in place rather than reloading the document.
+  // A reload throws away scroll position, form state, open dialogs and any
+  // JavaScript state the page had built up -- which for the CSS tweak you are
+  // in the middle of is the entire reason you were looking at the page.
+  function reloadStyles() {
+    const links = document.querySelectorAll('link[rel="stylesheet"][href]');
+    for (const link of links) {
+      const url = new URL(link.href, location.href);
+      if (url.origin !== location.origin) { continue; }
+      url.searchParams.set("__acuto", String(Date.now()));
+      // A fresh element that replaces the old one only after it has loaded,
+      // so the page is never briefly unstyled.
+      const replacement = link.cloneNode();
+      replacement.href = url.href;
+      replacement.addEventListener("load", () => link.remove(), { once: true });
+      replacement.addEventListener("error", () => replacement.remove(), { once: true });
+      link.after(replacement);
+    }
+  }
+
   async function poll() {
     try {
       const response = await fetch("/__acuto_live_reload?since=" + since, { cache: "no-store" });
       const body = await response.json();
-      if (body.generation > since && since !== 0) { location.reload(); return; }
+      if (since !== 0 && body.generation > since) {
+        if (body.styles_only) { reloadStyles(); } else { location.reload(); return; }
+      }
       since = body.generation;
-      window.__acutoReloadSince = since;
     } catch (error) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
@@ -67,6 +92,49 @@ const RELOAD_SCRIPT: &str = r#"<script id="acuto-live-reload">
   poll();
 })();
 </script>"#;
+
+/// What changed since a given generation.
+///
+/// The client needs to know whether it can swap stylesheets or has to reload,
+/// and only the watcher knows which files moved. Kept as a single atomic pair
+/// so a reader never sees a generation without its kind.
+struct ChangeLog {
+    generation: AtomicU64,
+    /// True while every change since the last full reload was a stylesheet.
+    styles_only: AtomicBool,
+}
+
+impl ChangeLog {
+    fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(1),
+            styles_only: AtomicBool::new(false),
+        }
+    }
+
+    /// Records a batch of changed paths.
+    ///
+    /// A batch counts as styles-only when every path in it is a stylesheet.
+    /// One changed `.js` file in the same batch means the page has to reload,
+    /// because swapping stylesheets would leave the old script running.
+    fn record(&self, paths: impl IntoIterator<Item = PathBuf>) {
+        let mut any = false;
+        let mut all_styles = true;
+        for path in paths {
+            any = true;
+            let is_style = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("css"));
+            all_styles &= is_style;
+        }
+        if !any {
+            return;
+        }
+        self.styles_only.store(all_styles, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Clone)]
 enum ServerState {
@@ -138,7 +206,7 @@ impl LiveServerButton {
             return;
         };
 
-        let generation = Arc::new(AtomicU64::new(1));
+        let changes = Arc::new(ChangeLog::new());
         let executor = cx.background_executor().clone();
 
         // Bound on the foreground so the port is known before the button
@@ -173,7 +241,7 @@ impl LiveServerButton {
 
         self._server = Some(cx.background_spawn({
             let root = root.clone();
-            let generation = generation.clone();
+            let changes = changes.clone();
             let executor = executor.clone();
             async move {
                 let Some(listener) = smol::net::TcpListener::try_from(listener).log_err() else {
@@ -185,11 +253,7 @@ impl LiveServerButton {
                         continue;
                     };
                     executor
-                        .spawn(serve_connection(
-                            stream,
-                            root.clone(),
-                            generation.clone(),
-                        ))
+                        .spawn(serve_connection(stream, root.clone(), changes.clone()))
                         .detach();
                 }
             }
@@ -197,11 +261,11 @@ impl LiveServerButton {
 
         self._watcher = Some(cx.background_spawn({
             let root = root.clone();
-            let generation = generation.clone();
+            let changes = changes.clone();
             async move {
                 let (mut events, _watcher) = fs.watch(&root, WATCH_LATENCY).await;
-                while events.next().await.is_some() {
-                    generation.fetch_add(1, Ordering::SeqCst);
+                while let Some(batch) = events.next().await {
+                    changes.record(batch.into_iter().map(|event| event.path));
                 }
             }
         }));
@@ -312,7 +376,7 @@ impl StatusItemView for LiveServerButton {
 async fn serve_connection(
     mut stream: smol::net::TcpStream,
     root: Arc<Path>,
-    generation: Arc<AtomicU64>,
+    changes: Arc<ChangeLog>,
 ) {
     let Some(request_target) = read_request_target(&mut stream).await else {
         return;
@@ -329,7 +393,7 @@ async fn serve_connection(
             .find_map(|pair| pair.strip_prefix("since="))
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
-        await_change(since, &generation).await
+        await_change(since, &changes).await
     } else {
         serve_path(path, &root).await
     };
@@ -374,19 +438,21 @@ async fn read_request_target(stream: &mut smol::net::TcpStream) -> Option<String
 }
 
 /// Holds a reload poll open until something changes, or until it times out.
-async fn await_change(since: u64, generation: &AtomicU64) -> Vec<u8> {
+async fn await_change(since: u64, changes: &ChangeLog) -> Vec<u8> {
     /// How often the poll re-checks. Small enough to feel immediate, large
     /// enough that an idle page costs nothing measurable.
     const TICK: Duration = Duration::from_millis(100);
 
     let deadline = std::time::Instant::now() + RELOAD_POLL_TIMEOUT;
     loop {
-        let current = generation.load(Ordering::SeqCst);
+        let current = changes.generation.load(Ordering::SeqCst);
         if current != since || std::time::Instant::now() >= deadline {
+            let styles_only = changes.styles_only.load(Ordering::SeqCst);
             return http_response(
                 200,
                 "application/json",
-                format!("{{\"generation\":{current}}}").into_bytes(),
+                format!("{{\"generation\":{current},\"styles_only\":{styles_only}}}")
+                    .into_bytes(),
             );
         }
         smol::Timer::after(TICK).await;
@@ -556,6 +622,30 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_batch_is_styles_only_when_every_path_in_it_is() {
+        let changes = ChangeLog::new();
+        let start = changes.generation.load(Ordering::SeqCst);
+
+        changes.record([PathBuf::from("site/main.css")]);
+        assert!(changes.styles_only.load(Ordering::SeqCst));
+        assert_eq!(changes.generation.load(Ordering::SeqCst), start + 1);
+
+        // One script in the batch means the page has to reload: swapping
+        // stylesheets would leave the old script running.
+        changes.record([PathBuf::from("site/a.css"), PathBuf::from("site/app.js")]);
+        assert!(!changes.styles_only.load(Ordering::SeqCst));
+        assert_eq!(changes.generation.load(Ordering::SeqCst), start + 2);
+
+        // An empty batch is not a change, and must not wake every open page.
+        changes.record([]);
+        assert_eq!(changes.generation.load(Ordering::SeqCst), start + 2);
+
+        // Extensions are compared without regard to case.
+        changes.record([PathBuf::from("site/Theme.CSS")]);
+        assert!(changes.styles_only.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn traversal_is_refused_rather_than_clamped() {

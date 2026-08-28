@@ -807,6 +807,10 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
         let channels_panel =
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
+        // Replaces the collaboration panel in practice: that one needs a server
+        // this fork does not have, this one carries notes in the repository.
+        let team_notes_panel =
+            team_notes::TeamNotesPanel::load(workspace_handle.clone(), cx.clone());
         // Diagnostics upstream is a centre-pane item competing with code for the
         // editor area; as a bottom panel it sits beside Terminal and Debug.
         // Ordered before DebugPanel::load, which takes the context by &mut and
@@ -837,6 +841,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(problems_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(team_notes_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );

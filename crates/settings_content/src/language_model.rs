@@ -439,6 +439,21 @@ pub struct OpenAiCompatibleAvailableModel {
     pub reasoning_effort: Option<OpenAiReasoningEffort>,
     #[serde(default)]
     pub capabilities: OpenAiCompatibleModelCapabilities,
+
+    /// Extra top-level fields to merge into every request to this model.
+    ///
+    /// "OpenAI-compatible" servers routinely accept fields OpenAI itself does
+    /// not, and some of them are the difference between a usable model and a
+    /// crippled one: NVIDIA's Nemotron models produce no reasoning at all
+    /// unless the request carries
+    /// `{"chat_template_kwargs": {"enable_thinking": true}}`. There is no way
+    /// to express that through a request type that only names OpenAI's schema.
+    ///
+    /// Merged verbatim, and it does not override fields the request already
+    /// sets -- so this cannot be used to quietly change the model, the message
+    /// list, or the tool definitions. A value that is not a JSON object is
+    /// ignored.
+    pub extra_body: Option<serde_json::Value>,
 }
 
 #[with_fallible_options]

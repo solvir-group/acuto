@@ -152,6 +152,7 @@ impl Mercury {
                 prompt_cache_key: None,
                 reasoning_effort: None,
                 service_tier: None,
+                extra_body: Default::default(),
             };
 
             let buf = serde_json::to_vec(&request_body)?;

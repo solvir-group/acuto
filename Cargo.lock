@@ -18100,6 +18100,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "team_notes"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "editor",
+ "fs",
+ "gpui",
+ "language",
+ "log",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "ui",
+ "util",
+ "uuid",
+ "workspace",
+]
+
+[[package]]
 name = "telemetry"
 version = "0.1.0"
 dependencies = [
@@ -22954,6 +22975,7 @@ dependencies = [
  "tab_switcher",
  "tabular_data_preview",
  "tasks_ui",
+ "team_notes",
  "telemetry",
  "telemetry_events",
  "tempfile",

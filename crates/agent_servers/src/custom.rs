@@ -229,7 +229,18 @@ impl AgentServer for CustomAgentServer {
         if is_registry_agent {
             match agent_id.as_ref() {
                 CLAUDE_AGENT_ID => {
-                    extra_env.insert("ANTHROPIC_API_KEY".into(), "".into());
+                    // Upstream blanks this unconditionally, so Claude Code
+                    // always signs in and bills a subscription rather than
+                    // silently spending API credit. That is the right default
+                    // and the wrong rule: a key set in the environment was set
+                    // on purpose, and blanking it means an editor-launched
+                    // Claude Code cannot use the credentials every other tool
+                    // on the machine already uses.
+                    //
+                    // Set when absent, passed through when present. Unsetting
+                    // the variable restores the upstream behaviour exactly.
+                    let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+                    extra_env.insert("ANTHROPIC_API_KEY".into(), key);
                 }
                 CODEX_ID => {
                     if let Ok(api_key) = std::env::var("CODEX_API_KEY") {

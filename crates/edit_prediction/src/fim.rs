@@ -30,6 +30,7 @@ pub fn request_prediction(
         position,
         events,
         trigger,
+        related_files,
         ..
     }: EditPredictionModelInput,
     prompt_format: EditPredictionPromptFormat,
@@ -47,6 +48,18 @@ pub fn request_prediction(
     let http_client = cx.http_client();
     let cursor_point = position.to_point(&snapshot);
     let request_start = cx.background_executor().now();
+
+    // The language name, so a chat model is not left inferring the syntax from
+    // a filename it may not recognise.
+    let language_name = snapshot
+        .language()
+        .map(|language| language.name().to_string());
+
+    // Excerpts from elsewhere in the project, already retrieved for this
+    // request by the same store the Zeta path uses. Dropping them -- which this
+    // did -- is why completions invented functions that do not exist: the model
+    // was shown a few hundred tokens around the caret and nothing else.
+    let related_context = format_related_files(&related_files);
 
     let Some(settings) = (match provider {
         settings::EditPredictionProvider::Ollama => settings.ollama.clone(),
@@ -80,7 +93,7 @@ pub fn request_prediction(
 
         let inputs = Zeta2PromptInput {
             events,
-            related_files: Some(Vec::new()),
+            related_files: Some(related_files),
             active_buffer_diagnostics: Vec::new(),
             cursor_offset_in_excerpt: cursor_offset - excerpt_offset_range.start,
             cursor_path: full_path.clone(),
@@ -101,6 +114,15 @@ pub fn request_prediction(
         let stop_tokens = get_fim_stop_tokens();
         let display_path = full_path.to_string_lossy().into_owned();
 
+        // A chat model is given the whole cursor excerpt rather than the narrow
+        // editable window the fill-in-the-middle template uses. The editable
+        // window is deliberately small because a FIM model only needs to see
+        // where the hole is; a chat model has to work out what the code around
+        // it means, and 512 tokens is not enough to do that.
+        let excerpt = inputs.cursor_excerpt.as_ref();
+        let caret_in_excerpt = inputs.cursor_offset_in_excerpt.min(excerpt.len());
+        let (excerpt_prefix, excerpt_suffix) = excerpt.split_at(caret_in_excerpt);
+
         let max_tokens = settings.max_output_tokens;
 
         let (response_text, request_id) = open_ai_compatible::send_custom_server_request(
@@ -111,8 +133,10 @@ pub fn request_prediction(
             // the two halves travel alongside it and the transport picks.
             Some(open_ai_compatible::CaretContext {
                 path: &display_path,
-                prefix: &prefix,
-                suffix: &suffix,
+                language: language_name.as_deref(),
+                related: &related_context,
+                prefix: excerpt_prefix,
+                suffix: excerpt_suffix,
             }),
             max_tokens,
             stop_tokens,
@@ -171,6 +195,43 @@ pub fn request_prediction(
             .await,
         ))
     })
+}
+
+/// Renders retrieved excerpts as a block a chat model can read.
+///
+/// Line numbers are included because they are what makes an excerpt locatable:
+/// without them a model cannot tell a definition from a call site, and starts
+/// treating a fragment as if it were the whole file.
+///
+/// Bounded, because these arrive from a retrieval store with no size contract
+/// and a prompt that overflows the context window fails the whole request
+/// rather than degrading.
+fn format_related_files(related_files: &[zeta_prompt::RelatedFile]) -> String {
+    /// Roughly a third of a 16k window, leaving the rest for the file being
+    /// edited and the reply.
+    const MAX_BYTES: usize = 12_000;
+
+    let mut out = String::new();
+    for file in related_files {
+        for excerpt in &file.excerpts {
+            let header = format!(
+                "--- {} lines {}-{} ---\n",
+                file.path.display(),
+                excerpt.row_range.start + 1,
+                excerpt.row_range.end + 1
+            );
+            if out.len() + header.len() + excerpt.text.len() > MAX_BYTES {
+                return out;
+            }
+            out.push_str(&header);
+            out.push_str(&excerpt.text);
+            if !excerpt.text.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn format_fim_prompt(

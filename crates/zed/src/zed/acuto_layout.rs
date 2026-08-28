@@ -113,12 +113,20 @@ impl DockLayout {
     }
 }
 
-/// How the centre is arranged, for presets that arrange it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+/// How the centre is arranged.
+///
+/// Every variant is a complete description, not an adjustment. A preset that
+/// only added panes would compose with whatever was already there: switching
+/// away from the eight-pane agent grid would leave the eight panes behind, and
+/// two switches later the window is a grid of grids. A preset has to be able to
+/// put the window in a known state or it is not a preset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 enum CenterLayout {
-    /// Left alone. What every saved preset uses.
-    Untouched,
-    /// A grid of agent threads, `rows` by `columns`, split from the active pane.
+    /// One pane holding everything that was open. Splits are undone; nothing is
+    /// closed, the items move into the surviving pane.
+    #[default]
+    Single,
+    /// A grid of agent threads, `rows` by `columns`.
     AgentGrid { rows: usize, columns: usize },
 }
 
@@ -145,8 +153,13 @@ impl Layout {
         cx: &mut Context<Workspace>,
     ) -> Vec<Entity<Pane>> {
         self.docks.apply(workspace, window, cx);
+
+        // Collapse first, in both cases. The grid then splits from a known
+        // single pane rather than from whatever the last preset left behind.
+        workspace.join_all_panes(window, cx);
+
         match self.center {
-            CenterLayout::Untouched => Vec::new(),
+            CenterLayout::Single => Vec::new(),
             CenterLayout::AgentGrid { rows, columns } => {
                 split_into_grid(rows, columns, workspace, window, cx)
             }
@@ -167,7 +180,7 @@ fn builtin_layouts() -> Vec<Layout> {
                 right: Some(PanelKind::Agent),
                 bottom: Some(PanelKind::Terminal),
             },
-            center: CenterLayout::Untouched,
+            center: CenterLayout::Single,
         },
         Layout {
             name: "Agents".into(),
@@ -184,7 +197,7 @@ fn builtin_layouts() -> Vec<Layout> {
                 right: Some(PanelKind::Git),
                 bottom: None,
             },
-            center: CenterLayout::Untouched,
+            center: CenterLayout::Single,
         },
         Layout {
             name: "Debug".into(),
@@ -193,17 +206,16 @@ fn builtin_layouts() -> Vec<Layout> {
                 right: None,
                 bottom: Some(PanelKind::Problems),
             },
-            center: CenterLayout::Untouched,
+            center: CenterLayout::Single,
         },
     ]
 }
 
 /// Splits the active pane into a `rows` by `columns` grid, in reading order.
 ///
-/// Splits outward from the active pane rather than clearing the centre first:
-/// the panes already open are the user's work, and a layout switch is not a
-/// reason to close them. The first cell is the pane that was already active, so
-/// whatever was open there gains a neighbour rather than losing its place.
+/// The caller has already collapsed the centre to one pane, so this splits from
+/// a known state. Nothing is closed: whatever was open stays in the first cell
+/// and gains neighbours.
 fn split_into_grid(
     rows: usize,
     columns: usize,
@@ -303,7 +315,7 @@ impl SaveLayoutModal {
         let layout = Layout {
             name,
             docks: DockLayout::capture(workspace.read(cx), cx),
-            center: CenterLayout::Untouched,
+            center: CenterLayout::Single,
         };
 
         let mut layouts = read_saved_layouts();

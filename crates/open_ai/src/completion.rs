@@ -238,6 +238,8 @@ pub fn into_open_ai(
         }),
         reasoning_effort,
         service_tier,
+        // Filled by providers that talk to a compatible-but-extended server.
+        extra_body: Default::default(),
     })
 }
 

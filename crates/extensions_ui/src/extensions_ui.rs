@@ -977,8 +977,9 @@ impl ExtensionsPage {
     /// column count changes, which is at most a handful of times across an
     /// entire resize rather than once per frame.
     fn render_column_measurer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        /// Narrower than this and a card's buttons wrap onto their own line.
-        const MIN_CARD_WIDTH: f32 = 320.;
+        /// Narrower than this and an extension's name truncates before its
+        /// version does, which is the half you need to read.
+        const MIN_CARD_WIDTH: f32 = 400.;
         /// The gap between columns, matching the row's own `gap_2`.
         const COLUMN_GAP: f32 = 8.;
 

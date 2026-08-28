@@ -6,8 +6,11 @@
   // - "system": Use the theme that corresponds to the system's appearance
   // - "light": Use the theme indicated by the "light" field
   // - "dark": Use the theme indicated by the "dark" field
+  // Dark by default rather than following the system. This is an editor for
+  // people who keep one open all day, and "system" means the window changes
+  // appearance underneath them when the OS decides the sun went down.
   "theme": {
-    "mode": "system",
+    "mode": "dark",
     "light": "One Light",
     "dark": "One Dark",
   },
@@ -826,7 +829,8 @@
     // Default width of the project panel.
     "default_width": 240,
     // Where to dock the project panel. Can be 'left' or 'right'.
-    "dock": "right",
+    // Left in this fork, where every other editor puts the file tree.
+    "dock": "left",
     // Spacing between worktree entries in the project panel. Can be 'comfortable' or 'standard'.
     "entry_spacing": "comfortable",
     // Whether to show file icons in the project panel.
@@ -2837,7 +2841,24 @@
   // Configures context servers for use by the agent.
   "context_servers": {},
   // Configures agent servers available in the agent panel.
-  "agent_servers": {},
+  // External agents, spoken to over the Agent Client Protocol. Registered here
+  // rather than left empty so Claude Code, Codex and Gemini appear in the agent
+  // picker on a fresh install: an agent nobody can find is an agent nobody
+  // uses, and each of these is a one-line npx away already.
+  //
+  // "type": "registry" means the command comes from the built-in registry and
+  // is fetched on first use. Remove an entry to hide that agent.
+  "agent_servers": {
+    "claude-acp": {
+      "type": "registry",
+    },
+    "codex-acp": {
+      "type": "registry",
+    },
+    "gemini": {
+      "type": "registry",
+    },
+  },
   "debugger": {
     "stepping_granularity": "line",
     "save_breakpoints": true,
