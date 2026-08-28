@@ -979,7 +979,7 @@ pub struct CreateThreadOptions {
     /// Agent to use. Defaults to the panel's selected agent.
     pub agent: Option<Agent>,
     /// Model override, as `provider/model-id`. Only applied when the thread
-    /// uses the native Zed agent.
+    /// uses the native Acuto agent.
     pub model: Option<String>,
     /// Working directories to attach to the new thread (e.g., the path of a
     /// freshly-created sibling worktree). When `None`, the thread inherits
@@ -4469,19 +4469,6 @@ impl AgentPanel {
                         })
                     },
                 ))
-                .child(
-                    IconButton::new("agent-thread-tab-new", IconName::Plus)
-                        .icon_size(IconSize::Small)
-                        .tooltip(Tooltip::text("New Thread"))
-                        .on_click(cx.listener(|panel, _, window, cx| {
-                            panel.activate_new_thread(
-                                true,
-                                AgentThreadSource::AgentPanel,
-                                window,
-                                cx,
-                            );
-                        })),
-                ),
         )
     }
 
@@ -6512,10 +6499,6 @@ impl AgentPanel {
         let thread_tabs = self
             .render_thread_tabs(cx)
             .map(|tabs| tabs.into_any_element());
-        // The tab strip carries its own `+` at the end, where a tab strip's new
-        // button belongs, so the one on the far right would be a second button
-        // for the same action in the same bar.
-        let has_thread_tabs = thread_tabs.is_some();
 
         let empty_thread_title = matches!(mode, ToolbarMode::EmptyThread).then(|| {
             Label::new(format!("New {} Thread", selected_agent_label))
@@ -6583,16 +6566,18 @@ impl AgentPanel {
                         .when(can_create_entries, |this| {
                             // `+` starts a thread outright rather than opening a
                             // menu; the full New Thread... menu is on the chevron.
-                            this.when(!has_thread_tabs, |this| {
-                                this.child(
-                                    IconButton::new("new_thread_btn", IconName::Plus)
-                                        .icon_size(IconSize::Small)
-                                        .tooltip(Tooltip::text("New Thread"))
-                                        .on_click(|_, window, cx| {
-                                            window.dispatch_action(NewThread.boxed_clone(), cx);
-                                        }),
-                                )
-                            })
+                            // Far right, with the other toolbar actions, rather
+                            // than at the end of the tab strip: a button that
+                            // moves as tabs are added is a button you have to
+                            // look for.
+                            this.child(
+                                IconButton::new("new_thread_btn", IconName::Plus)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("New Thread"))
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(NewThread.boxed_clone(), cx);
+                                    }),
+                            )
                             .child(new_thread_menu)
                         })
                         .child(full_screen_button)

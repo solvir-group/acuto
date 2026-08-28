@@ -359,7 +359,7 @@ impl ExtensionCard {
                             move |_, cx| {
                                 Tooltip::simple(
                                     format!(
-                                        "v{version} is not compatible with this version of Zed."
+                                        "v{version} is not compatible with this version of Acuto."
                                     ),
                                     cx,
                                 )
@@ -473,7 +473,7 @@ impl Component for ExtensionCard {
                     name: name.to_owned(),
                     version: version.into(),
                     description: Some(description.to_owned()),
-                    authors: vec!["Zed Industries".to_owned()],
+                    authors: vec!["Acuto Industries".to_owned()],
                     repository: "https://github.com/zed-industries/zed".to_owned(),
                     schema_version: Some(1),
                     wasm_api_version: None,

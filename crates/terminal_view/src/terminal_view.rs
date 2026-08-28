@@ -1447,27 +1447,6 @@ impl TerminalView {
             cx.notify();
         }
 
-        // TEMPORARY: written to disk because the app writes no log here, and
-        // six bugs in this feature were each invisible to a passing test suite.
-        if std::env::var_os("ACUTO_COMPLETION_DEBUG").is_some() {
-            let line = format!(
-                "phase={:?} allowed={} typed={:?} history={} suggestion={:?}\n",
-                self.terminal.read(cx).shell_state().phase(),
-                self.terminal.read(cx).shell_state().completions_allowed(),
-                self.suggestion.as_ref().map(|(typed, _)| typed.clone()),
-                self.history.entries().len(),
-                self.suggestion.as_ref().map(|(_, s)| s.command.clone()),
-            );
-            let path = paths::logs_dir().join("completion-debug.log");
-            use std::io::Write as _;
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let _ = file.write_all(line.as_bytes());
-            }
-        }
     }
 
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {

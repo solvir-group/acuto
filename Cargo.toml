@@ -995,7 +995,12 @@ webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev 
 
 [profile.dev]
 split-debuginfo = "unpacked"
-incremental = true
+# Fork change: true upstream. The incremental cache reaches ~30 GB within two
+# or three builds, and this machine has roughly that much headroom in total —
+# it has exhausted the disk nine times, twice corrupting a build or test run
+# mid-write. Faster edit-rebuild cycles are not worth a tree you cannot trust.
+# Revert if you move `target/` somewhere with room to spare.
+incremental = false
 codegen-units = 16
 # Fork change: "limited" upstream. Set durably here rather than through
 # CARGO_PROFILE_DEV_DEBUG, because an env var only covers the commands that

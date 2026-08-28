@@ -1867,7 +1867,7 @@ impl ThreadView {
                 ThreadError::PaymentRequired => (
                     "payment_required",
                     None,
-                    "You reached your free usage limit. Upgrade to Zed Pro for more prompts."
+                    "The model provider reported that payment is required. Check your provider credentials and quota."
                         .into(),
                 ),
                 ThreadError::Refusal => {

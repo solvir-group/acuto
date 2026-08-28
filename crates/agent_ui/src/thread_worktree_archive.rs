@@ -275,7 +275,7 @@ async fn verify_created_by_zed(root: &RootPlan, cx: &mut AsyncApp) -> Result<()>
         .map_err(|_| anyhow!("worktree creation time check was canceled"))?
         .with_context(|| {
             format!(
-                "refusing to delete worktree at {}: failed to verify that Zed created it",
+                "refusing to delete worktree at {}: failed to verify that Acuto created it",
                 root.root_path.display()
             )
         })?;

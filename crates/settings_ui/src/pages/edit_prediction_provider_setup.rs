@@ -320,7 +320,7 @@ fn render_api_key_provider(
                         .when_some(env_var_name, |this, env_var_name| {
                             this.child({
                                 let label = format!(
-                                    "Or set the {} env var and restart Zed.",
+                                    "Or set the {} env var and restart Acuto.",
                                     env_var_name.as_ref()
                                 );
                                 Label::new(label).size(LabelSize::Small).color(Color::Muted)
@@ -925,7 +925,7 @@ fn render_zed_provider(
         .pt_8()
         .gap_1p5()
         .child(
-            SettingsSectionHeader::new("Zed Predictions")
+            SettingsSectionHeader::new("Acuto Predictions")
                 .icon(IconName::ZedPredict)
                 .no_padding(true),
         )
