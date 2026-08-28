@@ -24,7 +24,7 @@ use std::{
 };
 
 use futures::{AsyncReadExt as _, AsyncWriteExt as _, StreamExt as _};
-use gpui::Task;
+use gpui::{Anchor, Task};
 use ui::prelude::*;
 use ui::{ContextMenu, Tooltip, right_click_menu};
 use util::ResultExt as _;
@@ -247,6 +247,11 @@ impl Render for LiveServerButton {
         let running = matches!(self.state, ServerState::Running { .. });
 
         right_click_menu("live-server-menu")
+            // Opens upward. The default drops the menu below its trigger,
+            // which for anything in the status bar is off the bottom of the
+            // window: the menu opens and is never seen.
+            .anchor(Anchor::BottomRight)
+            .attach(Anchor::TopRight)
             .trigger(move |_, _, _| {
                 Button::new("live-server", label.clone())
                     .label_size(LabelSize::Small)

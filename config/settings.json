@@ -200,10 +200,13 @@
       "model": "nvidia/nemotron-3-super-120b-a12b",
       "prompt_format": "qwen",
       "max_output_tokens": 96,
-      // Fire as soon as typing stops. The default already is 0; stated here
-      // because it is the setting most worth reaching for if completions feel
-      // like they interrupt rather than help.
-      "prediction_debounce": 0
+      // Milliseconds of quiet before a request goes out. The default is 0,
+      // which suits a fill-in-the-middle model answering in tens of
+      // milliseconds; against a chat model that takes about a second, firing
+      // on every pause spends most requests on text the caret has already
+      // left. Raise it if completions feel like they interrupt rather than
+      // help; lower it if they feel late.
+      "prediction_debounce": 300
     }
   },
 

@@ -703,7 +703,12 @@ impl ExtensionsPage {
                     .items_start()
                     .gap_2()
                     .children(cards.into_iter().map(|card| {
-                        div().flex_1().min_w_0().children(card).into_any_element()
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .children(card)
+                            .into_any_element()
                     }))
                     .into_any_element(),
             );

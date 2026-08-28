@@ -7,12 +7,11 @@
 use std::time::Duration;
 
 use editor::Editor;
-use gpui::{Entity, EventEmitter, Task, WeakEntity};
+use gpui::{Anchor, Entity, EventEmitter, Focusable as _, Task, WeakEntity};
 // ui::prelude carries gpui's prelude plus the builder traits, h_flex/v_flex,
 // Button, Color, LabelSize and App. These are not in it.
 use ui::prelude::*;
 use ui::{ContextMenu, IconPosition, Tooltip, right_click_menu};
-use util::ResultExt as _;
 // status_bar is a private module; these are re-exported from the crate root.
 use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
@@ -160,6 +159,11 @@ impl Render for FocusTimer {
         let entity_for_menu = entity.clone();
 
         right_click_menu("focus-timer-menu")
+            // Opens upward. The default drops the menu below its trigger,
+            // which for anything in the status bar is off the bottom of the
+            // window: the menu opens and is never seen.
+            .anchor(Anchor::BottomRight)
+            .attach(Anchor::TopRight)
             .trigger(move |_, _, _| {
                 Button::new("focus-timer", label.clone())
                     .label_size(LabelSize::Small)
@@ -298,12 +302,18 @@ impl AutoStyleButton {
             });
         });
 
-        // Dispatched rather than called: formatting is async, routes through
-        // the project's language servers, and reports its own errors. Driving
-        // that from a status bar button would duplicate all of it.
-        if let Some(action) = cx.build_action("editor::Format", None).log_err() {
-            window.dispatch_action(action, cx);
-        }
+        // Dispatched rather than called: `Editor::format` is private, it is
+        // async, it routes through the project's language servers and it
+        // reports its own errors. Driving that from a status bar button would
+        // duplicate all of it.
+        //
+        // Against the editor's focus handle rather than the window's focus,
+        // because `Format` is registered on the editor element. A click on a
+        // status bar button is not supposed to move focus, but "not supposed
+        // to" is not a guarantee, and dispatching into the window would then
+        // land nowhere.
+        let focus_handle = editor.focus_handle(cx);
+        focus_handle.dispatch_action(&editor::actions::Format, window, cx);
     }
 }
 

@@ -310,6 +310,13 @@ impl AgentTool for UpdateIdeSettingTool {
 
             // Edited as text rather than reserialized, so the comments and
             // hand-formatting in the settings file survive the write.
+            //
+            // `update_value_in_json_text` applies each edit to `updated` as it
+            // computes it, and *also* records it in `edits`. This used to apply
+            // `edits` a second time afterwards, at offsets measured against the
+            // original text -- which does not fail, it silently writes garbage
+            // into the middle of an unrelated line. The recorded edits are only
+            // useful to a caller that kept the string unmodified.
             let mut updated = text.clone();
             let mut edits = Vec::new();
             let mut key_path: Vec<&str> =
@@ -323,13 +330,17 @@ impl AgentTool for UpdateIdeSettingTool {
                 &mut edits,
             );
 
-            for (range, replacement) in edits.into_iter().rev() {
-                if range.end > updated.len() || range.start > range.end {
-                    return Err(IdeControlOutput::Error {
-                        error: "Computed an out-of-range edit; nothing was written.".into(),
-                    });
-                }
-                updated.replace_range(range, &replacement);
+            // Every setting the editor reads comes through this one file, so a
+            // bad write does not break one setting -- it drops the whole app
+            // back to defaults, and the user has to find and repair the file by
+            // hand. Cheaper to refuse the edit.
+            if let Err(error) = settings_json::parse_json_with_comments::<Value>(&updated) {
+                return Err(IdeControlOutput::Error {
+                    error: format!(
+                        "Refused to write: the result would not parse ({error}). \
+                         The settings file is unchanged."
+                    ),
+                });
             }
 
             std::fs::write(&settings_path, &updated).map_err(|error| {

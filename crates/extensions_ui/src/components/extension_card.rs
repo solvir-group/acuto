@@ -635,9 +635,19 @@ impl RenderOnce for ExtensionCard {
                 .rounded_md()
                 .child(
                     h_flex()
+                        .w_full()
+                        .min_w_0()
                         .justify_between()
                         .child(
                             h_flex()
+                                // `flex_shrink_1` alone leaves the row at its
+                                // content width, because a flex item will not
+                                // shrink past `min-content` without this. The
+                                // name and its chips then run out of the card
+                                // and over whatever is beside it, which only
+                                // shows up once cards sit side by side.
+                                .min_w_0()
+                                .overflow_hidden()
                                 .flex_shrink_1()
                                 .gap_2()
                                 .child(Headline::new(name).size(HeadlineSize::Small))
@@ -662,7 +672,12 @@ impl RenderOnce for ExtensionCard {
                                     )
                                 }),
                         )
-                        .child(h_flex().gap_1().children(actions.into_iter().flatten())),
+                        .child(
+                            h_flex()
+                                .flex_none()
+                                .gap_1()
+                                .children(actions.into_iter().flatten()),
+                        ),
                 )
                 .child(
                     h_flex()

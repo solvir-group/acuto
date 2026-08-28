@@ -3310,9 +3310,11 @@ fn native_available_skills(
 
 fn placeholder_text(agent_name: &str, has_commands: bool) -> String {
     if agent_name == agent::ZED_AGENT_ID.as_ref() {
+        // The id is a persisted identity, so it keeps its upstream spelling and
+        // only what the user reads changes.
         format!(
             "Message the {}, @ to include context, / for commands",
-            agent_name
+            crate::Agent::NativeAgent.label()
         )
     } else if has_commands {
         format!(

@@ -5701,18 +5701,17 @@ impl ThreadView {
     fn render_follow_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let following = self.is_following(cx);
 
-        let tooltip_label = if following {
-            if self.agent_id.as_ref() == agent::ZED_AGENT_ID.as_ref() {
-                format!("Stop Following the {}", self.agent_id)
-            } else {
-                format!("Stop Following {}", self.agent_id)
-            }
+        let is_native = self.agent_id.as_ref() == agent::ZED_AGENT_ID.as_ref();
+        // As above: the id identifies the agent, the label names it.
+        let name = if is_native {
+            format!("the {}", crate::Agent::NativeAgent.label())
         } else {
-            if self.agent_id.as_ref() == agent::ZED_AGENT_ID.as_ref() {
-                format!("Follow the {}", self.agent_id)
-            } else {
-                format!("Follow {}", self.agent_id)
-            }
+            self.agent_id.to_string()
+        };
+        let tooltip_label = if following {
+            format!("Stop Following {name}")
+        } else {
+            format!("Follow {name}")
         };
 
         IconButton::new("follow-agent", IconName::Crosshair)

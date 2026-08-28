@@ -24,7 +24,7 @@ use ui::prelude::*;
 use ui::{ContextMenu, PopoverMenu, Tooltip};
 use util::ResultExt as _;
 use workspace::{
-    HideStatusItem, ModalView, SplitDirection, StatusItemView, Workspace, item::ItemHandle,
+    HideStatusItem, ModalView, Pane, SplitDirection, StatusItemView, Workspace, item::ItemHandle,
 };
 
 /// Where saved presets live.
@@ -130,10 +130,26 @@ struct Layout {
 }
 
 impl Layout {
-    fn apply(&self, workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    /// Applies everything that needs the workspace itself, and hands back the
+    /// panes the caller still has to fill.
+    ///
+    /// Filling them cannot happen here. Opening a thread goes through the agent
+    /// panel, which reaches back into the workspace to place the item -- and
+    /// the workspace is leased for the whole of this call, so that second
+    /// update would panic. Splitting is the part that genuinely needs `&mut
+    /// Workspace`; filling only needs the panes.
+    fn apply(
+        &self,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Vec<Entity<Pane>> {
         self.docks.apply(workspace, window, cx);
-        if let CenterLayout::AgentGrid { rows, columns } = self.center {
-            build_agent_grid(rows, columns, workspace, window, cx);
+        match self.center {
+            CenterLayout::Untouched => Vec::new(),
+            CenterLayout::AgentGrid { rows, columns } => {
+                split_into_grid(rows, columns, workspace, window, cx)
+            }
         }
     }
 }
@@ -182,34 +198,27 @@ fn builtin_layouts() -> Vec<Layout> {
     ]
 }
 
-/// Splits the active pane into a grid and puts a fresh agent thread in each cell.
+/// Splits the active pane into a `rows` by `columns` grid, in reading order.
 ///
 /// Splits outward from the active pane rather than clearing the centre first:
 /// the panes already open are the user's work, and a layout switch is not a
 /// reason to close them. The first cell is the pane that was already active, so
-/// whatever was open there gains a thread beside it rather than losing it.
-fn build_agent_grid(
+/// whatever was open there gains a neighbour rather than losing its place.
+fn split_into_grid(
     rows: usize,
     columns: usize,
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) {
-    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
-        return;
-    };
-
+) -> Vec<Entity<Pane>> {
     let first = workspace.active_pane().clone();
 
-    // Rows first: splitting down from the top-left gives one pane per row,
-    // and splitting each of those to the right fills that row. Doing it the
-    // other way round would nest the rows inside the first column.
+    // Rows first: splitting down from the top-left gives one pane per row, and
+    // splitting each of those to the right fills that row. The other order
+    // would nest every row inside the first column.
     let mut row_panes = vec![first.clone()];
     for _ in 1..rows {
-        let previous = row_panes
-            .last()
-            .cloned()
-            .unwrap_or_else(|| first.clone());
+        let previous = row_panes.last().cloned().unwrap_or_else(|| first.clone());
         row_panes.push(workspace.split_pane(previous, SplitDirection::Down, window, cx));
     }
 
@@ -222,12 +231,7 @@ fn build_agent_grid(
             cells.push(current.clone());
         }
     }
-
-    for cell in cells {
-        panel.update(cx, |panel, cx| {
-            panel.open_new_thread_in_pane(cell, window, cx);
-        });
-    }
+    cells
 }
 
 fn read_saved_layouts() -> Vec<Layout> {
@@ -415,9 +419,23 @@ impl LayoutPresetSwitcher {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        workspace.update(cx, |workspace, cx| {
-            layout.apply(workspace, window, cx);
-        });
+
+        let cells = workspace.update(cx, |workspace, cx| layout.apply(workspace, window, cx));
+
+        // Outside the update above, deliberately: the panel places each thread
+        // by updating the workspace, which cannot happen while the workspace is
+        // already leased.
+        if !cells.is_empty() {
+            let panel = workspace.read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx));
+            if let Some(panel) = panel {
+                for cell in cells {
+                    panel.update(cx, |panel, cx| {
+                        panel.open_new_thread_in_pane(cell, window, cx);
+                    });
+                }
+            }
+        }
+
         // Any explicit layout choice ends focus mode: the docks it opened are
         // the opposite of what focus mode is for, and keeping the flag set
         // would make the next focus click restore a layout you already left.
@@ -476,6 +494,11 @@ impl Render for LayoutPresetSwitcher {
 
         let menu_entity = entity.clone();
         let layout_menu = PopoverMenu::new("layout-preset-menu")
+            // Opens upward. The default anchors the menu below its trigger,
+            // which for anything in the status bar is off the bottom of the
+            // window -- the menu opens and is never seen.
+            .anchor(gpui::Anchor::BottomRight)
+            .attach(gpui::Anchor::TopRight)
             .trigger(
                 Button::new("preset-layouts", "Layout")
                     .label_size(LabelSize::Small)

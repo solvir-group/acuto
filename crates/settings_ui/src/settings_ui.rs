@@ -872,34 +872,36 @@ fn open_settings_editor_with(
     // Fork change: settings live in a tab when there is a workspace to put one
     // in. The window path below is kept for the case where there is not -- the
     // action can be dispatched with no workspace open at all.
-    if let Some(handle) = workspace_handle {
-        let mut callback = Some(callback);
-        let opened = handle
+    //
+    // The handle is recovered from the active window when the caller did not
+    // supply one. `OpenSettings` has two handlers -- a global one and a
+    // workspace one -- and the global one fires first with no workspace to
+    // offer. Deciding here rather than at each call site means both handlers
+    // reach the same tab instead of one opening a tab and the other a window.
+    // The second handler then finds the tab the first opened and activates it.
+    let workspace_handle = workspace_handle.or_else(|| {
+        cx.active_window()
+            .and_then(|window| window.downcast::<MultiWorkspace>())
+    });
+
+    let Some(handle) = workspace_handle else {
+        return open_settings_window_with(None, cx, callback);
+    };
+
+    // Deferred for the same reason the window path below is deferred: the
+    // action that got us here is being dispatched inside this window's own
+    // update, and a window cannot be updated from inside itself. Without this
+    // the update fails and settings silently open in a window instead.
+    cx.defer(move |cx| {
+        handle
             .update(cx, |multi_workspace, window, cx| {
                 let workspace = multi_workspace.workspace().clone();
-                let Some(callback) = callback.take() else {
-                    return false;
-                };
                 workspace.update(cx, |workspace, cx| {
                     open_settings_item(workspace, window, cx, callback);
                 });
-                true
             })
-            .unwrap_or(false);
-
-        if opened {
-            return;
-        }
-
-        // `handle.update` failed, or the window had no workspace: fall through
-        // to a window, but only if the callback was never handed over.
-        if let Some(callback) = callback {
-            return open_settings_window_with(None, cx, callback);
-        }
-        return;
-    }
-
-    open_settings_window_with(workspace_handle, cx, callback);
+            .log_err();
+    });
 }
 
 fn open_settings_window_with(
