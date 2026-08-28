@@ -394,6 +394,13 @@ pub struct ExtensionsPage {
     _subscriptions: [gpui::Subscription; 2],
     extension_fetch_task: Option<Task<()>>,
     upsells: BTreeSet<Feature>,
+    /// How many cards fit across the list, measured from the last frame.
+    ///
+    /// The grid is virtualised, and a uniform list asks for rows rather than
+    /// for a width, so the column count has to be known before the rows are
+    /// built. It is measured rather than assumed because this page is a normal
+    /// editor tab: its width is whatever the pane is.
+    grid_columns: usize,
 }
 
 impl ExtensionsPage {
@@ -458,6 +465,7 @@ impl ExtensionsPage {
                 _subscriptions: subscriptions,
                 query_editor,
                 upsells: BTreeSet::default(),
+                grid_columns: 1,
             };
             this.fetch_extensions(
                 this.search_query(cx),
@@ -659,40 +667,86 @@ impl ExtensionsPage {
         .detach_and_log_err(cx);
     }
 
-    fn render_extensions(
+    /// One row of the card grid, `grid_columns` wide.
+    ///
+    /// Short rows are padded with empty cells rather than left to stretch, so a
+    /// final row of one card is the width of a card and not the width of the
+    /// page.
+    fn render_extension_rows(
         &mut self,
-        range: Range<usize>,
+        rows: Range<usize>,
         _: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Vec<ExtensionCard> {
+    ) -> Vec<AnyElement> {
+        let columns = self.grid_columns.max(1);
+        let total = self.filtered_extension_count();
+
+        // Written as loops rather than iterator chains because each card needs
+        // `&mut self`, and nesting two closures that each want it does not
+        // borrow-check.
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let first = row * columns;
+            let mut cards = Vec::with_capacity(columns);
+            for column in 0..columns {
+                let index = first + column;
+                if index < total {
+                    cards.push(Some(self.render_extension_at(index, cx)));
+                } else {
+                    cards.push(None);
+                }
+            }
+
+            result.push(
+                h_flex()
+                    .w_full()
+                    .items_start()
+                    .gap_2()
+                    .children(cards.into_iter().map(|card| {
+                        div().flex_1().min_w_0().children(card).into_any_element()
+                    }))
+                    .into_any_element(),
+            );
+        }
+        result
+    }
+
+    /// How many cards the filters currently admit.
+    fn filtered_extension_count(&self) -> usize {
+        let dev = if self.filter.include_dev_extensions() {
+            self.filtered_dev_extension_indices.len()
+        } else {
+            0
+        };
+        dev + self.filtered_remote_extension_indices.len()
+    }
+
+    fn render_extension_at(&mut self, ix: usize, cx: &mut Context<Self>) -> ExtensionCard {
         let dev_extension_entries_len = if self.filter.include_dev_extensions() {
             self.filtered_dev_extension_indices.len()
         } else {
             0
         };
-        range
-            .map(|ix| {
-                if ix < dev_extension_entries_len {
-                    let dev_ix = self.filtered_dev_extension_indices[ix];
-                    let extension = &self.dev_extension_entries[dev_ix];
-                    let repository_icon = extension
-                        .repository
-                        .as_deref()
-                        .map(|url| self.get_repository_icon(url));
-                    let card = ExtensionCard::for_dev(extension.clone(), cx);
-                    if let Some(icon) = repository_icon {
-                        card.repository_icon(icon)
-                    } else {
-                        card
-                    }
-                } else {
-                    let extension_ix =
-                        self.filtered_remote_extension_indices[ix - dev_extension_entries_len];
-                    let extension = &self.remote_extension_entries[extension_ix];
-                    self.render_remote_extension(extension, cx)
-                }
-            })
-            .collect()
+
+        if ix < dev_extension_entries_len {
+            let dev_ix = self.filtered_dev_extension_indices[ix];
+            let extension = &self.dev_extension_entries[dev_ix];
+            let repository_icon = extension
+                .repository
+                .as_deref()
+                .map(|url| self.get_repository_icon(url));
+            let card = ExtensionCard::for_dev(extension.clone(), cx);
+            if let Some(icon) = repository_icon {
+                card.repository_icon(icon)
+            } else {
+                card
+            }
+        } else {
+            let extension_ix =
+                self.filtered_remote_extension_indices[ix - dev_extension_entries_len];
+            let extension = &self.remote_extension_entries[extension_ix];
+            self.render_remote_extension(extension, cx)
+        }
     }
 
     fn render_remote_extension(
@@ -909,6 +963,41 @@ impl ExtensionsPage {
         } else {
             Some(search)
         }
+    }
+
+    /// A zero-height probe that reports how wide the list is.
+    ///
+    /// Laid out in the same padded column as the cards, so it measures the space
+    /// the cards actually get rather than the window. It notifies only when the
+    /// column count changes, which is at most a handful of times across an
+    /// entire resize rather than once per frame.
+    fn render_column_measurer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        /// Narrower than this and a card's buttons wrap onto their own line.
+        const MIN_CARD_WIDTH: f32 = 320.;
+        /// The gap between columns, matching the row's own `gap_2`.
+        const COLUMN_GAP: f32 = 8.;
+
+        let this = cx.weak_entity();
+        div().w_full().h_0().px_4().child(
+            gpui::canvas(
+                move |bounds, _window, cx| {
+                    let available = f32::from(bounds.size.width);
+                    let columns = ((available + COLUMN_GAP) / (MIN_CARD_WIDTH + COLUMN_GAP))
+                        .floor()
+                        .max(1.0) as usize;
+
+                    this.update(cx, |this, cx| {
+                        if this.grid_columns != columns {
+                            this.grid_columns = columns;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                },
+                |_, _, _, _| {},
+            )
+            .w_full(),
+        )
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1510,21 +1599,24 @@ impl Render for ExtensionsPage {
                     ),
             )
             .child(self.render_feature_upsells(cx))
+            .child(self.render_column_measurer(cx))
             .child(v_flex().px_4().size_full().overflow_y_hidden().map(|this| {
-                let mut count = self.filtered_remote_extension_indices.len();
-                if self.filter.include_dev_extensions() {
-                    count += self.filtered_dev_extension_indices.len();
-                }
+                let count = self.filtered_extension_count();
 
                 if count == 0 {
                     this.child(self.render_empty_state(cx)).into_any_element()
                 } else {
+                    let columns = self.grid_columns.max(1);
                     let scroll_handle = &self.list;
                     this.child(
-                        uniform_list("entries", count, cx.processor(Self::render_extensions))
-                            .flex_grow_1()
-                            .pb_4()
-                            .track_scroll(scroll_handle),
+                        uniform_list(
+                            "entries",
+                            count.div_ceil(columns),
+                            cx.processor(Self::render_extension_rows),
+                        )
+                        .flex_grow_1()
+                        .pb_4()
+                        .track_scroll(scroll_handle),
                     )
                     .vertical_scrollbar_for(scroll_handle, window, cx)
                     .into_any_element()

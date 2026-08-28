@@ -1683,6 +1683,26 @@ const FIND_HYPERLINK_THROTTLE: Duration = Duration::from_millis(100);
 /// clipboard. Mirrors the drag threshold used by gpui's `div` element.
 const SELECTION_DRAG_THRESHOLD: f64 = 2.0;
 
+/// How a shell executable is written when it names a terminal tab.
+///
+/// The executable name is lowercase and carries an extension on Windows, and
+/// neither is how anyone writes the name of their shell. Anything unrecognised
+/// passes through with only its extension removed, so a shell this does not know
+/// about still gets a sensible tab rather than a blank one.
+fn shell_display_name(program: &str) -> String {
+    let stem = program.strip_suffix(".exe").unwrap_or(program);
+    match stem.to_ascii_lowercase().as_str() {
+        "powershell" | "pwsh" => "PowerShell".to_string(),
+        "cmd" => "Command Prompt".to_string(),
+        "wsl" => "WSL".to_string(),
+        "bash" => "Bash".to_string(),
+        "zsh" => "Zsh".to_string(),
+        "fish" => "Fish".to_string(),
+        "nu" => "Nushell".to_string(),
+        _ => stem.to_string(),
+    }
+}
+
 impl Terminal {
     fn process_pty_event(&mut self, event: PtyEvent, cx: &mut Context<Self>) {
         match event {
@@ -3198,32 +3218,20 @@ impl Terminal {
                         .read()
                         .as_ref()
                         .map(|fpi| {
-                            let process_file = fpi
-                                .cwd
-                                .file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-
-                            // Just the process, without its arguments. Shells are
-                            // launched with flags and an inline profile command,
-                            // and appending argv made every tab read
-                            // "powershell.exe -NoLogo -NoExit -Command ..." which
-                            // then truncated to something unreadable. The trailing
-                            // .exe carries no information either.
-                            let process_name = fpi
-                                .name
-                                .strip_suffix(".exe")
-                                .unwrap_or(&fpi.name)
-                                .to_string();
-                            let (process_file, process_name) = if truncate {
-                                (
-                                    truncate_and_trailoff(&process_file, MAX_CHARS),
-                                    truncate_and_trailoff(&process_name, MAX_CHARS),
-                                )
+                            // The shell's name and nothing else. The working
+                            // directory used to lead the title, but it is already
+                            // shown in the breadcrumb and in the prompt itself, so
+                            // it only pushed the one word that identifies the tab
+                            // towards the truncation point. Arguments are dropped
+                            // for the same reason: shells here are launched with
+                            // flags and an inline profile command, which made every
+                            // tab read "powershell.exe -NoLogo -NoExit -Command ...".
+                            let process_name = shell_display_name(&fpi.name);
+                            if truncate {
+                                truncate_and_trailoff(&process_name, MAX_CHARS)
                             } else {
-                                (process_file, process_name)
-                            };
-                            format!("{process_file} — {process_name}")
+                                process_name
+                            }
                         })
                         .unwrap_or_else(|| "Terminal".to_string()),
                     TerminalType::DisplayOnly => "Terminal".to_string(),

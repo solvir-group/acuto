@@ -4161,6 +4161,42 @@ impl AgentPanel {
             .log_err();
     }
 
+    /// Creates a thread and places it directly in `pane`.
+    ///
+    /// For layouts that want several threads side by side. It builds the thread
+    /// the same way the `+` button does and then detaches it, rather than
+    /// constructing a `ConversationView` here: a second construction path would
+    /// drift from whatever the panel does the moment either changes.
+    ///
+    /// Neither the pane nor the thread is focused, so a caller filling eight
+    /// panes does not have focus jump through all eight of them.
+    pub fn open_new_thread_in_pane(
+        &mut self,
+        pane: Entity<workspace::Pane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.has_open_project(cx) {
+            return;
+        }
+
+        self.activate_new_thread(false, AgentThreadSource::AgentPanel, window, cx);
+
+        let Some(id) = self.active_thread_id(cx) else {
+            return;
+        };
+        let Some(view) = self.detach_thread_for_pane(id, window, cx) else {
+            return;
+        };
+
+        let item = cx.new(|_| AgentThreadItem::new(view));
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.add_item(pane, Box::new(item), None, false, false, window, cx);
+            })
+            .log_err();
+    }
+
     /// Removes a thread from the panel and hands its view to the caller.
     ///
     /// Used when a thread is dragged into a pane: the same `ConversationView`

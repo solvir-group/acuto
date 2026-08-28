@@ -9,8 +9,9 @@ use editor::{Editor, EditorEvent};
 use futures::{StreamExt, channel::mpsc};
 use fuzzy::StringMatchCandidate;
 use gpui::{
-    Action, App, AsyncApp, ClipboardItem, DEFAULT_ADDITIONAL_WINDOW_SIZE, Div, Entity, FocusHandle,
-    Focusable, Global, KeyContext, ListState, ReadGlobal as _, Role, ScrollHandle, Stateful,
+    Action, App, AsyncApp, ClipboardItem, DEFAULT_ADDITIONAL_WINDOW_SIZE, Div, Entity, EventEmitter,
+    FocusHandle, Focusable, Global, KeyContext, ListState, ReadGlobal as _, Role, ScrollHandle,
+    Stateful,
     Subscription, Task, TitlebarOptions, UniformListScrollHandle, WeakEntity, Window, WindowBounds,
     WindowHandle, WindowOptions, actions, div, list, point, prelude::*, px, uniform_list,
 };
@@ -821,6 +822,46 @@ pub fn open_skill_creator(
     });
 }
 
+/// Opens settings as a tab in `workspace`, or focuses the tab already there.
+///
+/// One instance per workspace: settings are global, so a second tab would show
+/// the same values twice and let the two disagree about which page is open.
+fn open_settings_item(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+    callback: impl FnOnce(&mut SettingsWindow, &mut Window, &mut Context<SettingsWindow>) + 'static,
+) {
+    telemetry::event!("Settings Viewed");
+
+    let existing = workspace
+        .items_of_type::<SettingsWindow>(cx)
+        .next()
+        .filter(|item| item.read(cx).embedded);
+
+    let settings_view = match existing {
+        Some(existing) => {
+            workspace.activate_item(&existing, true, true, window, cx);
+            existing
+        }
+        None => {
+            let settings_view = cx.new(|cx| SettingsWindow::new_embedded(window, cx));
+            workspace.add_item_to_active_pane(
+                Box::new(settings_view.clone()),
+                None,
+                true,
+                window,
+                cx,
+            );
+            settings_view
+        }
+    };
+
+    settings_view.update(cx, |settings_view, cx| {
+        callback(settings_view, window, cx);
+    });
+}
+
 fn open_settings_editor_with(
     workspace_handle: Option<WindowHandle<MultiWorkspace>>,
     cx: &mut App,
@@ -828,6 +869,44 @@ fn open_settings_editor_with(
 ) {
     telemetry::event!("Settings Viewed");
 
+    // Fork change: settings live in a tab when there is a workspace to put one
+    // in. The window path below is kept for the case where there is not -- the
+    // action can be dispatched with no workspace open at all.
+    if let Some(handle) = workspace_handle {
+        let mut callback = Some(callback);
+        let opened = handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let Some(callback) = callback.take() else {
+                    return false;
+                };
+                workspace.update(cx, |workspace, cx| {
+                    open_settings_item(workspace, window, cx, callback);
+                });
+                true
+            })
+            .unwrap_or(false);
+
+        if opened {
+            return;
+        }
+
+        // `handle.update` failed, or the window had no workspace: fall through
+        // to a window, but only if the callback was never handed over.
+        if let Some(callback) = callback {
+            return open_settings_window_with(None, cx, callback);
+        }
+        return;
+    }
+
+    open_settings_window_with(workspace_handle, cx, callback);
+}
+
+fn open_settings_window_with(
+    workspace_handle: Option<WindowHandle<MultiWorkspace>>,
+    cx: &mut App,
+    callback: impl FnOnce(&mut SettingsWindow, &mut Window, &mut Context<SettingsWindow>) + 'static,
+) {
     let existing_window = cx
         .windows()
         .into_iter()
@@ -927,6 +1006,12 @@ fn active_language_mut() -> Option<std::sync::RwLockWriteGuard<'static, Option<S
 
 pub struct SettingsWindow {
     title_bar: Option<Entity<PlatformTitleBar>>,
+    /// Whether this instance is an item in a pane rather than its own window.
+    ///
+    /// An embedded instance draws no title bar and no window decorations: the
+    /// workspace already provides both, and drawing a second set inside a tab
+    /// looks like a window that failed to open.
+    embedded: bool,
     original_window: Option<WindowHandle<MultiWorkspace>>,
     files: Vec<(SettingsUiFile, FocusHandle)>,
     worktree_root_dirs: HashMap<WorktreeId, String>,
@@ -1754,6 +1839,14 @@ impl SettingsUiFile {
 }
 
 impl SettingsWindow {
+    /// Builds a settings view meant to live in a pane rather than a window.
+    fn new_embedded(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::new(None, window, cx);
+        this.embedded = true;
+        this.title_bar = None;
+        this
+    }
+
     fn new(
         original_window: Option<WindowHandle<MultiWorkspace>>,
         window: &mut Window,
@@ -1956,6 +2049,7 @@ impl SettingsWindow {
 
         let mut this = Self {
             title_bar,
+            embedded: false,
             original_window,
 
             worktree_root_dirs: HashMap::default(),
@@ -4509,8 +4603,9 @@ impl SettingsWindow {
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui_font = theme_settings::setup_ui_font(window, cx);
+        let embedded = self.embedded;
 
-        client_side_decorations(
+        let contents =
             v_flex()
                 .text_color(cx.theme().colors().text)
                 .size_full()
@@ -4583,15 +4678,55 @@ impl Render for SettingsWindow {
                         .font(ui_font)
                         .bg(cx.theme().colors().background)
                         .text_color(cx.theme().colors().text)
-                        .when(!cfg!(target_os = "macos"), |this| {
+                        .when(!cfg!(target_os = "macos") && !embedded, |this| {
                             this.border_t_1().border_color(cx.theme().colors().border)
                         })
                         .child(self.render_nav(window, cx))
                         .child(self.render_page(window, cx)),
-                ),
-            window,
-            cx,
-        )
+                );
+
+        // A tab is already inside a decorated window; wrapping it again would
+        // draw a second frame and a second set of resize handles inside the
+        // pane.
+        if embedded {
+            contents.into_any_element()
+        } else {
+            client_side_decorations(contents, window, cx).into_any_element()
+        }
+    }
+}
+
+impl Focusable for SettingsWindow {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<workspace::item::ItemEvent> for SettingsWindow {}
+
+impl workspace::item::Item for SettingsWindow {
+    type Event = workspace::item::ItemEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        "Settings".into()
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::Settings))
+    }
+
+    fn telemetry_event_text(&self) -> Option<&'static str> {
+        Some("Settings Page Opened")
+    }
+
+    // The settings page has its own header and its own search; the editor
+    // toolbar above it would be empty chrome.
+    fn show_toolbar(&self) -> bool {
+        false
+    }
+
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(workspace::item::ItemEvent)) {
+        f(*event)
     }
 }
 

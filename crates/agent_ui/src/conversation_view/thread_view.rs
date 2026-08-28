@@ -42,7 +42,8 @@ use language_model::{
 use notifications::status_toast::StatusToast;
 use settings::{update_settings_file, update_settings_file_with_completion};
 use ui::{
-    ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
+    ButtonLike, CalloutBorderPosition, Checkbox, DotSpinner, SpinnerLabel, SpinnerVariant,
+    SplitButton,
     SplitButtonStyle, Tab, ToggleState,
 };
 use util::markdown::{source_position_from_fragment, split_local_url_fragment};
@@ -4469,7 +4470,6 @@ impl ThreadView {
                                     .min_w_0()
                                     .flex_wrap()
                                     .gap_1()
-                                    .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
                                     .map(|this| match self.config_options_view.clone() {
                                         Some(config_view) => this.child(config_view),
@@ -4707,6 +4707,10 @@ impl ThreadView {
             .is_some_and(|model| model.supports_split_token_display())
     }
 
+    // Kept, unused: the composer no longer shows the context rings, but the
+    // tooltip this builds is the only place the input/output split is written
+    // down, and deleting it would take that with it.
+    #[allow(dead_code)]
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let thread = self.thread.read(cx);
         let usage = thread.token_usage()?;
@@ -7398,9 +7402,12 @@ impl ThreadView {
                 } else {
                     this.child(
                         h_flex()
-                            .w_2()
+                            .w_4()
                             .justify_center()
-                            .child(GeneratingSpinnerElement::new(SpinnerVariant::Dots)),
+                            // A braille spinner is a font glyph, so it is fixed
+                            // at the six dots a braille cell has. This is drawn
+                            // from elements, so it is a three by three grid.
+                            .child(DotSpinner::new("generating-dots")),
                     )
                 }
             })
@@ -10686,9 +10693,7 @@ impl ThreadView {
         let diff_stat_id = format!("subagent-diff-{}", entry_ix);
 
         let icon = h_flex().w_4().justify_center().child(if is_running {
-            SpinnerLabel::new()
-                .size(LabelSize::Small)
-                .into_any_element()
+            DotSpinner::new(("subagent-dots", entry_ix)).into_any_element()
         } else if is_cancelled {
             div()
                 .id(status_icon)

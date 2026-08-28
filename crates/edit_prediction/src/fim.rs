@@ -99,6 +99,7 @@ pub fn request_prediction(
         let suffix = editable_text[cursor_in_editable..].to_string();
         let prompt = format_fim_prompt(prompt_format, &prefix, &suffix);
         let stop_tokens = get_fim_stop_tokens();
+        let display_path = full_path.to_string_lossy().into_owned();
 
         let max_tokens = settings.max_output_tokens;
 
@@ -106,6 +107,13 @@ pub fn request_prediction(
             provider,
             &settings,
             prompt,
+            // A chat endpoint cannot be handed a fill-in-the-middle prompt, so
+            // the two halves travel alongside it and the transport picks.
+            Some(open_ai_compatible::CaretContext {
+                path: &display_path,
+                prefix: &prefix,
+                suffix: &suffix,
+            }),
             max_tokens,
             stop_tokens,
             api_key,

@@ -1,3 +1,5 @@
+mod acuto_layout;
+mod acuto_live_server;
 mod acuto_status;
 mod app_menus;
 pub mod edit_prediction_registry;
@@ -635,7 +637,21 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             cx.new(|_| line_ending_selector::LineEndingIndicator::default());
         let git_blame_status = cx.new(|_| git_ui::GitBlameStatus::default());
         let focus_timer = cx.new(acuto_status::FocusTimer::new);
-        let layout_presets = cx.new(|_| acuto_status::LayoutPresetSwitcher);
+        // These three need the workspace, and a status item is not given one:
+        // `set_active_pane_item` hands over the active item, not its window.
+        let workspace_handle = cx.entity().downgrade();
+        let layout_presets = cx.new({
+            let workspace_handle = workspace_handle.clone();
+            |_| acuto_layout::LayoutPresetSwitcher::new(workspace_handle)
+        });
+        let auto_style = cx.new({
+            let workspace_handle = workspace_handle.clone();
+            |_| acuto_status::AutoStyleButton::new(workspace_handle)
+        });
+        let live_server = cx.new({
+            let workspace_handle = workspace_handle.clone();
+            |_| acuto_live_server::LiveServerButton::new(workspace_handle)
+        });
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
         workspace.status_bar().update(cx, |status_bar, cx| {
@@ -647,6 +663,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
             status_bar.add_right_item(layout_presets, window, cx);
+            status_bar.add_right_item(live_server, window, cx);
+            status_bar.add_right_item(auto_style, window, cx);
             status_bar.add_right_item(focus_timer, window, cx);
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
@@ -1743,7 +1761,7 @@ fn open_about_window(cx: &mut App) {
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("About Zed".into()),
+                title: Some("About Acuto".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),

@@ -79,6 +79,9 @@
   // default preset: tree left, editor centre, agent right, terminal bottom.
   "project_panel": {
     "dock": "left",
+    // The tree toggle lives on the toolbar row beside git and terminal. This
+    // is the same control's status bar copy.
+    "button": false,
     "default_width": 240,
     "entry_spacing": "standard",
     "indent_size": 20,
@@ -171,25 +174,32 @@
   },
 
   // ------------------------------------------------------------ code autofill
-  // Inline completions ran through no provider at all before this: the enum
-  // defaults to Copilot, which was never authenticated, so nothing was ever
-  // requested. This routes them at the same NVIDIA endpoint the agent uses.
   //
-  // Nothing here involves Zed AI. `open_ai_compatible_api` is a first-class
-  // provider, so custom models drive completions the same way a subscription
-  // would. The key comes from ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY.
+  // The chat endpoint, not /v1/completions. NVIDIA's integrate API answers
+  // /v1/completions with 404 for every model it serves, which is why inline
+  // completions produced nothing at all before this - the request never
+  // reached a model. Verified against the live endpoint, not inferred.
   //
-  // The model must serve fill-in-the-middle on /v1/completions - an
-  // instruct-only chat model will return nothing useful. Swap `model` if
-  // NVIDIA stops serving this one; `prompt_format` must match the model
-  // family, not the vendor.
+  // A URL ending in /chat/completions makes the provider send a chat request
+  // with the caret marked in the file, rather than a fill-in-the-middle
+  // prompt. That is a worse instrument than a FIM base model and it is the
+  // one on offer.
+  //
+  // The model is the same one the agent chats with, so there is one provider
+  // and one key to keep working. The key comes from
+  // ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY, set in main.rs.
+  //
+  // `prompt_format` is unused on the chat path - it selects a FIM template
+  // that a chat request never sends. It has to stay set to something that is
+  // neither "infer" nor a zeta format, because that is what routes the request
+  // down the FIM path in the first place.
   "edit_predictions": {
     "provider": "open_ai_compatible_api",
     "open_ai_compatible_api": {
-      "api_url": "https://integrate.api.nvidia.com/v1/completions",
-      "model": "qwen/qwen2.5-coder-32b-instruct",
+      "api_url": "https://integrate.api.nvidia.com/v1/chat/completions",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
       "prompt_format": "qwen",
-      "max_output_tokens": 256,
+      "max_output_tokens": 96,
       // Fire as soon as typing stops. The default already is 0; stated here
       // because it is the setting most worth reaching for if completions feel
       // like they interrupt rather than help.

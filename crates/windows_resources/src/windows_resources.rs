@@ -44,13 +44,19 @@ const MANIFEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/mani
 pub fn compile(manifest: bool) -> Result<(), Box<dyn std::error::Error>> {
     let channel = option_env!("RELEASE_CHANNEL").unwrap_or("dev");
     let (icon_filename, product_name) = match channel {
-        "stable" => ("app-icon.ico", "Zed"),
-        "preview" => ("app-icon-preview.ico", "Zed Preview"),
-        "nightly" => ("app-icon-nightly.ico", "Zed Nightly"),
-        _ => ("app-icon-dev.ico", "Zed Dev"),
+        "stable" => ("app-icon.ico", "Acuto"),
+        "preview" => ("app-icon-preview.ico", "Acuto Preview"),
+        "nightly" => ("app-icon-nightly.ico", "Acuto Nightly"),
+        _ => ("app-icon-dev.ico", "Acuto Dev"),
     };
     let icon = std::path::PathBuf::from(ICON_DIR).join(icon_filename);
     let icon_escaped = icon.to_string_lossy().replace('\\', "\\\\");
+
+    // Without these the embedded icon is whatever it was the last time some
+    // other input made the build script re-run, so replacing the .ico alone
+    // leaves the old icon on the executable.
+    println!("cargo:rerun-if-changed={}", icon.display());
+    println!("cargo:rerun-if-changed={MANIFEST_PATH}");
 
     let manifest_line = if manifest {
         let escaped = MANIFEST_PATH.replace('\\', "\\\\");

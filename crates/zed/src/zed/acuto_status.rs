@@ -1,20 +1,20 @@
 //! Status bar items specific to this fork.
 //!
-//! Both were named in the design spec's status bar line - "branch, LSP status,
-//! cursor position, focus timer, layout preset switcher" - and neither exists
-//! upstream. They are additive `StatusItemView`s, so they compose with Zed's own
-//! items rather than replacing anything.
+//! Additive `StatusItemView`s, so they compose with Zed's own items rather than
+//! replacing anything. The layout switcher named alongside these in the design
+//! spec lives in `acuto_layout`, which needed the room.
 
 use std::time::Duration;
 
-use gpui::{EventEmitter, Task};
+use editor::Editor;
+use gpui::{Entity, EventEmitter, Task, WeakEntity};
 // ui::prelude carries gpui's prelude plus the builder traits, h_flex/v_flex,
 // Button, Color, LabelSize and App. These are not in it.
 use ui::prelude::*;
 use ui::{ContextMenu, IconPosition, Tooltip, right_click_menu};
 use util::ResultExt as _;
 // status_bar is a private module; these are re-exported from the crate root.
-use workspace::{HideStatusItem, StatusItemView, item::ItemHandle};
+use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
 /// The preset countdown lengths offered by the right-click menu.
 const TIMER_PRESET_MINUTES: [u64; 4] = [15, 25, 45, 60];
@@ -249,71 +249,91 @@ impl StatusItemView for FocusTimer {
     }
 }
 
-/// Switches between the named layout presets defined in the fork's keymap.
+/// Tidies the active editor's formatting in one click.
 ///
-/// The presets themselves are keymap entries - `alt-shift-1` and `alt-shift-2` -
-/// so this dispatches the same actions rather than duplicating the layout logic
-/// in Rust. Keeping one source of truth means editing the keymap still changes
-/// what the presets do.
-pub struct LayoutPresetSwitcher;
+/// Two passes, in this order, because they answer different questions and only
+/// one of them always has an answer:
+///
+/// * auto-indent, which comes from the language's tree-sitter indent rules and
+///   therefore works in every file with a grammar, with no language server and
+///   no configuration; and
+/// * `editor::Format`, which is the language server or the configured external
+///   formatter, and which does nothing at all when neither is present.
+///
+/// Running only the second would make the button silently dead in exactly the
+/// files people reach for it in -- a scratch file, a language whose server has
+/// not started, a project with no formatter configured.
+pub struct AutoStyleButton {
+    workspace: WeakEntity<Workspace>,
+}
 
-impl Render for LayoutPresetSwitcher {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .gap_0p5()
-            .child(
-                Button::new("preset-default", "Default")
-                    .label_size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .tooltip(Tooltip::text(
-                        "Tree left, editor centre, agent right, terminal bottom",
-                    ))
-                    .on_click(|_, window, cx| {
-                        if let Some(action) = cx
-                            .build_action("workspace::CloseAllDocks", None)
-                            .log_err()
-                        {
-                            window.dispatch_action(action, cx);
-                        }
-                        if let Some(action) = cx
-                            .build_action(
-                                "workspace::SendKeystrokes",
-                                Some(serde_json::json!(
-                                    "ctrl-shift-e ctrl-shift-/ ctrl-` alt-1"
-                                )),
-                            )
-                            .log_err()
-                        {
-                            window.dispatch_action(action, cx);
-                        }
-                    }),
-            )
-            .child(
-                Button::new("preset-focus", "Focus")
-                    .label_size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .tooltip(Tooltip::text("Editor only"))
-                    .on_click(|_, window, cx| {
-                        if let Some(action) = cx
-                            .build_action("workspace::CloseAllDocks", None)
-                            .log_err()
-                        {
-                            window.dispatch_action(action, cx);
-                        }
-                    }),
-            )
+impl AutoStyleButton {
+    pub fn new(workspace: WeakEntity<Workspace>) -> Self {
+        Self { workspace }
+    }
+
+    fn active_editor(&self, cx: &App) -> Option<Entity<Editor>> {
+        let workspace = self.workspace.upgrade()?;
+        workspace
+            .read(cx)
+            .active_item(cx)?
+            .act_as::<Editor>(cx)
+    }
+
+    fn run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor(cx) else {
+            return;
+        };
+
+        editor.update(cx, |editor, cx| {
+            // The whole buffer, then the caret back where it was. `autoindent`
+            // works on the selection, so reaching every line means selecting
+            // every line first -- and leaving that selection behind would be a
+            // surprise from a button that claims only to tidy formatting.
+            let original = editor.selections.disjoint_anchors().to_vec();
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+            editor.autoindent(&editor::actions::AutoIndent, window, cx);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_anchors(original);
+            });
+        });
+
+        // Dispatched rather than called: formatting is async, routes through
+        // the project's language servers, and reports its own errors. Driving
+        // that from a status bar button would duplicate all of it.
+        if let Some(action) = cx.build_action("editor::Format", None).log_err() {
+            window.dispatch_action(action, cx);
+        }
     }
 }
 
-impl EventEmitter<()> for LayoutPresetSwitcher {}
+impl Render for AutoStyleButton {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let enabled = self.active_editor(cx).is_some();
 
-impl StatusItemView for LayoutPresetSwitcher {
+        IconButton::new("auto-style", IconName::TextIndent)
+            .icon_size(IconSize::Small)
+            .icon_color(if enabled { Color::Muted } else { Color::Disabled })
+            .disabled(!enabled)
+            .tooltip(Tooltip::text(
+                "Auto Style - re-indent the file and run the formatter",
+            ))
+            .on_click(cx.listener(|this, _, window, cx| this.run(window, cx)))
+    }
+}
+
+impl EventEmitter<()> for AutoStyleButton {}
+
+impl StatusItemView for AutoStyleButton {
     fn set_active_pane_item(
         &mut self,
         _active_pane_item: Option<&dyn ItemHandle>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        // The button greys out when the active item is not an editor, so it has
+        // to redraw when the active item changes.
+        cx.notify();
     }
 
     fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {

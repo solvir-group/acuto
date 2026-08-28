@@ -6365,36 +6365,51 @@ impl ProjectPanel {
                                 ),
                             })
                     })
-                    // Directories get an affordance on hover for creating something
+                    // Directories get affordances on hover for creating something
                     // inside them, so it does not require finding the folder in the
-                    // right-click menu first.
+                    // right-click menu first. Two buttons rather than one menu: the
+                    // choice is only ever between a file and a folder, and a menu
+                    // costs a second click to say what a second icon says for free.
                     .when(kind.is_dir() && !show_editor, |this| {
                         this.child(
-                            div()
+                            h_flex()
                                 // Pushed to the trailing edge of the row rather than
                                 // sitting against the folder name.
                                 .ml_auto()
                                 .child(
                                     IconButton::new(
-                                        ("new-in-folder", entry_id.to_usize()),
-                                        IconName::Plus,
+                                        ("new-file-in-folder", entry_id.to_usize()),
+                                        IconName::FilePlus,
                                     )
                                     .icon_size(IconSize::Small)
                                     .icon_color(Color::Muted)
                                     .visible_on_hover(GROUP_NAME)
-                                    .tooltip(Tooltip::text("New…"))
+                                    .tooltip(Tooltip::text("New File"))
                                     .on_click(cx.listener(
-                                        move |this, event: &ClickEvent, window, cx| {
-                                            // Open the entry menu so the choice
-                                            // between file and folder is the user's,
-                                            // rather than assuming a new file.
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            // `add_entry` reads the selection, so the
+                                            // hovered folder has to become the
+                                            // selection before it runs -- otherwise
+                                            // the new entry lands beside whatever was
+                                            // selected before.
                                             this.selection = Some(selection);
-                                            this.deploy_context_menu(
-                                                event.position(),
-                                                entry_id,
-                                                window,
-                                                cx,
-                                            );
+                                            this.new_file(&NewFile, window, cx);
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    IconButton::new(
+                                        ("new-folder-in-folder", entry_id.to_usize()),
+                                        IconName::FolderAdd,
+                                    )
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .visible_on_hover(GROUP_NAME)
+                                    .tooltip(Tooltip::text("New Folder"))
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.selection = Some(selection);
+                                            this.new_directory(&NewDirectory, window, cx);
                                         },
                                     )),
                                 ),

@@ -710,6 +710,17 @@ impl PickerDelegate for CommandPaletteDelegate {
 }
 
 pub fn humanize_action_name(name: &str) -> String {
+    // Display only. Actions keep the `zed::` namespace they are registered and
+    // bound under, because renaming it would invalidate every keymap written
+    // against upstream -- including the one this fork ships. What people read
+    // in the palette is the only place the namespace is chrome rather than an
+    // identifier.
+    let name = match name.strip_prefix("zed::") {
+        Some(rest) => std::borrow::Cow::Owned(format!("acuto::{rest}")),
+        None => std::borrow::Cow::Borrowed(name),
+    };
+    let name: &str = &name;
+
     let chars = name.chars().collect::<Vec<_>>();
     let capacity = name.len() + chars.iter().filter(|c| c.is_uppercase()).count();
     let mut result = String::with_capacity(capacity);
@@ -820,6 +831,15 @@ mod tests {
             "agent: open project AGENTS.md rules"
         );
         assert_eq!(humanize_action_name("editor::OpenURL"), "editor: open URL");
+        // Fork change: the `zed` namespace reads as `acuto` and nothing else does.
+        assert_eq!(
+            humanize_action_name("zed::OpenSettings"),
+            "acuto: open settings"
+        );
+        assert_eq!(
+            humanize_action_name("zeta::ClearHistory"),
+            "zeta: clear history"
+        );
         assert_eq!(
             humanize_action_name("editor::OpenURLParser"),
             "editor: open URL parser"

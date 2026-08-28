@@ -141,6 +141,7 @@ pub fn request_prediction(
             provider,
             &custom_settings,
             prompt,
+            None,
             custom_settings.max_output_tokens,
             RESERVED_SWEEP_TOKENS.map(str::to_string).to_vec(),
             api_key,

@@ -925,6 +925,21 @@ impl TitleBar {
     fn render_title_bar_tools(&self) -> impl IntoElement {
         h_flex()
             .gap_0p5()
+            // First, ahead of git: the tree is the control you reach for most,
+            // and it used to sit in the status bar where it was the only
+            // navigation control not on this row.
+            .child(
+                IconButton::new("title-bar-project-panel", IconName::FileTree)
+                    .tooltip(Tooltip::text("Project Panel"))
+                    .icon_size(IconSize::Small)
+                    .on_click(move |_, window, cx| {
+                        if let Some(action) =
+                            cx.build_action("project_panel::ToggleFocus", None).log_err()
+                        {
+                            window.dispatch_action(action, cx);
+                        }
+                    }),
+            )
             .child(
                 IconButton::new("title-bar-git", IconName::GitBranch)
                     .tooltip(Tooltip::text("Git Panel"))
