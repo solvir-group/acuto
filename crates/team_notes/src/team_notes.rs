@@ -9,10 +9,13 @@
 //! * **"What should I pick up next?"** -- a ticket, with a status and an
 //!   assignee, optionally anchored to the code it concerns.
 //!
-//! It does not do chat. Chat is a solved problem that Slack is better at, and
-//! an editor competing with it would lose while making the editor worse.
-//! Everything here is attached to work, which is the part a chat window cannot
-//! do and an editor can.
+//! * **"Can everyone see this?"** -- a message to the whole repository team,
+//!   in a conversation that is part of the repository rather than somewhere
+//!   else you have to go and look.
+//!
+//! What makes the third one worth having in an editor is that it shares a
+//! record type with the first two: something raised in conversation carries the
+//! same replies and the same `@mentions` as a note on a line.
 //!
 //! # Why the repository is the transport
 //!
@@ -23,9 +26,12 @@
 //! of a diff, and need no account. Nothing here can break because a service is
 //! down, because there is no service.
 //!
-//! The cost is that they move at the speed of pushes rather than keystrokes.
-//! That is the right trade for work items and code questions, and the wrong one
-//! for chat -- which is the other reason this does not try to do chat.
+//! The cost is real and worth stating plainly: records move at the speed of
+//! pushes, not keystrokes. A message is seen when your teammate next pulls. For
+//! notes and tickets that is the right trade. For conversation it means this is
+//! a place to leave something for the team, not a place to expect an answer in
+//! ten seconds -- and there is no presence or read receipt here, because both
+//! would need a server that does not exist.
 //!
 //! # Why JSONL
 //!
@@ -441,6 +447,58 @@ pub async fn author_name(executor: &gpui::BackgroundExecutor) -> Arc<str> {
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "unknown".to_string())
         .into()
+}
+
+/// Everyone who has committed to this repository lately.
+///
+/// The team is read out of git history rather than from a member list, because
+/// a member list is a second thing to maintain and it is wrong the day someone
+/// joins. Whoever has been writing code here is who the conversation is with.
+///
+/// Bounded to the last few hundred commits: walking all of history is O(repo)
+/// on a large one, and someone who stopped committing three years ago is not
+/// who you are talking to. Order is most-recent-first with duplicates dropped,
+/// so the people you actually work with sort to the front.
+///
+/// An empty result -- no git, no history, not a repository -- is not an error.
+/// It means the roster is unknown, and the panel says so rather than inventing
+/// one.
+pub async fn team_roster(
+    worktree_root: PathBuf,
+    executor: &gpui::BackgroundExecutor,
+) -> Vec<Arc<str>> {
+    const COMMITS_SCANNED: &str = "-400";
+
+    executor
+        .spawn(async move {
+            let Ok(output) = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&worktree_root)
+                .args(["log", "--format=%aN", "--no-merges", COMMITS_SCANNED])
+                .output()
+            else {
+                return Vec::new();
+            };
+            if !output.status.success() {
+                return Vec::new();
+            }
+
+            let mut members: Vec<Arc<str>> = Vec::new();
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let name = line.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                if !members
+                    .iter()
+                    .any(|existing| existing.as_ref().eq_ignore_ascii_case(name))
+                {
+                    members.push(name.into());
+                }
+            }
+            members
+        })
+        .await
 }
 
 #[cfg(test)]

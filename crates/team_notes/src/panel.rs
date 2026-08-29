@@ -17,7 +17,10 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-use crate::{Anchor, Kind, Message, NoteThread, Status, author_name, notes_file, resolve_anchor};
+use crate::{
+    Anchor, Kind, Message, NoteThread, Status, author_name, notes_file, resolve_anchor,
+    team_roster,
+};
 
 actions!(
     team_notes,
@@ -28,6 +31,8 @@ actions!(
         AddNote,
         /// Starts a ticket.
         NewTicket,
+        /// Sends whatever is in the chat composer.
+        SendMessage,
     ]
 );
 
@@ -111,6 +116,8 @@ pub struct TeamNotesPanel {
     /// A record being written that does not exist yet.
     drafting: Option<(Draft, Entity<Editor>)>,
     author: Arc<str>,
+    /// Everyone on the repository, most recently active first.
+    team: Vec<Arc<str>>,
     _reload: Option<Task<()>>,
 }
 
@@ -128,6 +135,13 @@ impl TeamNotesPanel {
     pub fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
         let project = workspace.project().clone();
         let fs = project.read(cx).fs().clone();
+        // Taken before `project` moves into the struct, so the roster can be
+        // fetched by the same task that resolves the author name.
+        let root = project
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
 
         let mut this = Self {
             workspace: workspace.weak_handle(),
@@ -140,14 +154,28 @@ impl TeamNotesPanel {
             replying_to: None,
             drafting: None,
             author: "unknown".into(),
+            team: Vec::new(),
             _reload: None,
         };
 
         cx.spawn(async move |this, cx| {
             let executor = cx.background_executor().clone();
             let author = author_name(&executor).await;
+            let mut team = match root {
+                Some(root) => team_roster(root, &executor).await,
+                None => Vec::new(),
+            };
+            // You belong in the roster before your first commit lands, which is
+            // exactly when a new person is most likely to open this panel.
+            if !team
+                .iter()
+                .any(|member| member.as_ref().eq_ignore_ascii_case(author.as_ref()))
+            {
+                team.insert(0, author.clone());
+            }
             this.update(cx, |this, cx| {
                 this.author = author;
+                this.team = team;
                 cx.notify();
             })
             .ok();
@@ -712,39 +740,127 @@ fn row_and_line_at(text: &str, offset: usize) -> (u32, String) {
 }
 
 impl TeamNotesPanel {
+    /// Who the conversation is with.
+    ///
+    /// Sits where the panel's own title row does on the other tabs, so the chat
+    /// gets a conversation header without the panel growing a second one.
+    fn render_chat_header(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        /// Enough faces to say "this is a group" in a 340px dock.
+        const STACK: usize = 3;
+
+        let ring = cx.theme().colors().panel_background;
+
+        h_flex()
+            .w_full()
+            .gap_2()
+            .child(
+                h_flex()
+                    .flex_none()
+                    .children(self.team.iter().take(STACK).enumerate().map(
+                        |(index, member)| {
+                            div()
+                                // Overlapped rather than spaced: a stack reads
+                                // as one group, a row reads as a list.
+                                .when(index > 0, |this| this.ml(px(-8.)))
+                                .child(initials_avatar(member, px(24.), Some(ring), cx))
+                        },
+                    )),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new("Everyone").size(LabelSize::Small))
+                    .child(
+                        Label::new(self.roster_summary())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                IconButton::new("chat-reload", IconName::ArrowCircle)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Re-read from the repository"))
+                    .on_click(cx.listener(|this, _, _window, cx| this.reload(cx))),
+            )
+            .into_any_element()
+    }
+
+    /// The subtitle under "Everyone".
+    ///
+    /// Deliberately not "Active now". Presence needs a server telling you who
+    /// has the editor open, and there is none -- the whole point of this panel
+    /// is that it works with nothing but the repository. A count of who is on
+    /// the repository is the true version of the same reassurance.
+    fn roster_summary(&self) -> String {
+        match self.team.len() {
+            0 => "Reading the repository…".to_string(),
+            1 => "Just you, so far".to_string(),
+            count => format!("{count} people on this repo"),
+        }
+    }
+
     /// The Messages view: a transcript, and a composer pinned to the bottom.
     ///
     /// Deliberately not the card list the other tabs use. A message is read in
-    /// order and answered at the end, so the shape people already know for that
-    /// -- oldest at the top, newest above the box you type in -- is the shape
-    /// that needs no explanation. The cards are right for tickets, where you
+    /// order and answered at the end, so the shape everyone already knows for
+    /// that -- oldest at the top, newest above the box you type in -- is the
+    /// shape that needs no explanation. Cards are right for tickets, where you
     /// scan for the one you want.
     fn render_chat(&self, records: &[NoteThread], cx: &mut Context<Self>) -> gpui::AnyElement {
         let me = self.author.to_string();
 
         // Oldest first: a transcript reads down the page. Ids are time-ordered,
-        // so this is chronological without storing a second timestamp to sort
-        // on.
+        // so this is chronological without storing a second field to sort on.
         let mut ordered: Vec<&NoteThread> = records.iter().collect();
         ordered.sort_by(|a, b| a.id.cmp(&b.id));
 
-        // A name is drawn only when the speaker changes. Judged against the
-        // previous bubble on screen rather than against position within a
-        // thread: two people answering each other inside one thread are still
-        // two speakers, and hiding the second name would attribute their words
-        // to the first.
-        let mut bubbles: Vec<(Message, bool, bool)> = Vec::new();
+        // Flattened into one stream, each entry carrying what the renderer needs
+        // to know about its neighbours. Working that out here rather than in the
+        // element tree keeps the layout code to one shape per entry.
+        struct Bubble {
+            message: Message,
+            mine: bool,
+            /// First of a run by the same person: the one that gets a face and
+            /// a name.
+            starts_run: bool,
+            /// A time to draw above it, when the clock has moved on.
+            stamp: Option<String>,
+        }
+
+        let mut bubbles: Vec<Bubble> = Vec::new();
         let mut previous_author: Option<String> = None;
+        let mut previous_minute: Option<String> = None;
         for record in &ordered {
             for message in &record.messages {
                 let mine = message.author.eq_ignore_ascii_case(&me);
-                let new_speaker = previous_author
+                let starts_run = previous_author
                     .as_deref()
                     .is_none_or(|author| !author.eq_ignore_ascii_case(&message.author));
+                let minute = message.at.get(..16).unwrap_or(&message.at).to_string();
+                let stamp = (previous_minute.as_deref() != Some(minute.as_str()))
+                    .then(|| separator_stamp(&message.at, previous_minute.as_deref()));
+
                 previous_author = Some(message.author.clone());
-                bubbles.push((message.clone(), mine, new_speaker));
+                previous_minute = Some(minute);
+                bubbles.push(Bubble {
+                    message: message.clone(),
+                    mine,
+                    starts_run,
+                    stamp,
+                });
             }
         }
+
+        // The status line goes under the last thing *you* said, which is where
+        // you look to check it went.
+        let last_own = bubbles.iter().rposition(|bubble| bubble.mine);
+
+        let sent_background = cx.theme().players().local().cursor;
+        let received_background = cx.theme().colors().elevated_surface_background;
+        let on_sent = gpui::hsla(0., 0., 1., 1.);
+        let empty = bubbles.is_empty();
 
         v_flex()
             .size_full()
@@ -754,91 +870,146 @@ impl TeamNotesPanel {
                     .id("team-chat-transcript")
                     .flex_1()
                     .p_2()
-                    .gap_1p5()
+                    .gap_1()
                     .overflow_y_scroll()
-                    .when(ordered.is_empty(), |this| {
+                    .when(empty, |this| {
                         this.child(
                             Label::new(
                                 "Nothing said yet. Messages are written to \
-                                 .acuto/notes.jsonl and travel with the repository, so your \
-                                 team sees them on the next pull.",
+                                 .acuto/notes.jsonl and travel with the repository, so \
+                                 your team sees them on the next pull.",
                             )
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                         )
                     })
-                    .children(bubbles.into_iter().map(|(message, mine, new_speaker)| {
-                        // Own messages to the right, everyone else's to the
-                        // left. Alignment is what makes a transcript readable
-                        // at a glance, more than colour does.
-                        h_flex()
+                    .children(bubbles.into_iter().enumerate().map(|(index, bubble)| {
+                        let at = bubble.message.at.clone();
+                        let is_last_own = last_own == Some(index);
+
+                        v_flex()
                             .w_full()
-                            .when(mine, |this| this.justify_end())
+                            .gap_0p5()
+                            .when_some(bubble.stamp, |this, stamp| {
+                                this.child(div().pt_1().child(
+                                    Label::new(stamp).size(LabelSize::XSmall).color(Color::Muted),
+                                ))
+                            })
                             .child(
-                                v_flex()
-                                    .max_w(relative(0.85))
-                                    .min_w_0()
-                                    .px_2()
-                                    .py_1p5()
-                                    .gap_0p5()
-                                    .rounded_lg()
-                                    .bg(if mine {
-                                        cx.theme().colors().element_selected
-                                    } else {
-                                        cx.theme().colors().elevated_surface_background
-                                    })
-                                    .border_1()
-                                    .border_color(cx.theme().colors().border_variant)
-                                    // Your own bubbles are already identified by
-                                    // sitting on the right, so they never carry
-                                    // a name.
-                                    .when(!mine && new_speaker, |this| {
-                                        this.child(
-                                            Label::new(message.author.clone())
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Accent),
-                                        )
+                                h_flex()
+                                    .w_full()
+                                    .items_end()
+                                    .gap_1()
+                                    .when(bubble.mine, |this| this.justify_end())
+                                    .when(!bubble.mine, |this| {
+                                        // The face sits against the first bubble
+                                        // of a run; the rest of the run is
+                                        // indented past the same gap so the
+                                        // column of text stays straight.
+                                        this.child(if bubble.starts_run {
+                                            initials_avatar(
+                                                &bubble.message.author,
+                                                px(22.),
+                                                None,
+                                                cx,
+                                            )
+                                        } else {
+                                            div().flex_none().w(px(22.)).into_any_element()
+                                        })
                                     })
                                     .child(
-                                        Label::new(message.body.clone())
-                                            .size(LabelSize::Small),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .justify_end()
+                                        v_flex()
+                                            .max_w(relative(0.78))
+                                            .min_w_0()
+                                            .gap_0p5()
+                                            // A name only when the speaker
+                                            // changes, and never on your own:
+                                            // sitting on the right already says
+                                            // who wrote it.
+                                            .when(!bubble.mine && bubble.starts_run, |this| {
+                                                this.child(
+                                                    Label::new(bubble.message.author.clone())
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                            })
                                             .child(
-                                                Label::new(short_time(&message.at))
-                                                    .size(LabelSize::XSmall)
-                                                    .color(Color::Muted),
+                                                div()
+                                                    .px_2p5()
+                                                    .py_1p5()
+                                                    .rounded_2xl()
+                                                    .bg(if bubble.mine {
+                                                        sent_background
+                                                    } else {
+                                                        received_background
+                                                    })
+                                                    .child({
+                                                        let label =
+                                                            Label::new(bubble.message.body.clone())
+                                                                .size(LabelSize::Small);
+                                                        if bubble.mine {
+                                                            label.color(Color::Custom(on_sent))
+                                                        } else {
+                                                            label
+                                                        }
+                                                    }),
                                             ),
                                     ),
                             )
+                            .when(is_last_own, |this| {
+                                // "Sent", not "Seen". Nothing here can know
+                                // whether anyone read it -- that needs a server,
+                                // and claiming it without one would be a lie on
+                                // every message.
+                                this.child(
+                                    h_flex().w_full().justify_end().child(
+                                        Label::new(format!("Sent · {}", short_time(&at)))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                                )
+                            })
                     })),
             )
             .child(self.render_chat_composer(cx))
             .into_any_element()
     }
 
-    /// The box at the bottom of the Messages view.
+    /// The bar at the bottom: attach, type, send.
     ///
-    /// Always present, and always the same height, so the place you type does
-    /// not move as the conversation grows.
+    /// Always present and always the same height, so the place you type does not
+    /// move as the conversation grows.
     fn render_chat_composer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let composing = matches!(self.drafting, Some((Draft::Message, _)));
+        let accent = cx.theme().players().local().cursor;
 
-        v_flex()
+        h_flex()
             .flex_none()
+            .w_full()
             .p_2()
-            .gap_1()
+            .gap_1p5()
+            .items_end()
             .border_t_1()
             .border_color(cx.theme().colors().border)
             .bg(cx.theme().colors().panel_background)
             .child(
-                v_flex()
-                    .w_full()
-                    .px_2()
+                IconButton::new("chat-attach", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Custom(accent))
+                    .tooltip(Tooltip::text("Mention the file you are looking at"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.attach_current_file(window, cx)
+                    })),
+            )
+            .child(
+                div()
+                    .id("chat-composer")
+                    .key_context("TeamNotesComposer")
+                    .flex_1()
+                    .min_w_0()
+                    .px_3()
                     .py_1p5()
-                    .rounded_lg()
+                    .rounded_2xl()
                     .bg(cx.theme().colors().editor_background)
                     .border_1()
                     .border_color(if composing {
@@ -846,48 +1017,172 @@ impl TeamNotesPanel {
                     } else {
                         cx.theme().colors().border_variant
                     })
+                    .on_action(cx.listener(|this, _: &SendMessage, window, cx| {
+                        this.send_chat_message(window, cx)
+                    }))
                     .map(|this| match self.drafting.as_ref() {
                         Some((Draft::Message, composer)) => this.child(composer.clone()),
                         _ => this.child(
-                            Label::new("Message the team…")
+                            Label::new("Type your message")
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
                         ),
                     })
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            if !matches!(this.drafting, Some((Draft::Message, _))) {
-                                this.open_composer(
-                                    Draft::Message,
-                                    "Message the team… @mention to reach someone.",
-                                    window,
-                                    cx,
-                                );
-                            }
-                        }),
-                    ),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if !matches!(this.drafting, Some((Draft::Message, _))) {
+                            this.open_composer(Draft::Message, "Type your message", window, cx);
+                        }
+                    })),
             )
-            .when(composing, |this| {
-                this.child(
-                    h_flex().justify_end().child(
-                        Button::new("chat-send", "Send")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.submit_draft(window, cx)
-                            })),
-                    ),
-                )
-            })
+            .child(
+                // Send, not a smiley. The reference has an emoji button because
+                // the field is empty; an emoji button here would be a control
+                // that does nothing, which is worse than one that does the thing
+                // you actually came to do.
+                IconButton::new("chat-send", IconName::Send)
+                    .icon_size(IconSize::Small)
+                    .icon_color(if composing {
+                        Color::Custom(accent)
+                    } else {
+                        Color::Muted
+                    })
+                    .disabled(!composing)
+                    .tooltip(Tooltip::text("Send"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.send_chat_message(window, cx)
+                    })),
+            )
             .into_any_element()
+    }
+
+    /// Sends, then reopens the box.
+    ///
+    /// A chat that closes its own composer after every line makes you click
+    /// before each message.
+    fn send_chat_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_draft(window, cx);
+        if self.drafting.is_none() {
+            self.open_composer(Draft::Message, "Type your message", window, cx);
+        }
+    }
+
+    /// Drops the path of the file you are looking at into the message.
+    ///
+    /// The one thing a chat inside an editor can do that a chat beside it
+    /// cannot: say which file you mean without alt-tabbing to find out.
+    fn attach_current_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.drafting, Some((Draft::Message, _))) {
+            self.open_composer(Draft::Message, "Type your message", window, cx);
+        }
+        let Some(path) = self.active_file_path(cx) else {
+            return;
+        };
+        let Some((Draft::Message, composer)) = self.drafting.as_ref() else {
+            return;
+        };
+        let composer = composer.clone();
+        composer.update(cx, |editor, cx| {
+            editor.insert(&format!("{path} "), window, cx);
+        });
+        composer.focus_handle(cx).focus(window, cx);
+    }
+
+    /// The active editor's path, worktree-relative with forward slashes.
+    fn active_file_path(&self, cx: &App) -> Option<String> {
+        let workspace = self.workspace.upgrade()?;
+        let item = workspace.read(cx).active_item(cx)?;
+        let editor = item.act_as::<Editor>(cx)?;
+        let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+        let path = buffer.read(cx).file()?.path().as_std_path().to_path_buf();
+        Some(
+            path.to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/"),
+        )
+    }
+}
+
+/// A circle with someone's initials, coloured from their name.
+///
+/// Not `ui::Avatar`, which needs an image URL: there is no account system here
+/// and no server to fetch a picture from, so the name is all there is. The
+/// colour is hashed from the name, so one person is the same colour on every
+/// teammate's screen without anything having to agree on it.
+fn initials_avatar(
+    name: &str,
+    size: gpui::Pixels,
+    ring: Option<gpui::Hsla>,
+    cx: &App,
+) -> gpui::AnyElement {
+    let background = cx
+        .theme()
+        .players()
+        .color_for_participant(name_hash(name))
+        .cursor;
+
+    h_flex()
+        .flex_none()
+        .size(size)
+        .justify_center()
+        .rounded_full()
+        .bg(background)
+        .when_some(ring, |this, ring| this.border_2().border_color(ring))
+        .child(
+            Label::new(initials(name))
+                .size(LabelSize::XSmall)
+                .color(Color::Custom(gpui::hsla(0., 0., 1., 1.))),
+        )
+        .into_any_element()
+}
+
+/// `Drew Wycherley` as `DW`, `procoder30001` as `P`.
+fn initials(name: &str) -> String {
+    let mut words = name.split_whitespace();
+    let first = words.next().and_then(|word| word.chars().next());
+    let last = words.last().and_then(|word| word.chars().next());
+    match (first, last) {
+        (Some(first), Some(last)) => format!("{}{}", upper(first), upper(last)),
+        (Some(first), None) => upper(first),
+        _ => "?".to_string(),
+    }
+}
+
+fn upper(character: char) -> String {
+    character.to_uppercase().collect()
+}
+
+/// FNV-1a over the lowercased name.
+///
+/// Any stable hash would do; what matters is that it is computed from the name
+/// and not from a position in a list, so someone's colour does not change when
+/// a different teammate commits.
+fn name_hash(name: &str) -> u32 {
+    let mut hash: u32 = 2166136261;
+    for byte in name.as_bytes() {
+        hash ^= u32::from(byte.to_ascii_lowercase());
+        hash = hash.wrapping_mul(16777619);
+    }
+    hash
+}
+
+/// The time to draw above a message, given the one before it.
+///
+/// Just the clock time within a day, and the date as well when the day changes.
+/// Both are slices of the stored RFC 3339 string, so this needs no date library
+/// and cannot disagree with what was written down.
+fn separator_stamp(at: &str, previous_minute: Option<&str>) -> String {
+    let day = at.get(..10).unwrap_or_default();
+    let time = short_time(at);
+    let same_day = previous_minute.and_then(|previous| previous.get(..10)) == Some(day);
+    if same_day || day.is_empty() {
+        time
+    } else {
+        format!("{day} · {time}")
     }
 }
 
 /// `2026-08-29T15:04:05Z` as `15:04`.
 ///
-/// The date is dropped: a transcript is read in order, and the day something
-/// was said is rarely the question. Anything that does not parse is shown
-/// whole rather than guessed at.
+/// Anything that does not parse is shown whole rather than guessed at.
 fn short_time(timestamp: &str) -> String {
     timestamp
         .split('T')
@@ -938,7 +1233,10 @@ impl Render for TeamNotesPanel {
                     .gap_1p5()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(
+                    .when(filter == Filter::Messages, |this| {
+                        this.child(self.render_chat_header(cx))
+                    })
+                    .when(filter != Filter::Messages, |this| this.child(
                         h_flex()
                             .justify_between()
                             .child(Label::new("Team").size(LabelSize::Small))
@@ -1003,7 +1301,7 @@ impl Render for TeamNotesPanel {
                                             })),
                                     ),
                             ),
-                    )
+                    ))
                     .child(
                         h_flex()
                             .gap_0p5()
@@ -1174,6 +1472,49 @@ impl Panel for TeamNotesPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_becomes_one_or_two_initials() {
+        assert_eq!(initials("Drew Wycherley"), "DW");
+        assert_eq!(initials("procoder30001"), "P");
+        assert_eq!(initials("ada lovelace king"), "AK");
+        assert_eq!(initials("  "), "?");
+        assert_eq!(initials(""), "?");
+        // Not every contributor's name is ASCII.
+        assert_eq!(initials("Ólafur Jónsson"), "ÓJ");
+    }
+
+    #[test]
+    fn a_persons_colour_does_not_depend_on_who_else_committed() {
+        // The hash is over the name alone, so adding a teammate cannot shuffle
+        // everyone else's avatar colour.
+        assert_eq!(name_hash("Drew"), name_hash("Drew"));
+        assert_eq!(name_hash("Drew"), name_hash("drew"));
+        assert_ne!(name_hash("Drew"), name_hash("Ada"));
+    }
+
+    #[test]
+    fn the_time_separator_adds_the_date_only_when_the_day_changes() {
+        assert_eq!(
+            separator_stamp("2026-08-29T15:04:05Z", Some("2026-08-29T14:31")),
+            "15:04"
+        );
+        assert_eq!(
+            separator_stamp("2026-08-30T09:12:00Z", Some("2026-08-29T23:58")),
+            "2026-08-30 · 09:12"
+        );
+        // The first message of a conversation has nothing before it.
+        assert_eq!(
+            separator_stamp("2026-08-29T15:04:05Z", None),
+            "2026-08-29 · 15:04"
+        );
+    }
+
+    #[test]
+    fn a_timestamp_that_makes_no_sense_is_shown_rather_than_guessed_at() {
+        assert_eq!(short_time("not a timestamp"), "not a timestamp");
+        assert_eq!(separator_stamp("", None), "");
+    }
 
     #[test]
     fn the_row_and_line_are_found_from_a_byte_offset() {

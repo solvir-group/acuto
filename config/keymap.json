@@ -3,6 +3,21 @@
   // Hot-reloads - no rebuild.
 
   {
+    // Enter sends in the team chat, shift-enter starts a new line. This is the
+    // one place in the editor where that inversion is right: the composer is a
+    // chat box, and every chat anyone has used works this way.
+    //
+    // Scoped to the composer's own context rather than to Editor, so it cannot
+    // reach the note and ticket composers -- those are prose, where enter has
+    // to stay a newline.
+    "context": "TeamNotesComposer > Editor",
+    "bindings": {
+      "enter": "team_notes::SendMessage",
+      "shift-enter": "editor::Newline"
+    }
+  },
+
+  {
     // Upstream binds assistant::InlineAssist to ctrl-enter in the editor and to
     // ctrl-i in the terminal. This adds ctrl-i in the editor as well so the
     // inline chat opens at the caret with the same key everywhere.
