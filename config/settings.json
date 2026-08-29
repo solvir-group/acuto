@@ -14,40 +14,47 @@
   // chrome labels. Body UI text is 0.825rem (crates/ui/src/styles/typography.rs).
   // 15.5 * 0.825 = 12.8px labels, which is the 12.5-13px the spec asks for.
   // Setting this to 13 would give ~10.7px and shrink the entire UI.
-  // Inter is NOT currently installed on this machine, so this renders Segoe UI
-  // Variable through the fallback until it is. DirectWrite refreshes the system
-  // collection on a miss, so installing Inter should take effect without an edit.
-  // Segoe UI Variable first, because it is actually on this machine. Naming a
-  // font that is not installed leaves the choice to the font system, and after
-  // Berkeley Mono was installed the whole interface came back monospace --
-  // menus, panels and all. A first entry that resolves means the fallbacks
-  // never have to be guessed at.
+  //
+  // Name a font that is actually installed. This said "Inter", which is not on
+  // this machine, so the choice fell to the font system -- and once Berkeley
+  // Mono was installed the whole interface came back monospace, menus and
+  // panels included. A first entry that resolves means the fallbacks never have
+  // to be guessed at.
   "ui_font_family": "Segoe UI",
-  "ui_font_fallbacks": ["Segoe UI Variable Text", "Inter"],
+  "ui_font_fallbacks": ["Segoe UI Variable Text"],
   "ui_font_size": 15.5,
   "ui_font_weight": 400,
 
-  // JetBrains Mono is NOT currently installed on this machine, so this renders
-  // Cascadia Mono via the fallback until it is. DirectWrite refreshes the system
-  // font collection on a miss and retries, so installing it should take effect
-  // without editing this file again. Test Söhne Mono to return later.
-  // Berkeley Mono, installed per-user from the trial download rather than
-  // bundled: the trial licence does not cover redistribution, so the font
-  // lives in the user's own font directory and this names it. The trial build
-  // carries 95 glyphs -- ASCII and little else -- so the fallbacks below are
-  // load-bearing for anything outside it rather than decorative.
-  "buffer_font_family": "Berkeley Mono Trial",
-  "buffer_font_fallbacks": ["Consolas", "Cascadia Mono"],
+  // NOT Berkeley Mono Trial. The trial build swaps glyph outlines as its
+  // watermark -- its own README build log says so:
+  //
+  //     FC-013: Swapping glyphs: backslash,slash
+  //     FC-014: Swapping glyphs: asterisk,numbersign
+  //
+  // So `/` draws as `\`, `#` draws as `*`, and vice versa. Verified in the
+  // font binary: `/` maps to glyph 72, whose outline falls left-to-right. In a
+  // code editor that silently corrupts every comment, path, division, regex,
+  // CSS colour, attribute and preprocessor line on screen -- and it is why
+  // `</style>` appeared to be highlighted wrongly. It was drawn as `<\style>`.
+  //
+  // No setting can undo it; the fix is the licensed font. If that is bought,
+  // change this one line back to its family name and delete this note.
+  "buffer_font_family": "Cascadia Mono",
+  "buffer_font_fallbacks": ["Consolas"],
   "buffer_font_size": 14,
   "buffer_font_weight": 400,
-  // 1.75 was the original spec value, but JetBrains Mono has a tall x-height
-  // and is drawn around ~1.2. At 1.75 the glyphs sit in very sparse rows and
-  // read as horizontally squashed even though advance width is unchanged.
+  // 1.75 was the original spec value, but these grotesque monos have a tall
+  // x-height and are drawn around ~1.2. At 1.75 the glyphs sit in very sparse
+  // rows and read as horizontally squashed even though advance width is
+  // unchanged.
   "buffer_line_height": { "custom": 1.5 },
 
-  // Agent panel: sans for responses, mono for user messages, matching the editor.
+  // Two fonts in the whole editor: Segoe UI for anything you read, Cascadia
+  // Mono for anything that is code. The agent panel follows the same split --
+  // its prose in the UI font, the code it quotes in the code font -- rather
+  // than introducing a third.
   "agent_ui_font_family": "Segoe UI",
-  "agent_buffer_font_family": "Segoe UI",
+  "agent_buffer_font_family": "Cascadia Mono",
 
   // UNSTABLE upstream ("expect many elements to be broken"). It is the single
   // biggest lever on density. FIRST THING TO REMOVE if the UI looks wrong.
@@ -155,8 +162,8 @@
     "env": {
       "EDITOR": "C:/Users/broad/zed/target/debug/zed.exe --user-data-dir C:/Users/broad/zed-fork-data --wait"
     },
-    "font_family": "Berkeley Mono Trial",
-    "font_fallbacks": ["Consolas", "Cascadia Mono"],
+    "font_family": "Cascadia Mono",
+    "font_fallbacks": ["Consolas"],
     "font_size": 14,
     "line_height": { "custom": 1.5 }
   },

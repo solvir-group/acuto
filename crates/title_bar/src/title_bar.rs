@@ -238,6 +238,9 @@ impl Render for TitleBar {
         // Read before `repository` is consumed below, so the top bar's repo
         // button has somewhere to point.
         let mut remote_url: Option<String> = None;
+        // A repository with no remote is still a repository: commit and push
+        // are meaningful, and only the "open on the web" button is not.
+        let mut repository_present = false;
         if let Some(worktree) = self.effective_active_worktree(cx) {
             repository = self.get_repository_for_worktree(&worktree, cx);
             let worktree_abs_path = worktree.read(cx).abs_path();
@@ -247,6 +250,7 @@ impl Render for TitleBar {
                 .file_name()
                 .map(|name| SharedString::from(name.to_string()));
             if let Some(repo) = &repository {
+                repository_present = true;
                 let snapshot = repo.read(cx).snapshot();
                 remote_url = snapshot
                     .remote_origin_url
@@ -407,17 +411,27 @@ impl Render for TitleBar {
         );
 
         if show_menus {
-            // The row is `justify_between`, so a second child sits against the
-            // right edge, inside the window controls.
+            // The row is `justify_between`: the first child sits left with the
+            // menus, the last against the right edge inside the window
+            // controls.
+            let has_repository = remote_url.is_some() || repository_present;
+            let git_cluster = self.render_top_bar_git(has_repository);
             let extras = self.render_top_bar_extras(remote_url, cx);
             self.platform_titlebar.update(cx, |this, _| {
                 this.set_button_layout(button_layout);
                 this.set_children(
-                    self.application_menu
-                        .clone()
-                        .map(|menu| menu.into_any_element())
-                        .into_iter()
-                        .chain(std::iter::once(extras)),
+                    std::iter::once(
+                        h_flex()
+                            .gap_1()
+                            .children(
+                                self.application_menu
+                                    .clone()
+                                    .map(|menu| menu.into_any_element()),
+                            )
+                            .child(git_cluster)
+                            .into_any_element(),
+                    )
+                    .chain(std::iter::once(extras)),
                 );
             });
 
@@ -928,6 +942,62 @@ impl TitleBar {
             .anchor(gpui::Anchor::TopLeft)
     }
 
+    /// Stage-and-commit and push, on the window frame.
+    ///
+    /// The two commands a working day is made of, one click each, always in the
+    /// same place. They are dispatched by name rather than by importing
+    /// `git_ui`, which is not a dependency of this crate and would pull a large
+    /// subtree into its rebuild graph for two buttons.
+    ///
+    /// Commit stages everything first. A commit button that commits nothing
+    /// because the changes are unstaged is a button that appears broken, and
+    /// the panel is one click away for anyone who wants to stage selectively.
+    fn render_top_bar_git(&self, has_repository: bool) -> AnyElement {
+        fn dispatch(name: &'static str) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+            move |_, window, cx| {
+                if let Some(action) = cx.build_action(name, None).log_err() {
+                    window.dispatch_action(action, cx);
+                }
+            }
+        }
+
+        h_flex()
+            .gap_0p5()
+            .pl_2()
+            .child(
+                IconButton::new("top-bar-git-panel", IconName::Github)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .disabled(!has_repository)
+                    .tooltip(Tooltip::text("Git Panel"))
+                    .on_click(dispatch("git_panel::ToggleFocus")),
+            )
+            .child(
+                IconButton::new("top-bar-git-commit", IconName::GitBranch)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .disabled(!has_repository)
+                    .tooltip(Tooltip::text("Stage all and commit"))
+                    .on_click(|_, window, cx| {
+                        if let Some(stage) = cx.build_action("git::StageAll", None).log_err() {
+                            window.dispatch_action(stage, cx);
+                        }
+                        if let Some(commit) = cx.build_action("git::Commit", None).log_err() {
+                            window.dispatch_action(commit, cx);
+                        }
+                    }),
+            )
+            .child(
+                IconButton::new("top-bar-git-push", IconName::ArrowUp)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .disabled(!has_repository)
+                    .tooltip(Tooltip::text("Push"))
+                    .on_click(dispatch("git::Push")),
+            )
+            .into_any_element()
+    }
+
     /// Where feature requests go. Empty until there is somewhere to send them,
     /// which the button says rather than pretending otherwise.
     const FEATURE_REQUEST_URL: &'static str = "";
@@ -954,13 +1024,14 @@ impl TitleBar {
                     .tooltip(Tooltip::text(label))
                     .on_click(move |_, _, cx| cx.open_url(&web_url))
             }
-            None => IconButton::new("top-bar-repository", IconName::Link)
+            // The mark stays put whether or not there is a remote: it is where
+            // people look for the repository, and a control that appears and
+            // disappears is one nobody learns the position of.
+            None => IconButton::new("top-bar-repository", IconName::Github)
                 .icon_size(IconSize::Small)
                 .icon_color(Color::Disabled)
                 .disabled(true)
-                .tooltip(Tooltip::text(
-                    "This project has no git remote to open",
-                )),
+                .tooltip(Tooltip::text("This project has no git remote to open")),
         };
 
         let has_destination = !Self::FEATURE_REQUEST_URL.is_empty();

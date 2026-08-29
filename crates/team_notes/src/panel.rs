@@ -432,23 +432,6 @@ impl TeamNotesPanel {
         self.commit(records, cx);
     }
 
-    /// Turns a message into a ticket, keeping what was already said.
-    ///
-    /// The common path: something is raised in conversation and turns out to be
-    /// work. Retyping it into a tracker is where the detail gets lost.
-    fn promote_to_ticket(&mut self, id: &str, cx: &mut Context<Self>) {
-        let mut records = self.records.clone();
-        if let Some(record) = records.iter_mut().find(|record| record.id == id) {
-            if record.kind == Kind::Message {
-                record.kind = Kind::Ticket;
-                record.title = Some(record.headline().to_string());
-                record.status = Status::Open;
-                record.resolved = false;
-            }
-        }
-        self.commit(records, cx);
-    }
-
     fn take_ownership(&mut self, id: &str, cx: &mut Context<Self>) {
         let me = self.author.to_string();
         let mut records = self.records.clone();
@@ -683,23 +666,6 @@ impl TeamNotesPanel {
                             move |this, _, _window, cx| this.take_ownership(&id, cx)
                         })),
                     )
-                    .when(record.kind == Kind::Message, |this| {
-                        this.child(
-                            Button::new(
-                                SharedString::from(format!("promote-{}", record.id)),
-                                "Make Ticket",
-                            )
-                            .label_size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .tooltip(Tooltip::text(
-                                "Turn this into a ticket, keeping the conversation",
-                            ))
-                            .on_click(cx.listener({
-                                let id = id.clone();
-                                move |this, _, _window, cx| this.promote_to_ticket(&id, cx)
-                            })),
-                        )
-                    })
                     // Done in one click, wherever the record currently is. The
                     // status button cycles, which takes two clicks to finish a
                     // ticket that has not been started.
@@ -743,6 +709,192 @@ fn row_and_line_at(text: &str, offset: usize) -> (u32, String) {
         row.saturating_sub(1),
         text.lines().last().unwrap_or_default().to_string(),
     )
+}
+
+impl TeamNotesPanel {
+    /// The Messages view: a transcript, and a composer pinned to the bottom.
+    ///
+    /// Deliberately not the card list the other tabs use. A message is read in
+    /// order and answered at the end, so the shape people already know for that
+    /// -- oldest at the top, newest above the box you type in -- is the shape
+    /// that needs no explanation. The cards are right for tickets, where you
+    /// scan for the one you want.
+    fn render_chat(&self, records: &[NoteThread], cx: &mut Context<Self>) -> gpui::AnyElement {
+        let me = self.author.to_string();
+
+        // Oldest first: a transcript reads down the page. Ids are time-ordered,
+        // so this is chronological without storing a second timestamp to sort
+        // on.
+        let mut ordered: Vec<&NoteThread> = records.iter().collect();
+        ordered.sort_by(|a, b| a.id.cmp(&b.id));
+
+        // A name is drawn only when the speaker changes. Judged against the
+        // previous bubble on screen rather than against position within a
+        // thread: two people answering each other inside one thread are still
+        // two speakers, and hiding the second name would attribute their words
+        // to the first.
+        let mut bubbles: Vec<(Message, bool, bool)> = Vec::new();
+        let mut previous_author: Option<String> = None;
+        for record in &ordered {
+            for message in &record.messages {
+                let mine = message.author.eq_ignore_ascii_case(&me);
+                let new_speaker = previous_author
+                    .as_deref()
+                    .is_none_or(|author| !author.eq_ignore_ascii_case(&message.author));
+                previous_author = Some(message.author.clone());
+                bubbles.push((message.clone(), mine, new_speaker));
+            }
+        }
+
+        v_flex()
+            .size_full()
+            .justify_between()
+            .child(
+                v_flex()
+                    .id("team-chat-transcript")
+                    .flex_1()
+                    .p_2()
+                    .gap_1p5()
+                    .overflow_y_scroll()
+                    .when(ordered.is_empty(), |this| {
+                        this.child(
+                            Label::new(
+                                "Nothing said yet. Messages are written to \
+                                 .acuto/notes.jsonl and travel with the repository, so your \
+                                 team sees them on the next pull.",
+                            )
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                    })
+                    .children(bubbles.into_iter().map(|(message, mine, new_speaker)| {
+                        // Own messages to the right, everyone else's to the
+                        // left. Alignment is what makes a transcript readable
+                        // at a glance, more than colour does.
+                        h_flex()
+                            .w_full()
+                            .when(mine, |this| this.justify_end())
+                            .child(
+                                v_flex()
+                                    .max_w(relative(0.85))
+                                    .min_w_0()
+                                    .px_2()
+                                    .py_1p5()
+                                    .gap_0p5()
+                                    .rounded_lg()
+                                    .bg(if mine {
+                                        cx.theme().colors().element_selected
+                                    } else {
+                                        cx.theme().colors().elevated_surface_background
+                                    })
+                                    .border_1()
+                                    .border_color(cx.theme().colors().border_variant)
+                                    // Your own bubbles are already identified by
+                                    // sitting on the right, so they never carry
+                                    // a name.
+                                    .when(!mine && new_speaker, |this| {
+                                        this.child(
+                                            Label::new(message.author.clone())
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Accent),
+                                        )
+                                    })
+                                    .child(
+                                        Label::new(message.body.clone())
+                                            .size(LabelSize::Small),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .justify_end()
+                                            .child(
+                                                Label::new(short_time(&message.at))
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                            ),
+                                    ),
+                            )
+                    })),
+            )
+            .child(self.render_chat_composer(cx))
+            .into_any_element()
+    }
+
+    /// The box at the bottom of the Messages view.
+    ///
+    /// Always present, and always the same height, so the place you type does
+    /// not move as the conversation grows.
+    fn render_chat_composer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let composing = matches!(self.drafting, Some((Draft::Message, _)));
+
+        v_flex()
+            .flex_none()
+            .p_2()
+            .gap_1()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().panel_background)
+            .child(
+                v_flex()
+                    .w_full()
+                    .px_2()
+                    .py_1p5()
+                    .rounded_lg()
+                    .bg(cx.theme().colors().editor_background)
+                    .border_1()
+                    .border_color(if composing {
+                        cx.theme().colors().border_focused
+                    } else {
+                        cx.theme().colors().border_variant
+                    })
+                    .map(|this| match self.drafting.as_ref() {
+                        Some((Draft::Message, composer)) => this.child(composer.clone()),
+                        _ => this.child(
+                            Label::new("Message the team…")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                    })
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            if !matches!(this.drafting, Some((Draft::Message, _))) {
+                                this.open_composer(
+                                    Draft::Message,
+                                    "Message the team… @mention to reach someone.",
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }),
+                    ),
+            )
+            .when(composing, |this| {
+                this.child(
+                    h_flex().justify_end().child(
+                        Button::new("chat-send", "Send")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_draft(window, cx)
+                            })),
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+/// `2026-08-29T15:04:05Z` as `15:04`.
+///
+/// The date is dropped: a transcript is read in order, and the day something
+/// was said is rarely the question. Anything that does not parse is shown
+/// whole rather than guessed at.
+fn short_time(timestamp: &str) -> String {
+    timestamp
+        .split('T')
+        .nth(1)
+        .and_then(|time| time.get(..5))
+        .unwrap_or(timestamp)
+        .to_string()
 }
 
 impl Render for TeamNotesPanel {
@@ -875,7 +1027,14 @@ impl Render for TeamNotesPanel {
                             })),
                     ),
             )
-            .child(
+            .map(|this| {
+                // A conversation is read in order and answered at the end; a
+                // list of tickets is scanned. Same records, two shapes, because
+                // one shape cannot do both jobs well.
+                if filter == Filter::Messages {
+                    return this.child(self.render_chat(&records, cx));
+                }
+                this.child(
                 v_flex()
                     .id("team-list")
                     .p_2()
@@ -940,7 +1099,8 @@ impl Render for TeamNotesPanel {
                         )
                     })
                     .children(records.iter().map(|record| self.render_record(record, cx))),
-            )
+                )
+            })
     }
 }
 

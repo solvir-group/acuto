@@ -849,7 +849,8 @@ fn open_settings_item(
     let settings_view = match existing {
         Some(existing) => existing,
         None => {
-            let settings_view = cx.new(|cx| SettingsWindow::new_embedded(window, cx));
+            let settings_view =
+                cx.new(|cx| SettingsWindow::new_embedded(workspace.downgrade(), window, cx));
             workspace.update(cx, |workspace, cx| {
                 workspace.add_item_to_active_pane(
                     Box::new(settings_view.clone()),
@@ -1014,6 +1015,22 @@ fn active_language_mut() -> Option<std::sync::RwLockWriteGuard<'static, Option<S
     ACTIVE_LANGUAGE.write().ok()
 }
 
+/// The extensions browser, as a settings sub-page.
+fn render_extensions_sub_page(
+    settings_window: &SettingsWindow,
+    _scroll_handle: &ScrollHandle,
+    _window: &mut Window,
+    _cx: &mut Context<SettingsWindow>,
+) -> AnyElement {
+    let Some(page) = settings_window.extensions_page() else {
+        return gpui::Empty.into_any_element();
+    };
+    // The browser is a virtualised list and sizes itself to what it is given,
+    // so it needs a parent that fills the content area rather than one that
+    // shrinks to fit.
+    div().size_full().child(page).into_any_element()
+}
+
 pub struct SettingsWindow {
     title_bar: Option<Entity<PlatformTitleBar>>,
     /// Whether this instance is an item in a pane rather than its own window.
@@ -1082,6 +1099,18 @@ pub struct SettingsWindow {
     /// mouse, where `focus_visible` styling would otherwise be suppressed).
     pub(crate) external_agent_add_focus_handle: FocusHandle,
     skill_creator_page: Option<(Entity<pages::SkillCreatorPage>, Subscription)>,
+    /// The workspace this instance is a tab in, when it is one.
+    ///
+    /// Only needed by the extensions page, which installs things and opens
+    /// files. `None` for the standalone window, where extensions fall back to
+    /// the action that opens them in their own tab.
+    workspace: Option<WeakEntity<Workspace>>,
+    /// Built the first time extensions are opened, then kept.
+    ///
+    /// Constructing it starts a network fetch, so it is not built with the
+    /// window; keeping it means going back to extensions does not re-fetch and
+    /// lose the search you had typed.
+    extensions_page: Option<Entity<extensions_ui::ExtensionsPage>>,
 }
 
 struct SearchDocument {
@@ -1850,10 +1879,15 @@ impl SettingsUiFile {
 
 impl SettingsWindow {
     /// Builds a settings view meant to live in a pane rather than a window.
-    fn new_embedded(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new_embedded(
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut this = Self::new(None, window, cx);
         this.embedded = true;
         this.title_bar = None;
+        this.workspace = Some(workspace);
         this
     }
 
@@ -2113,6 +2147,8 @@ impl SettingsWindow {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
+            workspace: None,
+            extensions_page: None,
         };
 
         this.fetch_files(window, cx);
@@ -3385,14 +3421,9 @@ impl SettingsWindow {
                                     .color(Color::Muted),
                             )
                             .full_width()
-                            .on_click(|_, window, cx| {
-                                if let Some(action) = cx
-                                    .build_action("zed::Extensions", None)
-                                    .log_err()
-                                {
-                                    window.dispatch_action(action, cx);
-                                }
-                            }),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_extensions_sub_page(window, cx)
+                            })),
                     ),
             )
             .child(
@@ -4392,6 +4423,46 @@ impl SettingsWindow {
             render,
         };
         self.push_sub_page(sub_page_link, section_header.into(), window, cx);
+    }
+
+    pub(crate) fn extensions_page(&self) -> Option<Entity<extensions_ui::ExtensionsPage>> {
+        self.extensions_page.clone()
+    }
+
+    /// Shows the extensions browser inside settings.
+    ///
+    /// Installing an extension is configuring the editor, so it belongs in the
+    /// window where the editor is configured rather than behind a separate
+    /// command that opens a tab somewhere else. It is a sub-page so the back
+    /// button leads where you came from.
+    ///
+    /// With no workspace -- the standalone settings window -- there is nowhere
+    /// for an extension to open a file, so this falls back to the action that
+    /// opens extensions in their own tab rather than showing a page that half
+    /// works.
+    pub fn open_extensions_sub_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.clone() else {
+            if let Some(action) = cx.build_action("zed::Extensions", None).log_err() {
+                window.dispatch_action(action, cx);
+            }
+            return;
+        };
+
+        if self.extensions_page.is_none() {
+            self.extensions_page = Some(extensions_ui::ExtensionsPage::new(
+                workspace, None, None, window, cx,
+            ));
+        }
+
+        self.push_dynamic_sub_page(
+            "Extensions",
+            "Extensions",
+            None,
+            false,
+            render_extensions_sub_page,
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn skill_creator_page(&self) -> Option<Entity<pages::SkillCreatorPage>> {
@@ -5526,6 +5597,8 @@ pub mod test {
                 custom_agent_form: None,
                 external_agent_add_focus_handle: cx.focus_handle(),
                 skill_creator_page: None,
+                workspace: None,
+                extensions_page: None,
             }
         }
     }
@@ -5665,6 +5738,8 @@ pub mod test {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
+            workspace: None,
+            extensions_page: None,
         };
 
         settings_window.build_filter_table();

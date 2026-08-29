@@ -151,7 +151,7 @@ pub fn init(cx: &mut App) {
                         workspace.activate_item(&existing, true, true, window, cx);
                     } else {
                         let extensions_page = ExtensionsPage::new(
-                            workspace,
+                            workspace.weak_handle(),
                             provides_filter,
                             action.id.as_deref(),
                             window,
@@ -404,16 +404,21 @@ pub struct ExtensionsPage {
 }
 
 impl ExtensionsPage {
+    /// Takes a weak handle and `&mut App` rather than `&Workspace` and its
+    /// context, so the page can also be built from somewhere that is not
+    /// already inside a workspace update -- the settings window, which is a
+    /// different entity, would otherwise have to lease the workspace it lives
+    /// in just to read a handle out of it.
     pub fn new(
-        workspace: &Workspace,
+        workspace: WeakEntity<Workspace>,
         provides_filter: Option<ExtensionProvides>,
         focus_extension_id: Option<&str>,
         window: &mut Window,
-        cx: &mut Context<Workspace>,
+        cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
             let store = ExtensionStore::global(cx);
-            let workspace_handle = workspace.weak_handle();
+            let workspace_handle = workspace.clone();
             let subscriptions = [
                 cx.observe(&store, |_: &mut Self, _, cx| cx.notify()),
                 cx.subscribe_in(
@@ -449,7 +454,7 @@ impl ExtensionsPage {
             let provider_registry = GitHostingProviderRegistry::default_global(cx);
 
             let mut this = Self {
-                workspace: workspace.weak_handle(),
+                workspace,
                 provider_registry,
                 list: scroll_handle,
                 is_fetching_extensions: false,

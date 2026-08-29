@@ -201,6 +201,42 @@ const COMPLETION_SYSTEM_PROMPT: &str = concat!(
      read and an undo.",
 );
 
+/// A worked example, in the exact shape a real request arrives in.
+///
+/// Rules in a system prompt tell a chat model what to do; a turn it can see
+/// itself having taken tells it what its output is supposed to look like. This
+/// is the one that stops the two commonest failures at once -- answering in
+/// prose, and re-typing the line the caret is already on.
+const SHOWN_MID_LINE: &str = concat!(
+    "Language: JavaScript\n",
+    "File being edited: cart.js\n\n",
+    "function total(items) {\n",
+    "  let sum = 0;\n",
+    "  for (const item of items) {\n",
+    "    sum += item.pri",
+    "<|caret|>",
+    "\n  }\n",
+    "  return sum;\n",
+    "}\n",
+);
+
+/// Note what is *not* here: no `sum += `, which is already before the caret,
+/// and no `}` or `return sum;`, which are already after it.
+const SHOWN_MID_LINE_REPLY: &str = "ce * item.quantity;";
+
+/// And the case where the honest answer is nothing.
+///
+/// A model with no example of declining will always find something to say. The
+/// caret here sits after a finished statement with no way to know what comes
+/// next, which is the situation that produces invented identifiers.
+const SHOWN_NOTHING_TO_SAY: &str = concat!(
+    "Language: JavaScript\n",
+    "File being edited: cart.js\n\n",
+    "const cart = loadCart();\n",
+    "<|caret|>",
+    "\n",
+);
+
 /// Asks a chat model to fill in at the caret.
 ///
 /// This is a worse instrument than a fill-in-the-middle base model: it costs a
@@ -243,6 +279,10 @@ async fn send_chat_completion_request(
         "chat_template_kwargs": { "enable_thinking": false },
         "messages": [
             { "role": "system", "content": COMPLETION_SYSTEM_PROMPT },
+            { "role": "user", "content": SHOWN_MID_LINE },
+            { "role": "assistant", "content": SHOWN_MID_LINE_REPLY },
+            { "role": "user", "content": SHOWN_NOTHING_TO_SAY },
+            { "role": "assistant", "content": "" },
             { "role": "user", "content": user_message },
         ],
     });
@@ -297,7 +337,51 @@ async fn send_chat_completion_request(
     let completion = clean_chat_completion(text);
     let completion = trim_overlap_with_buffer(completion, caret.prefix, caret.suffix);
     let completion = stop_at_repeated_line(completion, caret.suffix);
-    Ok((cap_lines(completion), request_id))
+    let completion = cap_lines(completion);
+
+    log_exchange(&user_message, text, &completion);
+
+    Ok((completion, request_id))
+}
+
+/// Where the wire log goes, if anywhere.
+///
+/// Read once: this is on the path of every keystroke that triggers a
+/// prediction, and reading the environment per request would be a syscall for
+/// nothing on the overwhelmingly common path where it is unset.
+static WIRE_LOG: std::sync::LazyLock<Option<std::path::PathBuf>> =
+    std::sync::LazyLock::new(|| std::env::var_os("ACUTO_PREDICTION_LOG").map(Into::into));
+
+/// Appends one request and its reply to the wire log.
+///
+/// Inline predictions are judged on output nobody can see the input for, so a
+/// bad suggestion is otherwise diagnosed by guessing at the prompt. This writes
+/// what was actually sent, what actually came back, and what survived the
+/// cleanup, which turns "the suggestions are wrong" into a file you can read.
+///
+/// Off unless `ACUTO_PREDICTION_LOG` names a path, because the prompt contains
+/// the source being edited and that should never be written anywhere by
+/// default. Failures are logged rather than propagated: a diagnostic that can
+/// fail a completion is worse than no diagnostic.
+fn log_exchange(user_message: &str, raw: &str, kept: &str) {
+    use std::io::Write as _;
+
+    let Some(path) = WIRE_LOG.as_ref() else {
+        return;
+    };
+
+    let record = format!(
+        "================================ REQUEST\n{user_message}\n         -------------------------------- RAW REPLY\n{raw}\n         -------------------------------- SHOWN\n{kept}\n\n"
+    );
+
+    let appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(record.as_bytes()));
+    if let Err(error) = appended {
+        log::warn!("could not write the prediction wire log to {path:?}: {error}");
+    }
 }
 
 /// Cuts the completion at the first line that already appears just after the

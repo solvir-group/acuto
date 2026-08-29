@@ -73,6 +73,11 @@ pub enum EditSessionOutput {
         old_text: Arc<String>,
         #[serde(default)]
         diff: String,
+        /// What the language's own parser makes of the file afterwards, when
+        /// the edit made it worse. `None` when the file still parses as well as
+        /// it did, which is the overwhelmingly common case.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        syntax: Option<String>,
     },
     Error {
         error: String,
@@ -97,13 +102,23 @@ impl std::fmt::Display for EditSessionOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EditSessionOutput::Success {
-                diff, input_path, ..
+                diff,
+                input_path,
+                syntax,
+                ..
             } => {
                 if diff.is_empty() {
-                    write!(f, "No edits were made.")
-                } else {
-                    write!(f, "Edited {} successfully", input_path.display())
+                    return write!(f, "No edits were made.");
                 }
+                write!(f, "Edited {} successfully", input_path.display())?;
+                // Appended to the success line rather than turned into a
+                // failure: the edit is already applied and saved, so calling it
+                // an error would be a lie. Saying it plainly in the same result
+                // is what gets it fixed in the same turn.
+                if let Some(syntax) = syntax {
+                    write!(f, "\n\n{syntax}")?;
+                }
+                Ok(())
             }
             EditSessionOutput::Error {
                 error,
@@ -284,11 +299,13 @@ pub(crate) async fn run_session(
                 .ensure_buffer_saved(&session.buffer, cx)
                 .await;
             let (new_text, diff) = session.compute_new_text_and_diff(cx).await;
+            let syntax = syntax_verdict(&session, &new_text, cx).await;
             Ok(EditSessionOutput::Success {
                 old_text: session.old_text.clone(),
                 new_text,
                 input_path: session.input_path,
                 diff,
+                syntax,
             })
         }
         EditSessionResult::Failed {
@@ -325,6 +342,103 @@ pub(crate) async fn run_session(
             })
         }
     }
+}
+
+/// Checks an applied edit against the language's own parser.
+///
+/// The point of the whole review surface is that you can tell whether an agent
+/// edit is correct without reading the file yourself. Nothing supports that
+/// claim if the file no longer parses and nobody says so -- the agent reports
+/// success, the diff looks plausible, and the breakage surfaces later as a red
+/// squiggle nobody connects to this turn.
+///
+/// Judged by *change*, not by absolute count: a file that was already mid-edit
+/// and full of errors before the agent touched it must not be blamed on the
+/// agent, and a file with a construct this grammar has never handled must not
+/// make every edit to it look like a failure. Only "you made this worse" is
+/// reported, because only that is attributable.
+///
+/// Returns `None` -- reporting nothing -- for a file with no grammar, or when
+/// either parse fails outright. A check that cannot run is not a check that
+/// failed, and inventing a verdict from a missing parser would be exactly the
+/// kind of unfounded assurance this exists to prevent.
+async fn syntax_verdict(
+    session: &EditSession,
+    new_text: &str,
+    cx: &mut AsyncApp,
+) -> Option<String> {
+    let language = session
+        .buffer
+        .read_with(cx, |buffer, _| buffer.language().cloned())?;
+    let grammar = language.grammar()?.ts_language.clone();
+
+    let old_text = session.old_text.clone();
+    let new_text = new_text.to_string();
+    let language_name = language.name().to_string();
+
+    // Parsing is O(file) and this runs on every agent edit, so it does not
+    // belong on the thread that draws.
+    cx.background_spawn(async move {
+        let before = syntax_errors(&grammar, &old_text)?;
+        let after = syntax_errors(&grammar, &new_text)?;
+        if after.len() <= before.len() {
+            return None;
+        }
+
+        let mut report = format!(
+            "Syntax check: this edit left the file with {} {language_name} parse \
+             error(s), up from {}. Fix it before doing anything else.",
+            after.len(),
+            before.len()
+        );
+        // The first few locations only. A broken construct cascades, so the
+        // tail of this list is consequences of the head and listing all of it
+        // buries the one line that matters.
+        for line in after.iter().take(3) {
+            report.push_str(&format!("\n  line {line}"));
+        }
+        Some(report)
+    })
+    .await
+}
+
+/// One-based line numbers of the places the parser could not make sense of.
+///
+/// `None` if the text cannot be parsed at all, which is a broken grammar rather
+/// than a broken file.
+fn syntax_errors(language: &tree_sitter::Language, text: &str) -> Option<Vec<usize>> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(language).ok()?;
+    let tree = parser.parse(text, None)?;
+
+    let mut lines = Vec::new();
+    let mut cursor = tree.walk();
+    let mut descend = true;
+    loop {
+        if descend {
+            let node = cursor.node();
+            // `is_error` is a node the parser could not place; `is_missing` is
+            // one it inserted to recover. Both are the parser saying the text
+            // is not what the grammar describes.
+            if node.is_error() || node.is_missing() {
+                lines.push(node.start_position().row + 1);
+            }
+        }
+
+        if descend && cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            descend = true;
+            continue;
+        }
+        if !cursor.goto_parent() {
+            break;
+        }
+        descend = false;
+    }
+
+    Some(lines)
 }
 
 pub(crate) fn initial_title_from_partial_path<P>(
