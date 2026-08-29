@@ -926,11 +926,11 @@ impl TeamNotesPanel {
                         // gets air. The spacing is what tells you where one
                         // thought ends, without drawing anything to say so.
                         let space_above = if bubble.stamp.is_some() {
-                            px(7.)
+                            px(5.)
                         } else if bubble.starts_run {
-                            px(4.)
+                            px(2.)
                         } else {
-                            px(1.)
+                            px(0.)
                         };
 
                         v_flex()
