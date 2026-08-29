@@ -1058,8 +1058,12 @@ impl TeamNotesPanel {
                     .rounded_2xl()
                     .bg(cx.theme().colors().editor_background)
                     .border_1()
+                    // Neutral in both states. A focus ring in the accent colour
+                    // competes with the sent bubbles and the send button, which
+                    // are the two things in this panel that have earned the
+                    // colour; the border only has to say where the box is.
                     .border_color(if composing {
-                        accent
+                        cx.theme().colors().border
                     } else {
                         cx.theme().colors().border_variant
                     })
