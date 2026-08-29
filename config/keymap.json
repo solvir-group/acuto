@@ -13,7 +13,18 @@
     "context": "TeamNotesComposer > Editor",
     "bindings": {
       "enter": "team_notes::SendMessage",
-      "shift-enter": "editor::Newline"
+      "shift-enter": "editor::Newline",
+      "escape": "team_notes::CancelDraft"
+    }
+  },
+
+  {
+    // Escape leaves a note or ticket you have started writing. Without it the
+    // only way out of the composer was to submit something, because an editor
+    // swallows escape as editor::Cancel before any panel sees it.
+    "context": "TeamNotesDraft > Editor",
+    "bindings": {
+      "escape": "team_notes::CancelDraft"
     }
   },
 

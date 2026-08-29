@@ -10,7 +10,7 @@ use gpui::{
 };
 use language::ToOffset as _;
 use project::Project;
-use ui::{Tooltip, prelude::*};
+use ui::{Icon, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     Workspace,
@@ -33,6 +33,8 @@ actions!(
         NewTicket,
         /// Sends whatever is in the chat composer.
         SendMessage,
+        /// Abandons the note, ticket or message being written.
+        CancelDraft,
     ]
 );
 
@@ -327,6 +329,25 @@ impl TeamNotesPanel {
                 cx,
             );
         });
+    }
+
+    /// Throws away whatever was being written.
+    ///
+    /// A composer with no way out is a trap: until this existed the only way to
+    /// stop writing a ticket was to submit one.
+    fn cancel_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.drafting = None;
+        self.replying_to = None;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Whether the draft has anything in it worth keeping.
+    fn draft_is_empty(&self, cx: &App) -> bool {
+        match self.drafting.as_ref() {
+            Some((_, composer)) => composer.read(cx).text(cx).trim().is_empty(),
+            None => true,
+        }
     }
 
     fn submit_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -870,7 +891,6 @@ impl TeamNotesPanel {
                     .id("team-chat-transcript")
                     .flex_1()
                     .p_2()
-                    .gap_1()
                     .overflow_y_scroll()
                     .when(empty, |this| {
                         this.child(
@@ -887,13 +907,26 @@ impl TeamNotesPanel {
                         let at = bubble.message.at.clone();
                         let is_last_own = last_own == Some(index);
 
+                        // Messages fired off in one go sit almost on top of each
+                        // other; a change of speaker, or a jump in the clock,
+                        // gets air. The spacing is what tells you where one
+                        // thought ends, without drawing anything to say so.
+                        let space_above = if bubble.stamp.is_some() {
+                            px(10.)
+                        } else if bubble.starts_run {
+                            px(8.)
+                        } else {
+                            px(1.)
+                        };
+
                         v_flex()
                             .w_full()
+                            .mt(space_above)
                             .gap_0p5()
                             .when_some(bubble.stamp, |this, stamp| {
-                                this.child(div().pt_1().child(
+                                this.child(
                                     Label::new(stamp).size(LabelSize::XSmall).color(Color::Muted),
-                                ))
+                                )
                             })
                             .child(
                                 h_flex()
@@ -977,11 +1010,19 @@ impl TeamNotesPanel {
 
     /// The bar at the bottom: attach, type, send.
     ///
-    /// Always present and always the same height, so the place you type does not
-    /// move as the conversation grows.
+    /// One row, three items, all the same height and all bottom-aligned, so the
+    /// two round buttons sit level with the input rather than near it. No rule
+    /// above it: the composer is already a different shape from everything in
+    /// the transcript, and a line as well is one separator too many in a panel
+    /// this narrow.
     fn render_chat_composer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        /// Buttons and the collapsed input are all this tall, which is the only
+        /// reason the row lines up.
+        const CONTROL: f32 = 30.;
+
         let composing = matches!(self.drafting, Some((Draft::Message, _)));
         let accent = cx.theme().players().local().cursor;
+        let on_accent = gpui::hsla(0., 0., 1., 1.);
 
         h_flex()
             .flex_none()
@@ -989,26 +1030,36 @@ impl TeamNotesPanel {
             .p_2()
             .gap_1p5()
             .items_end()
-            .border_t_1()
-            .border_color(cx.theme().colors().border)
             .bg(cx.theme().colors().panel_background)
             .child(
-                IconButton::new("chat-attach", IconName::Plus)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Custom(accent))
+                h_flex()
+                    .id("chat-attach")
+                    .flex_none()
+                    .size(px(CONTROL))
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
                     .tooltip(Tooltip::text("Mention the file you are looking at"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.attach_current_file(window, cx)
                     })),
             )
             .child(
-                div()
+                v_flex()
                     .id("chat-composer")
                     .key_context("TeamNotesComposer")
                     .flex_1()
                     .min_w_0()
+                    .min_h(px(CONTROL))
+                    .justify_center()
                     .px_3()
-                    .py_1p5()
+                    .py_1()
                     .rounded_2xl()
                     .bg(cx.theme().colors().editor_background)
                     .border_1()
@@ -1019,6 +1070,9 @@ impl TeamNotesPanel {
                     })
                     .on_action(cx.listener(|this, _: &SendMessage, window, cx| {
                         this.send_chat_message(window, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &CancelDraft, window, cx| {
+                        this.cancel_draft(window, cx)
                     }))
                     .map(|this| match self.drafting.as_ref() {
                         Some((Draft::Message, composer)) => this.child(composer.clone()),
@@ -1035,18 +1089,27 @@ impl TeamNotesPanel {
                     })),
             )
             .child(
-                // Send, not a smiley. The reference has an emoji button because
-                // the field is empty; an emoji button here would be a control
-                // that does nothing, which is worse than one that does the thing
-                // you actually came to do.
-                IconButton::new("chat-send", IconName::Send)
-                    .icon_size(IconSize::Small)
-                    .icon_color(if composing {
-                        Color::Custom(accent)
+                // Send, not a smiley. The reference shows an emoji button
+                // because its field is empty; an emoji button here would be a
+                // control that does nothing, which is worse than one that does
+                // the thing you came to do.
+                h_flex()
+                    .id("chat-send")
+                    .flex_none()
+                    .size(px(CONTROL))
+                    .justify_center()
+                    .rounded_full()
+                    .bg(if composing {
+                        accent
                     } else {
-                        Color::Muted
+                        gpui::Hsla { a: 0.35, ..accent }
                     })
-                    .disabled(!composing)
+                    .cursor_pointer()
+                    .child(
+                        Icon::new(IconName::Send)
+                            .size(IconSize::Small)
+                            .color(Color::Custom(on_accent)),
+                    )
                     .tooltip(Tooltip::text("Send"))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.send_chat_message(window, cx)
@@ -1320,6 +1383,16 @@ impl Render for TeamNotesPanel {
                                     })
                                     .on_click(cx.listener(move |this, _, _window, cx| {
                                         this.filter = option;
+                                        // An untouched composer does not follow
+                                        // you to another tab, where it would be
+                                        // invisible but still open. One with
+                                        // text in it does, because discarding
+                                        // what someone typed to tidy up the UI
+                                        // is worse than the stray composer.
+                                        if this.draft_is_empty(cx) {
+                                            this.drafting = None;
+                                            this.replying_to = None;
+                                        }
                                         cx.notify();
                                     }))
                             })),
@@ -1347,11 +1420,15 @@ impl Render for TeamNotesPanel {
                         };
                         this.child(
                             v_flex()
+                                .key_context("TeamNotesDraft")
                                 .p_2()
                                 .gap_1p5()
                                 .rounded_md()
                                 .border_1()
                                 .border_color(cx.theme().colors().border_focused)
+                                .on_action(cx.listener(|this, _: &CancelDraft, window, cx| {
+                                    this.cancel_draft(window, cx)
+                                }))
                                 .child(
                                     Label::new(where_to)
                                         .size(LabelSize::XSmall)
@@ -1359,11 +1436,23 @@ impl Render for TeamNotesPanel {
                                 )
                                 .child(composer.clone())
                                 .child(
-                                    Button::new("submit-draft", "Add")
-                                        .label_size(LabelSize::Small)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.submit_draft(window, cx)
-                                        })),
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            Button::new("submit-draft", "Add")
+                                                .label_size(LabelSize::Small)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.submit_draft(window, cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("cancel-draft", "Cancel")
+                                                .label_size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.cancel_draft(window, cx)
+                                                })),
+                                        ),
                                 ),
                         )
                     })
