@@ -5406,6 +5406,8 @@ dependencies = [
  "text",
  "thiserror 2.0.17",
  "toml 0.8.23",
+ "tree-sitter",
+ "tree-sitter-rust",
  "ui",
  "util",
  "uuid",

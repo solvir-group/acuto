@@ -1,37 +1,44 @@
-//! Conversations anchored to lines of code, carried by the repository.
+//! Team communication that lives in the repository.
 //!
 //! This replaces the collaboration panel, which talked to a server this fork
-//! does not have and so did nothing at all. The question it answers is narrower
-//! and more useful: not "how do I chat with my team", which Slack does better
-//! than an editor ever will, but "how do I ask about *this line* in a way my
-//! teammate will see when they are looking at it".
+//! does not have and so did nothing at all. It answers two questions a team
+//! actually has inside an editor, and deliberately not a third:
+//!
+//! * **"Why is this line like this?"** -- a note, anchored to the line, that
+//!   your teammate sees when they open the file.
+//! * **"What should I pick up next?"** -- a ticket, with a status and an
+//!   assignee, optionally anchored to the code it concerns.
+//!
+//! It does not do chat. Chat is a solved problem that Slack is better at, and
+//! an editor competing with it would lose while making the editor worse.
+//! Everything here is attached to work, which is the part a chat window cannot
+//! do and an editor can.
 //!
 //! # Why the repository is the transport
 //!
 //! A fork with no server has exactly one channel that every teammate is already
 //! connected to, already authenticated against, and already synchronises
-//! deliberately rather than in the background: the git repository. Notes stored
-//! in it arrive with `git pull`, survive going offline, review as part of a
-//! diff, and need no account. Nothing about them can break because a service is
+//! deliberately rather than in the background: the git repository. Records
+//! stored in it arrive with `git pull`, survive going offline, review as part
+//! of a diff, and need no account. Nothing here can break because a service is
 //! down, because there is no service.
 //!
-//! The cost is that notes move at the speed of pushes rather than keystrokes.
-//! That is the right trade for the thing being built -- a question about a line
-//! of code is not a chat message, and answering it hours later in the same
-//! place is fine.
+//! The cost is that they move at the speed of pushes rather than keystrokes.
+//! That is the right trade for work items and code questions, and the wrong one
+//! for chat -- which is the other reason this does not try to do chat.
 //!
 //! # Why JSONL
 //!
-//! One thread per line, sorted by id. A pretty-printed JSON array conflicts in
-//! git the moment two people add a thread, because both edits land on the same
+//! One record per line, sorted by id. A pretty-printed JSON array conflicts in
+//! git the moment two people add anything, because both edits land on the same
 //! closing bracket. Line-delimited records with stable ordering merge cleanly:
-//! two people adding threads touch different lines, and git resolves it without
-//! anyone being asked. A file format that generates merge conflicts is a file
-//! format nobody will keep using.
+//! two people adding records touch different lines, and git resolves it without
+//! anyone being asked. A format that generates merge conflicts is a format
+//! nobody will keep using.
 
 pub mod panel;
 
-pub use panel::{AddNote, TeamNotesPanel, ToggleFocus};
+pub use panel::{AddNote, NewTicket, TeamNotesPanel, ToggleFocus};
 
 use std::{
     collections::BTreeMap,
@@ -80,28 +87,171 @@ pub struct Anchor {
     pub text: String,
 }
 
-/// A conversation about one place in one file.
+/// What a record is for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// A question or remark about a specific line. Always anchored.
+    #[default]
+    Note,
+    /// A piece of work. Anchored only if it is about a specific place.
+    Ticket,
+}
+
+/// Where a ticket has got to.
+///
+/// Three states, not seven. A tracker with a rich workflow is a tracker
+/// somebody has to administer, and this one has to survive being edited by hand
+/// in a merge conflict.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    #[default]
+    Open,
+    InProgress,
+    Done,
+}
+
+impl Status {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::InProgress => "In Progress",
+            Self::Done => "Done",
+        }
+    }
+
+    /// The next state when the status is clicked. Cycles, so one control moves
+    /// a ticket all the way through and back.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Open => Self::InProgress,
+            Self::InProgress => Self::Done,
+            Self::Done => Self::Open,
+        }
+    }
+
+    pub fn is_closed(self) -> bool {
+        matches!(self, Self::Done)
+    }
+}
+
+/// A note or a ticket, with its replies.
+///
+/// One type for both, because the difference between them is two optional
+/// fields and everything else -- storage, merging, anchoring, replying,
+/// mentions -- is identical. Two types would be the same code twice.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoteThread {
     /// Sortable and unique. Sortable matters: the file is kept in id order so
-    /// two people writing notes produce a diff git can merge.
+    /// two people writing records produce a diff git can merge.
     pub id: String,
-    /// Worktree-relative, with forward slashes on every platform so a note
+    #[serde(default)]
+    pub kind: Kind,
+    /// Present for a note, and for a ticket that is about a particular place.
+    /// Worktree-relative with forward slashes on every platform, so a record
     /// written on Windows resolves on Linux.
-    pub file: String,
-    pub anchor: Anchor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Anchor>,
+    /// A ticket's own headline. Notes take their title from the first message,
+    /// because a note is a sentence and giving it a separate title would mean
+    /// writing the same thing twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub status: Status,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
     #[serde(default)]
     pub resolved: bool,
     pub messages: Vec<Message>,
 }
 
 impl NoteThread {
-    pub fn title(&self) -> &str {
+    /// What to show as the record's one-line summary.
+    pub fn headline(&self) -> &str {
+        if let Some(title) = self.title.as_deref()
+            && !title.is_empty()
+        {
+            return title;
+        }
         self.messages
             .first()
             .map(|message| message.body.as_str())
             .unwrap_or_default()
     }
+
+    /// Whether this record is finished, by whichever of its two mechanisms
+    /// applies.
+    pub fn is_closed(&self) -> bool {
+        match self.kind {
+            Kind::Note => self.resolved,
+            Kind::Ticket => self.status.is_closed(),
+        }
+    }
+
+    /// Everyone named with an `@` anywhere in the record, plus its assignee.
+    ///
+    /// Used to decide what belongs in someone's inbox. Names are compared
+    /// without case because a mention is typed by a person, and `@Drew` and
+    /// `@drew` are the same person.
+    pub fn mentions(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.assignee.iter().cloned().collect();
+        for message in &self.messages {
+            names.extend(extract_mentions(&message.body));
+        }
+        if let Some(title) = &self.title {
+            names.extend(extract_mentions(title));
+        }
+        names
+    }
+
+    /// Whether `name` should see this in their inbox.
+    pub fn concerns(&self, name: &str) -> bool {
+        self.mentions()
+            .iter()
+            .any(|mentioned| mentioned.eq_ignore_ascii_case(name))
+    }
+}
+
+/// Pulls `@name` out of a body.
+///
+/// A name runs until whitespace or punctuation that cannot be part of one, so
+/// `@drew,` and `@drew.` both mention drew. An `@` with nothing after it, or
+/// one inside an email address, is not a mention.
+pub fn extract_mentions(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let bytes = text.as_bytes();
+    let mut index = 0;
+
+    while let Some(offset) = text[index..].find('@') {
+        let at = index + offset;
+        index = at + 1;
+
+        // An `@` preceded by a word character is part of an address, not a
+        // mention.
+        if at > 0
+            && bytes
+                .get(at - 1)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        {
+            continue;
+        }
+
+        let rest = &text[at + 1..];
+        let end = rest
+            .find(|character: char| {
+                !(character.is_alphanumeric() || character == '-' || character == '_')
+            })
+            .unwrap_or(rest.len());
+        if end > 0 {
+            found.push(rest[..end].to_string());
+        }
+    }
+
+    found
 }
 
 /// Where a thread's anchor resolved to in the current text.
@@ -292,11 +442,15 @@ mod tests {
     fn thread(id: &str, line: u32, text: &str) -> NoteThread {
         NoteThread {
             id: id.to_string(),
-            file: "src/main.rs".to_string(),
-            anchor: Anchor {
+            kind: Kind::Note,
+            file: Some("src/main.rs".to_string()),
+            anchor: Some(Anchor {
                 line,
                 text: text.to_string(),
-            },
+            }),
+            title: None,
+            status: Status::Open,
+            assignee: None,
             resolved: false,
             messages: vec![Message {
                 author: "drew".into(),
@@ -310,7 +464,7 @@ mod tests {
     fn an_unmoved_line_resolves_exactly() {
         let lines = ["fn main() {", "    let x = 1;", "}"];
         assert_eq!(
-            resolve_anchor(&thread("a", 1, "let x = 1;").anchor, &lines),
+            resolve_anchor(thread("a", 1, "let x = 1;").anchor.as_ref().unwrap(), &lines),
             Resolution::Exact(1)
         );
     }
@@ -320,7 +474,7 @@ mod tests {
         let lines = ["// added", "// added", "fn main() {", "    let x = 1;", "}"];
         // Recorded at line 1, the text is now at line 3.
         assert_eq!(
-            resolve_anchor(&thread("a", 1, "let x = 1;").anchor, &lines),
+            resolve_anchor(thread("a", 1, "let x = 1;").anchor.as_ref().unwrap(), &lines),
             Resolution::Moved(3)
         );
     }
@@ -332,11 +486,11 @@ mod tests {
         // looks down first, so 4 is the answer -- what matters is that it is
         // one of the near ones and never 0 by accident of being first.
         assert_eq!(
-            resolve_anchor(&thread("a", 2, "}").anchor, &lines),
+            resolve_anchor(thread("a", 2, "}").anchor.as_ref().unwrap(), &lines),
             Resolution::Exact(2)
         );
         assert_eq!(
-            resolve_anchor(&thread("a", 3, "}").anchor, &lines),
+            resolve_anchor(thread("a", 3, "}").anchor.as_ref().unwrap(), &lines),
             Resolution::Moved(4)
         );
     }
@@ -344,7 +498,7 @@ mod tests {
     #[test]
     fn deleted_code_keeps_its_note_rather_than_losing_it() {
         let lines = ["fn main() {", "}"];
-        let resolution = resolve_anchor(&thread("a", 1, "let x = 1;").anchor, &lines);
+        let resolution = resolve_anchor(thread("a", 1, "let x = 1;").anchor.as_ref().unwrap(), &lines);
         assert!(resolution.has_drifted());
         // Clamped into the file, so jumping to it cannot land past the end.
         assert!(resolution.line() < lines.len() as u32);
@@ -354,7 +508,7 @@ mod tests {
     fn re_indentation_does_not_orphan_a_note() {
         let lines = ["fn main() {", "        let x = 1;", "}"];
         assert_eq!(
-            resolve_anchor(&thread("a", 1, "    let x = 1;").anchor, &lines),
+            resolve_anchor(thread("a", 1, "    let x = 1;").anchor.as_ref().unwrap(), &lines),
             Resolution::Exact(1)
         );
     }
@@ -383,7 +537,88 @@ mod tests {
         let second = serde_json::to_string(&thread("a", 9, "y")).unwrap();
         let parsed = parse(&format!("{first}\n{second}\n"));
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].anchor.line, 9);
+        assert_eq!(parsed[0].anchor.as_ref().unwrap().line, 9);
+    }
+
+    #[test]
+    fn a_note_written_before_tickets_existed_still_loads() {
+        // The fields tickets added are all defaulted, so a file written by an
+        // earlier build parses as an open note rather than failing the line --
+        // which would silently drop every note somebody already had.
+        let legacy = concat!(
+            r#"{"id":"a","file":"src/main.rs","#,
+            r#""anchor":{"line":3,"text":"let x = 1;"},"#,
+            r#""resolved":false,"#,
+            r#""messages":[{"author":"drew","at":"2026-01-01T00:00:00Z","body":"why?"}]}"#,
+        );
+        let parsed = parse(legacy);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, Kind::Note);
+        assert_eq!(parsed[0].status, Status::Open);
+        assert!(!parsed[0].is_closed());
+    }
+
+    #[test]
+    fn a_ticket_needs_no_file() {
+        let ticket = NoteThread {
+            id: "t".into(),
+            kind: Kind::Ticket,
+            file: None,
+            anchor: None,
+            title: Some("Ship the installer".into()),
+            status: Status::InProgress,
+            assignee: Some("drew".into()),
+            resolved: false,
+            messages: vec![],
+        };
+        let rendered = render(&[ticket.clone()]).unwrap();
+        assert_eq!(parse(&rendered), vec![ticket.clone()]);
+        assert_eq!(ticket.headline(), "Ship the installer");
+        assert!(!ticket.is_closed());
+    }
+
+    #[test]
+    fn a_ticket_is_closed_by_status_and_a_note_by_resolution() {
+        let mut ticket = NoteThread {
+            kind: Kind::Ticket,
+            status: Status::Done,
+            ..thread("t", 0, "x")
+        };
+        assert!(ticket.is_closed());
+        ticket.status = Status::Open;
+        assert!(!ticket.is_closed());
+
+        let mut note = thread("n", 0, "x");
+        assert!(!note.is_closed());
+        note.resolved = true;
+        assert!(note.is_closed());
+    }
+
+    #[test]
+    fn status_cycles_all_the_way_round() {
+        assert_eq!(Status::Open.next(), Status::InProgress);
+        assert_eq!(Status::InProgress.next(), Status::Done);
+        assert_eq!(Status::Done.next(), Status::Open);
+    }
+
+    #[test]
+    fn mentions_are_found_but_email_addresses_are_not() {
+        assert_eq!(extract_mentions("ping @drew and @sam-b"), vec!["drew", "sam-b"]);
+        assert!(extract_mentions("mail me at drew@example.com").is_empty());
+        assert!(extract_mentions("an @ on its own").is_empty());
+        assert_eq!(extract_mentions("@drew, thoughts?"), vec!["drew"]);
+    }
+
+    #[test]
+    fn a_record_concerns_its_assignee_and_anyone_mentioned() {
+        let mut record = thread("a", 0, "x");
+        record.assignee = Some("sam".into());
+        record.messages[0].body = "@Drew can you look".into();
+
+        assert!(record.concerns("sam"));
+        // Case does not matter: a mention is typed by a person.
+        assert!(record.concerns("drew"));
+        assert!(!record.concerns("alex"));
     }
 
     #[test]

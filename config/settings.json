@@ -71,8 +71,14 @@
           {
             "name": "nvidia/nemotron-3-super-120b-a12b",
             "display_name": "Nemotron 3 Super 120B",
-            "max_tokens": 16384,
-            "max_output_tokens": 16384,
+            // Measured against the endpoint, not guessed: a 260,024-token
+            // prompt is accepted. 16384 was the number here before, so the
+            // agent had been discarding context to fit a window sixteen times
+            // smaller than the one it actually had -- which is most of why it
+            // forgot what it had just read. 200k leaves room for the reply
+            // inside what was verified.
+            "max_tokens": 200000,
+            "max_output_tokens": 32768,
             "extra_body": {
               "chat_template_kwargs": { "enable_thinking": true }
             }

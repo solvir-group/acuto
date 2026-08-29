@@ -10,7 +10,7 @@
 //! as it is, because the panes you have open are your work and a named layout
 //! has no business discarding it.
 
-use agent_ui::AgentPanel;
+use agent_ui::{AgentPanel, agent_thread_item::AgentThreadItem};
 use db::kvp::GlobalKeyValueStore;
 use diagnostics::problems_panel::ProblemsPanel;
 use editor::Editor;
@@ -154,7 +154,18 @@ impl Layout {
     ) -> Vec<Entity<Pane>> {
         self.docks.apply(workspace, window, cx);
 
-        // Collapse first, in both cases. The grid then splits from a known
+        // The agent threads a previous preset opened are closed before anything
+        // else. `join_all_panes` merges panes but keeps every item, so without
+        // this the eight tabs from the last Agents run survive into the next
+        // layout, and the one after that, until the tab bar is unreadable.
+        //
+        // Only agent threads. Editors, terminals and settings are the user's
+        // work and a layout switch has no business closing them. A thread that
+        // is closed is not lost either -- it stays in the agent panel's history
+        // and can be reopened from there.
+        close_agent_threads(workspace, window, cx);
+
+        // Collapse next, in both cases. The grid then splits from a known
         // single pane rather than from whatever the last preset left behind.
         workspace.join_all_panes(window, cx);
 
@@ -209,6 +220,39 @@ fn builtin_layouts() -> Vec<Layout> {
             center: CenterLayout::Single,
         },
     ]
+}
+
+/// Closes every agent thread open as a pane item.
+///
+/// Closing is asynchronous -- an item can refuse, and the task carries that --
+/// but a thread has nothing to save, so the tasks are detached rather than
+/// awaited. Waiting would mean the layout could not be applied until every
+/// close resolved, and the close cannot fail in a way this could act on.
+fn close_agent_threads(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let panes: Vec<Entity<Pane>> = workspace.panes().to_vec();
+    for pane in panes {
+        let thread_items: Vec<gpui::EntityId> = pane
+            .read(cx)
+            .items()
+            .filter(|item| item.downcast::<AgentThreadItem>().is_some())
+            .map(|item| item.item_id())
+            .collect();
+
+        if thread_items.is_empty() {
+            continue;
+        }
+
+        pane.update(cx, |pane, cx| {
+            pane.close_items(window, cx, workspace::SaveIntent::Skip, &move |item_id| {
+                thread_items.contains(&item_id)
+            })
+            .detach_and_log_err(cx);
+        });
+    }
 }
 
 /// Splits the active pane into a `rows` by `columns` grid, in reading order.

@@ -55,6 +55,13 @@ pub fn request_prediction(
         .language()
         .map(|language| language.name().to_string());
 
+    // The grammar, for checking afterwards that whatever comes back parses.
+    // Taken here because `snapshot` moves into the background task.
+    let grammar = snapshot
+        .language()
+        .and_then(|language| language.grammar())
+        .map(|grammar| grammar.ts_language.clone());
+
     // Excerpts from elsewhere in the project, already retrieved for this
     // request by the same store the Zeta path uses. Dropping them -- which this
     // did -- is why completions invented functions that do not exist: the model
@@ -152,7 +159,34 @@ pub fn request_prediction(
             (response_received_at - request_start).as_secs_f64()
         );
 
-        let completion: Arc<str> = clean_fim_completion(&response_text).into();
+        let completion = clean_fim_completion(&response_text);
+
+        // Refuse anything that makes the file parse worse than it already did.
+        //
+        // A completion is inserted verbatim, so a model that closes a brace
+        // that was already closed, or opens one it never closes, produces code
+        // that does not compile -- and the person accepting it finds out later,
+        // somewhere else. This is the one property that can be checked here
+        // cheaply and exactly, so it is checked.
+        //
+        // Compared against the file as it stands rather than against zero:
+        // half-typed code is full of parse errors by definition, and a
+        // completion is not responsible for the ones that were already there.
+        let completion = match &grammar {
+            Some(language) if !completion.is_empty() => {
+                let cursor_offset = cursor_point.to_offset(&snapshot);
+                let text = snapshot.text();
+                if worsens_syntax(language, &text, cursor_offset, &completion) {
+                    log::debug!("fim: dropped a completion that added syntax errors");
+                    String::new()
+                } else {
+                    completion
+                }
+            }
+            _ => completion,
+        };
+
+        let completion: Arc<str> = completion.into();
         let edits = if completion.is_empty() {
             vec![]
         } else {
@@ -195,6 +229,126 @@ pub fn request_prediction(
             .await,
         ))
     })
+}
+
+/// Whether inserting `completion` at `offset` leaves the file with more syntax
+/// errors than it has now.
+///
+/// Both texts are parsed from scratch. That is more work than reusing the
+/// buffer's existing tree, and it is work done once per accepted-looking
+/// completion on a background thread, against an excerpt-sized string -- next
+/// to a network round trip it does not register.
+///
+/// Any failure to parse either version returns `false`. The gate exists to
+/// remove bad completions, not to become a second way for good ones to
+/// disappear.
+fn worsens_syntax(
+    language: &tree_sitter::Language,
+    text: &str,
+    offset: usize,
+    completion: &str,
+) -> bool {
+    let Some(before) = error_count(language, text) else {
+        return false;
+    };
+
+    let mut after_text = String::with_capacity(text.len() + completion.len());
+    if !text.is_char_boundary(offset) {
+        return false;
+    }
+    after_text.push_str(&text[..offset]);
+    after_text.push_str(completion);
+    after_text.push_str(&text[offset..]);
+
+    let Some(after) = error_count(language, &after_text) else {
+        return false;
+    };
+
+    after > before
+}
+
+/// Counts the error and missing nodes in `text`, or `None` if it cannot be
+/// parsed at all.
+fn error_count(language: &tree_sitter::Language, text: &str) -> Option<usize> {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(language).ok()?;
+    let tree = parser.parse(text, None)?;
+
+    let mut count = 0;
+    let mut cursor = tree.walk();
+    let mut descend = true;
+    loop {
+        if descend {
+            let node = cursor.node();
+            // `is_error` is a node the parser could not place; `is_missing` is
+            // one it inserted to recover. Both are the parser saying the text
+            // is not what the grammar describes, and both matter here.
+            if node.is_error() || node.is_missing() {
+                count += 1;
+            }
+        }
+
+        if descend && cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            descend = true;
+            continue;
+        }
+        if !cursor.goto_parent() {
+            break;
+        }
+        descend = false;
+    }
+
+    Some(count)
+}
+
+#[cfg(test)]
+mod syntax_gate_tests {
+    use super::*;
+
+    fn rust() -> tree_sitter::Language {
+        tree_sitter_rust::LANGUAGE.into()
+    }
+
+    #[test]
+    fn a_completion_that_finishes_the_line_is_kept() {
+        let text = "fn main() {\n    let x = \n}\n";
+        let offset = text.find("\n}").unwrap();
+        assert!(!worsens_syntax(&rust(), text, offset, "1;"));
+    }
+
+    #[test]
+    fn a_completion_that_leaves_a_brace_open_is_refused() {
+        let text = "fn main() {\n    \n}\n";
+        let offset = text.find("\n}").unwrap();
+        assert!(worsens_syntax(&rust(), text, offset, "if x {"));
+    }
+
+    #[test]
+    fn a_completion_that_duplicates_a_closing_brace_is_refused() {
+        let text = "fn main() {\n    let x = 1;\n}\n";
+        let offset = text.find("\n}").unwrap();
+        assert!(worsens_syntax(&rust(), text, offset, "\n}\n}"));
+    }
+
+    #[test]
+    fn errors_already_in_the_file_are_not_blamed_on_the_completion() {
+        // The stray `@#$` is broken before anything is inserted. A completion
+        // that adds nothing wrong must still be allowed through.
+        let text = "fn main() {\n    @#$\n    let x = \n}\n";
+        let offset = text.find("\n}").unwrap();
+        assert!(!worsens_syntax(&rust(), text, offset, "1;"));
+    }
+
+    #[test]
+    fn an_offset_inside_a_character_is_refused_rather_than_panicking() {
+        let text = "let caf\u{00e9} = 1;";
+        // One byte into the two-byte `\u{00e9}`.
+        let offset = text.find('\u{00e9}').unwrap() + 1;
+        assert!(!worsens_syntax(&rust(), text, offset, "x"));
+    }
 }
 
 /// Renders retrieved excerpts as a block a chat model can read.

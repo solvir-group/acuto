@@ -141,10 +141,31 @@ impl TerminalPanel {
                 let focus_handle = pane.focus_handle(cx);
                 let right_children = h_flex()
                     .gap(DynamicSpacing::Base02.rems(cx))
+                    // `+` opens a terminal. It used to open a menu whose first
+                    // entry was "New Terminal", which is two clicks and a read
+                    // to do the only thing anyone presses `+` in a terminal
+                    // panel for. The rest of the menu moved to the chevron
+                    // beside it, the shape the editor tab bar already uses.
+                    .child(
+                        IconButton::new("plus", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("New Terminal"))
+                            .on_click({
+                                let focus_handle = focus_handle.clone();
+                                move |_, window, cx| {
+                                    focus_handle.dispatch_action(
+                                        &workspace::NewTerminal::default(),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }),
+                    )
                     .child(
                         PopoverMenu::new("terminal-tab-bar-popover-menu")
                             .trigger_with_tooltip(
-                                IconButton::new("plus", IconName::Plus).icon_size(IconSize::Small),
+                                IconButton::new("more-new-terminal", IconName::ChevronDown)
+                                    .icon_size(IconSize::Small),
                                 Tooltip::text("New…"),
                             )
                             .anchor(Anchor::TopRight)

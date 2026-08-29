@@ -826,36 +826,46 @@ pub fn open_skill_creator(
 ///
 /// One instance per workspace: settings are global, so a second tab would show
 /// the same values twice and let the two disagree about which page is open.
+///
+/// Takes the workspace as a handle and `&mut App` rather than as `&mut
+/// Workspace` and its `Context`, because `SettingsWindow::new` reads every open
+/// workspace to find their projects. Constructing it while one of those
+/// workspaces is leased for an update is a double lease, and gpui panics --
+/// which is exactly what opening settings used to do.
 fn open_settings_item(
-    workspace: &mut Workspace,
+    workspace: Entity<Workspace>,
     window: &mut Window,
-    cx: &mut Context<Workspace>,
+    cx: &mut App,
     callback: impl FnOnce(&mut SettingsWindow, &mut Window, &mut Context<SettingsWindow>) + 'static,
 ) {
     telemetry::event!("Settings Viewed");
 
     let existing = workspace
+        .read(cx)
         .items_of_type::<SettingsWindow>(cx)
         .next()
         .filter(|item| item.read(cx).embedded);
 
     let settings_view = match existing {
-        Some(existing) => {
-            workspace.activate_item(&existing, true, true, window, cx);
-            existing
-        }
+        Some(existing) => existing,
         None => {
             let settings_view = cx.new(|cx| SettingsWindow::new_embedded(window, cx));
-            workspace.add_item_to_active_pane(
-                Box::new(settings_view.clone()),
-                None,
-                true,
-                window,
-                cx,
-            );
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(
+                    Box::new(settings_view.clone()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+            });
             settings_view
         }
     };
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.activate_item(&settings_view, true, true, window, cx);
+    });
 
     settings_view.update(cx, |settings_view, cx| {
         callback(settings_view, window, cx);
@@ -896,9 +906,7 @@ fn open_settings_editor_with(
         handle
             .update(cx, |multi_workspace, window, cx| {
                 let workspace = multi_workspace.workspace().clone();
-                workspace.update(cx, |workspace, cx| {
-                    open_settings_item(workspace, window, cx, callback);
-                });
+                open_settings_item(workspace, window, cx, callback);
             })
             .log_err();
     });
