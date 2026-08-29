@@ -25,13 +25,34 @@ use windows::{
 
 use crate::{Args, OpenListener, RawOpenRequest};
 
+/// What names this instance's mutex and pipe.
+///
+/// The release channel alone is not enough: `--user-data-dir` is how a build is
+/// run against its own configuration and database, and two such runs are two
+/// different editors that must not adopt each other's windows. Including the
+/// data directory means same directory joins the running instance, different
+/// directory gets its own -- which is what the flag is for.
+fn instance_key() -> String {
+    let data_dir = paths::data_dir().to_string_lossy().to_lowercase();
+
+    // A hash rather than the path itself: a Windows object name cannot contain
+    // a backslash, and is capped well below the length of a real path.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in data_dir.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    format!("{}-{hash:016x}", app_identifier())
+}
+
 #[inline]
 fn is_first_instance() -> bool {
     unsafe {
         CreateMutexW(
             None,
             false,
-            &HSTRING::from(format!("{}-Instance-Mutex", app_identifier())),
+            &HSTRING::from(format!("{}-Instance-Mutex", instance_key())),
         )
         .expect("Unable to create instance mutex.")
     };
@@ -64,7 +85,7 @@ pub fn handle_single_instance(opener: OpenListener, args: &Args) -> bool {
 fn with_pipe(f: &dyn Fn(String)) {
     let pipe = unsafe {
         CreateNamedPipeW(
-            &HSTRING::from(format!("\\\\.\\pipe\\{}-Named-Pipe", app_identifier())),
+            &HSTRING::from(format!("\\\\.\\pipe\\{}-Named-Pipe", instance_key())),
             PIPE_ACCESS_INBOUND,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             1,
@@ -209,7 +230,7 @@ fn send_args_to_instance(args: &Args) -> anyhow::Result<()> {
 fn write_message_to_instance_pipe(message: &[u8]) -> anyhow::Result<()> {
     unsafe {
         let pipe = CreateFileW(
-            &HSTRING::from(format!("\\\\.\\pipe\\{}-Named-Pipe", app_identifier())),
+            &HSTRING::from(format!("\\\\.\\pipe\\{}-Named-Pipe", instance_key())),
             GENERIC_WRITE.0,
             FILE_SHARE_MODE::default(),
             None,

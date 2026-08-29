@@ -222,12 +222,17 @@ fn builtin_layouts() -> Vec<Layout> {
     ]
 }
 
-/// Closes every agent thread open as a pane item.
+/// Removes every agent thread that is open as a pane item.
 ///
-/// Closing is asynchronous -- an item can refuse, and the task carries that --
-/// but a thread has nothing to save, so the tasks are detached rather than
-/// awaited. Waiting would mean the layout could not be applied until every
-/// close resolved, and the close cannot fail in a way this could act on.
+/// `remove_item` rather than `close_items`, which is the obvious choice and the
+/// wrong one: closing is asynchronous, because an item may need saving and may
+/// refuse. The caller collapses the panes immediately afterwards, so the
+/// detached close tasks would resolve against panes that no longer hold the
+/// items -- and the threads survived into the next layout, and the one after
+/// that, which is exactly the symptom this was meant to fix.
+///
+/// A thread has nothing to save and nothing to refuse, so removing it directly
+/// is both correct and complete before the next line runs.
 fn close_agent_threads(
     workspace: &mut Workspace,
     window: &mut Window,
@@ -242,15 +247,12 @@ fn close_agent_threads(
             .map(|item| item.item_id())
             .collect();
 
-        if thread_items.is_empty() {
-            continue;
-        }
-
         pane.update(cx, |pane, cx| {
-            pane.close_items(window, cx, workspace::SaveIntent::Skip, &move |item_id| {
-                thread_items.contains(&item_id)
-            })
-            .detach_and_log_err(cx);
+            for item_id in thread_items {
+                // Never close the pane itself: the grid is about to split from
+                // it, and the layout below counts on it still being there.
+                pane.remove_item(item_id, false, false, window, cx);
+            }
         });
     }
 }

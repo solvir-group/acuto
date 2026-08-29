@@ -47,7 +47,7 @@ use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use parking_lot::Mutex;
 use project::{project_settings::ProjectSettings, trusted_worktrees};
 use recent_projects::{RemoteSettings, open_remote_project};
-use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
+use release_channel::{AppCommitSha, AppVersion};
 use session::{AppSession, Session};
 use settings::{BaseKeymap, Settings, SettingsStore, watch_config_file};
 use smol::future::poll_once;
@@ -411,9 +411,17 @@ fn main() {
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
-    let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
-        || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
-    {
+    // Upstream also skips this whole check on the Dev channel, so that several
+    // development builds can run side by side. In this fork the dev build *is*
+    // the product, and skipping it meant every `zed.exe <path>` started a
+    // separate process with its own window -- so `code index.html` in the
+    // integrated terminal opened the file in a brand new one-file project
+    // instead of the window the terminal was sitting in.
+    //
+    // `ZED_STATELESS` is still the way to get an isolated instance, and
+    // instances are keyed by data directory (see `windows_only_instance`), so
+    // running against a different `--user-data-dir` still gets its own process.
+    let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS {
         false
     } else {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]

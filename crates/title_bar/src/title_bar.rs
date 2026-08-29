@@ -939,22 +939,33 @@ impl TitleBar {
     /// is about the file you are editing. They are about the project and about
     /// the editor, which is what this row is already for.
     fn render_top_bar_extras(&self, remote_url: Option<String>, _cx: &App) -> AnyElement {
-        let repository_button = remote_url.and_then(|url| {
-            let web_url = web_url_for_remote(&url)?;
-            let icon = hosting_icon_for(&web_url);
-            let label = SharedString::from(format!("Open {web_url}"));
-            Some(
+        // Always present, so it is somewhere rather than somewhere-conditional.
+        // A project with no remote gets the generic mark, disabled, saying why:
+        // a button that vanishes reads as a bug, and this one was reported as
+        // one twice.
+        let web_url = remote_url.and_then(|url| web_url_for_remote(&url));
+        let repository_button = match web_url {
+            Some(web_url) => {
+                let icon = hosting_icon_for(&web_url);
+                let label = SharedString::from(format!("Open {web_url}"));
                 IconButton::new("top-bar-repository", icon)
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text(label))
-                    .on_click(move |_, _, cx| cx.open_url(&web_url)),
-            )
-        });
+                    .on_click(move |_, _, cx| cx.open_url(&web_url))
+            }
+            None => IconButton::new("top-bar-repository", IconName::Link)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Disabled)
+                .disabled(true)
+                .tooltip(Tooltip::text(
+                    "This project has no git remote to open",
+                )),
+        };
 
         let has_destination = !Self::FEATURE_REQUEST_URL.is_empty();
         let workspace = self.workspace.clone();
-        let feature_request = IconButton::new("top-bar-feature-request", IconName::Envelope)
+        let feature_request = IconButton::new("top-bar-feature-request", IconName::Star)
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
             .tooltip(Tooltip::text(if has_destination {
@@ -986,7 +997,7 @@ impl TitleBar {
         h_flex()
             .gap_0p5()
             .pr_2()
-            .children(repository_button)
+            .child(repository_button)
             .child(feature_request)
             .into_any_element()
     }

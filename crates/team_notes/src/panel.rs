@@ -37,19 +37,27 @@ enum Filter {
     /// Assigned to you or mentioning you. The first thing to look at, so it is
     /// the first tab and the default.
     Inbox,
-    Notes,
+    Messages,
     Tickets,
+    Notes,
     All,
 }
 
 impl Filter {
-    const ALL: [Filter; 4] = [Filter::Inbox, Filter::Notes, Filter::Tickets, Filter::All];
+    const ALL: [Filter; 5] = [
+        Filter::Inbox,
+        Filter::Messages,
+        Filter::Tickets,
+        Filter::Notes,
+        Filter::All,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Inbox => "Inbox",
-            Self::Notes => "Notes",
+            Self::Messages => "Messages",
             Self::Tickets => "Tickets",
+            Self::Notes => "Notes",
             Self::All => "All",
         }
     }
@@ -57,6 +65,7 @@ impl Filter {
     fn admits(self, record: &NoteThread, me: &str) -> bool {
         match self {
             Self::Inbox => record.concerns(me),
+            Self::Messages => record.kind == Kind::Message,
             Self::Notes => record.kind == Kind::Note,
             Self::Tickets => record.kind == Kind::Ticket,
             Self::All => true,
@@ -85,6 +94,8 @@ enum Draft {
     Note { file: String, anchor: Anchor },
     /// A ticket, which may or may not be about a place in the code.
     Ticket,
+    /// A message to the team.
+    Message,
 }
 
 pub struct TeamNotesPanel {
@@ -332,6 +343,21 @@ impl TeamNotesPanel {
                 resolved: false,
                 messages: Vec::new(),
             },
+            Draft::Message => NoteThread {
+                id: crate::new_thread_id(),
+                kind: Kind::Message,
+                file: None,
+                anchor: None,
+                title: None,
+                status: Status::Open,
+                assignee,
+                resolved: false,
+                messages: vec![Message {
+                    author: self.author.to_string(),
+                    at: crate::now_timestamp(),
+                    body,
+                }],
+            },
         };
 
         let mut records = self.records.clone();
@@ -374,14 +400,50 @@ impl TeamNotesPanel {
         cx.notify();
     }
 
-    /// Moves a record forward: a ticket to its next status, a note between open
-    /// and resolved.
+    /// Moves a record forward: a ticket to its next status, anything else
+    /// between open and resolved.
     fn advance(&mut self, id: &str, cx: &mut Context<Self>) {
         let mut records = self.records.clone();
         if let Some(record) = records.iter_mut().find(|record| record.id == id) {
             match record.kind {
                 Kind::Ticket => record.status = record.status.next(),
-                Kind::Note => record.resolved = !record.resolved,
+                Kind::Note | Kind::Message => record.resolved = !record.resolved,
+            }
+        }
+        self.commit(records, cx);
+    }
+
+    /// Marks a record finished in one click, wherever it currently is.
+    ///
+    /// Separate from `advance`, which cycles: getting a ticket to Done from
+    /// Open takes two clicks through In Progress, and "this is finished" is the
+    /// thing you most often want to say.
+    fn complete(&mut self, id: &str, cx: &mut Context<Self>) {
+        let mut records = self.records.clone();
+        if let Some(record) = records.iter_mut().find(|record| record.id == id) {
+            let finished = record.is_closed();
+            match record.kind {
+                Kind::Ticket => {
+                    record.status = if finished { Status::Open } else { Status::Done }
+                }
+                Kind::Note | Kind::Message => record.resolved = !finished,
+            }
+        }
+        self.commit(records, cx);
+    }
+
+    /// Turns a message into a ticket, keeping what was already said.
+    ///
+    /// The common path: something is raised in conversation and turns out to be
+    /// work. Retyping it into a tracker is where the detail gets lost.
+    fn promote_to_ticket(&mut self, id: &str, cx: &mut Context<Self>) {
+        let mut records = self.records.clone();
+        if let Some(record) = records.iter_mut().find(|record| record.id == id) {
+            if record.kind == Kind::Message {
+                record.kind = Kind::Ticket;
+                record.title = Some(record.headline().to_string());
+                record.status = Status::Open;
+                record.resolved = false;
             }
         }
         self.commit(records, cx);
@@ -516,10 +578,10 @@ impl TeamNotesPanel {
                     .min_w_0()
                     .gap_1()
                     .child(
-                        Icon::new(if is_ticket {
-                            IconName::ListTodo
-                        } else {
-                            IconName::Chat
+                        Icon::new(match record.kind {
+                            Kind::Ticket => IconName::ListTodo,
+                            Kind::Message => IconName::Chat,
+                            Kind::Note => IconName::Pin,
                         })
                         .size(IconSize::XSmall)
                         .color(status_color),
@@ -620,6 +682,45 @@ impl TeamNotesPanel {
                             let id = id.clone();
                             move |this, _, _window, cx| this.take_ownership(&id, cx)
                         })),
+                    )
+                    .when(record.kind == Kind::Message, |this| {
+                        this.child(
+                            Button::new(
+                                SharedString::from(format!("promote-{}", record.id)),
+                                "Make Ticket",
+                            )
+                            .label_size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .tooltip(Tooltip::text(
+                                "Turn this into a ticket, keeping the conversation",
+                            ))
+                            .on_click(cx.listener({
+                                let id = id.clone();
+                                move |this, _, _window, cx| this.promote_to_ticket(&id, cx)
+                            })),
+                        )
+                    })
+                    // Done in one click, wherever the record currently is. The
+                    // status button cycles, which takes two clicks to finish a
+                    // ticket that has not been started.
+                    .child(
+                        IconButton::new(
+                            SharedString::from(format!("complete-{}", record.id)),
+                            IconName::Check,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(if closed { Color::Success } else { Color::Muted })
+                        .tooltip(Tooltip::text(if closed {
+                            "Reopen"
+                        } else if is_ticket {
+                            "Mark this ticket done"
+                        } else {
+                            "Mark this resolved"
+                        }))
+                        .on_click(cx.listener({
+                            let id = id.clone();
+                            move |this, _, _window, cx| this.complete(&id, cx)
+                        })),
                     ),
             )
             .into_any_element()
@@ -692,6 +793,21 @@ impl Render for TeamNotesPanel {
                             .child(
                                 h_flex()
                                     .gap_1()
+                                    .child(
+                                        IconButton::new("new-message", IconName::Chat)
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Muted)
+                                            .tooltip(Tooltip::text("New Message"))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.filter = Filter::Messages;
+                                                this.open_composer(
+                                                    Draft::Message,
+                                                    "Say something to the team. @mention to reach someone.",
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
                                     .child(
                                         IconButton::new("new-ticket", IconName::Plus)
                                             .icon_size(IconSize::Small)
@@ -770,6 +886,7 @@ impl Render for TeamNotesPanel {
                         let where_to = match draft {
                             Draft::Note { file, anchor } => format!("{file}:{}", anchor.line + 1),
                             Draft::Ticket => "New ticket".to_string(),
+                            Draft::Message => "New message".to_string(),
                         };
                         this.child(
                             v_flex()
@@ -801,6 +918,7 @@ impl Render for TeamNotesPanel {
                                 .child(
                                     Label::new(match filter {
                                         Filter::Inbox => "Nothing waiting on you",
+                                        Filter::Messages => "No messages",
                                         Filter::Notes => "No notes",
                                         Filter::Tickets => "No tickets",
                                         Filter::All => "Nothing here yet",
@@ -809,10 +927,12 @@ impl Render for TeamNotesPanel {
                                 )
                                 .child(
                                     Label::new(
-                                        "Notes attach to a line: put the cursor on one and run \
-                                         `team notes: add note`. Tickets are the + above. Both \
-                                         are written to .acuto/notes.jsonl and travel with the \
-                                         repository, so your team gets them on the next pull.",
+                                        "Messages and tickets are the two buttons above; a note \
+                                         attaches to a line, so put the cursor on one and run \
+                                         `team notes: add note`. Everything is written to \
+                                         .acuto/notes.jsonl and travels with the repository, so \
+                                         your team sees it on the next pull -- no account, no \
+                                         server, and it reviews as part of the diff.",
                                     )
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
@@ -862,8 +982,10 @@ impl Panel for TeamNotesPanel {
         px(340.)
     }
 
+    /// Not `Chat`: the agent's toggle in the title bar already uses that, and
+    /// two chat icons that open different things is a coin toss every time.
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        Some(IconName::Chat)
+        Some(IconName::ListTodo)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {

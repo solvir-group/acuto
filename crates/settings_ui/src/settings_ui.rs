@@ -3365,6 +3365,36 @@ impl SettingsWindow {
                     )
                     .vertical_scrollbar_for(&self.navbar_scroll_handle, window, cx),
             )
+            // Extensions sit with the settings rather than behind a separate
+            // command, because installing one is configuring the editor and
+            // that is what someone in this window is doing. Below the tree
+            // rather than in it: the tree's entries are pages of this settings
+            // view, and this opens a tab of its own.
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_shrink_0()
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        Button::new("settings-nav-extensions", "Extensions")
+                            .start_icon(
+                                Icon::new(IconName::Blocks)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .full_width()
+                            .on_click(|_, window, cx| {
+                                if let Some(action) = cx
+                                    .build_action("zed::Extensions", None)
+                                    .log_err()
+                                {
+                                    window.dispatch_action(action, cx);
+                                }
+                            }),
+                    ),
+            )
             .child(
                 h_flex()
                     .w_full()

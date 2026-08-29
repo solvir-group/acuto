@@ -4413,16 +4413,18 @@ fn default_render_tab_bar_buttons(
     let right_children = h_flex()
         // Instead we need to replicate the spacing from the [TabBar]'s `end_slot` here.
         .gap(DynamicSpacing::Base04.rems(cx))
-        // `+` opens a Launchpad tab rather than an untitled buffer, so the next
-        // thing you do is a choice instead of an assumption that you want to type
-        // code. The full New… menu is still on the chevron beside it.
+        // `+` makes a new file. It used to open a Launchpad tab, on the theory
+        // that the next thing you do should be a choice -- but the button is
+        // pressed to get a tab, and answering with a menu of things you did not
+        // ask for is a step, not a choice. The Launchpad still fills an empty
+        // pane, which is where it was actually useful.
         .child(
             IconButton::new("new-tab", IconName::Plus)
                 .icon_size(IconSize::Small)
-                .tooltip(Tooltip::text("New Tab"))
+                .tooltip(Tooltip::text("New File"))
                 .on_click(cx.listener(|pane, _, window, cx| {
-                    let launchpad = cx.new(|cx| crate::launchpad::Launchpad::new(cx));
-                    pane.add_item(Box::new(launchpad), true, true, None, window, cx);
+                    let focus_handle = pane.focus_handle(cx);
+                    focus_handle.dispatch_action(&NewFile, window, cx);
                 })),
         )
         .child(

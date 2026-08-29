@@ -17,8 +17,13 @@
   // Inter is NOT currently installed on this machine, so this renders Segoe UI
   // Variable through the fallback until it is. DirectWrite refreshes the system
   // collection on a miss, so installing Inter should take effect without an edit.
-  "ui_font_family": "Inter",
-  "ui_font_fallbacks": ["Segoe UI Variable", "Segoe UI"],
+  // Segoe UI Variable first, because it is actually on this machine. Naming a
+  // font that is not installed leaves the choice to the font system, and after
+  // Berkeley Mono was installed the whole interface came back monospace --
+  // menus, panels and all. A first entry that resolves means the fallbacks
+  // never have to be guessed at.
+  "ui_font_family": "Segoe UI",
+  "ui_font_fallbacks": ["Segoe UI Variable Text", "Inter"],
   "ui_font_size": 15.5,
   "ui_font_weight": 400,
 
@@ -26,8 +31,13 @@
   // Cascadia Mono via the fallback until it is. DirectWrite refreshes the system
   // font collection on a miss and retries, so installing it should take effect
   // without editing this file again. Test Söhne Mono to return later.
-  "buffer_font_family": "Consolas",
-  "buffer_font_fallbacks": ["Cascadia Mono", "JetBrains Mono"],
+  // Berkeley Mono, installed per-user from the trial download rather than
+  // bundled: the trial licence does not cover redistribution, so the font
+  // lives in the user's own font directory and this names it. The trial build
+  // carries 95 glyphs -- ASCII and little else -- so the fallbacks below are
+  // load-bearing for anything outside it rather than decorative.
+  "buffer_font_family": "Berkeley Mono Trial",
+  "buffer_font_fallbacks": ["Consolas", "Cascadia Mono"],
   "buffer_font_size": 14,
   "buffer_font_weight": 400,
   // 1.75 was the original spec value, but JetBrains Mono has a tall x-height
@@ -36,8 +46,8 @@
   "buffer_line_height": { "custom": 1.5 },
 
   // Agent panel: sans for responses, mono for user messages, matching the editor.
-  "agent_ui_font_family": "Inter",
-  "agent_buffer_font_family": "Inter",
+  "agent_ui_font_family": "Segoe UI",
+  "agent_buffer_font_family": "Segoe UI",
 
   // UNSTABLE upstream ("expect many elements to be broken"). It is the single
   // biggest lever on density. FIRST THING TO REMOVE if the UI looks wrong.
@@ -145,7 +155,8 @@
     "env": {
       "EDITOR": "C:/Users/broad/zed/target/debug/zed.exe --user-data-dir C:/Users/broad/zed-fork-data --wait"
     },
-    "font_family": "Consolas",
+    "font_family": "Berkeley Mono Trial",
+    "font_fallbacks": ["Consolas", "Cascadia Mono"],
     "font_size": 14,
     "line_height": { "custom": 1.5 }
   },

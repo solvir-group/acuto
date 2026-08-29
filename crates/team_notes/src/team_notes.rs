@@ -96,6 +96,14 @@ pub enum Kind {
     Note,
     /// A piece of work. Anchored only if it is about a specific place.
     Ticket,
+    /// Something said to the team that is not about a line and is not work.
+    ///
+    /// Deliberately the same record as the other two, with the same replies and
+    /// the same `@mentions`. A separate chat system would need its own storage,
+    /// its own sync and its own inbox, and would still be worse at chat than
+    /// the tool everyone already has open. What this adds is a message that can
+    /// become a ticket without being retyped.
+    Message,
 }
 
 /// Where a ticket has got to.
@@ -187,7 +195,7 @@ impl NoteThread {
     /// applies.
     pub fn is_closed(&self) -> bool {
         match self.kind {
-            Kind::Note => self.resolved,
+            Kind::Note | Kind::Message => self.resolved,
             Kind::Ticket => self.status.is_closed(),
         }
     }
@@ -619,6 +627,17 @@ mod tests {
         // Case does not matter: a mention is typed by a person.
         assert!(record.concerns("drew"));
         assert!(!record.concerns("alex"));
+    }
+
+    #[test]
+    fn a_message_is_closed_by_resolution_like_a_note() {
+        let mut message = NoteThread {
+            kind: Kind::Message,
+            ..thread("m", 0, "x")
+        };
+        assert!(!message.is_closed());
+        message.resolved = true;
+        assert!(message.is_closed());
     }
 
     #[test]

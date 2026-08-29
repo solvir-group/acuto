@@ -294,10 +294,76 @@ async fn send_chat_completion_request(
         .unwrap_or_default()
         .to_string();
 
-    Ok((
-        trim_overlap_with_buffer(clean_chat_completion(text), caret.prefix, caret.suffix),
-        request_id,
-    ))
+    let completion = clean_chat_completion(text);
+    let completion = trim_overlap_with_buffer(completion, caret.prefix, caret.suffix);
+    let completion = stop_at_repeated_line(completion, caret.suffix);
+    Ok((cap_lines(completion), request_id))
+}
+
+/// Cuts the completion at the first line that already appears just after the
+/// caret.
+///
+/// The overlap trim only catches repetition that touches the caret exactly. The
+/// commoner failure is a model that writes two plausible lines and then
+/// re-emits a line from further down the file -- the text still parses, so the
+/// syntax gate passes it, and the user gets a duplicated statement they have to
+/// spot and undo.
+///
+/// Only lines with something on them: a blank line or a lone brace appears
+/// everywhere, and cutting on those would truncate almost every completion.
+fn stop_at_repeated_line(completion: String, suffix: &str) -> String {
+    /// A line shorter than this is punctuation, not content.
+    const MIN_MEANINGFUL: usize = 4;
+    /// How far ahead to look. Repetition beyond this is not the model echoing
+    /// what it was shown, it is a coincidence.
+    const LOOKAHEAD_LINES: usize = 30;
+
+    let ahead: Vec<&str> = suffix
+        .lines()
+        .take(LOOKAHEAD_LINES)
+        .map(str::trim)
+        .filter(|line| line.len() >= MIN_MEANINGFUL)
+        .collect();
+    if ahead.is_empty() {
+        return completion;
+    }
+
+    let mut kept = String::new();
+    for (index, line) in completion.split_inclusive('\n').enumerate() {
+        let trimmed = line.trim();
+        // The first line continues what the caret is on, so it is judged by the
+        // overlap trim rather than here.
+        if index > 0 && trimmed.len() >= MIN_MEANINGFUL && ahead.contains(&trimmed) {
+            break;
+        }
+        kept.push_str(line);
+    }
+
+    kept
+}
+
+/// Bounds how much a completion may be.
+///
+/// Inline completions are read at a glance while typing. Past a few lines the
+/// reader cannot check it faster than writing it, so a long one is not a better
+/// suggestion, it is a worse interaction -- and a chat model handed a file will
+/// happily produce twenty.
+fn cap_lines(completion: String) -> String {
+    /// Two lines after the one the caret is on. Enough for a closing brace or
+    /// a return, not enough to write a function nobody asked for.
+    const MAX_LINES: usize = 3;
+
+    let mut kept = String::new();
+    for (index, line) in completion.split_inclusive('\n').enumerate() {
+        if index >= MAX_LINES {
+            break;
+        }
+        kept.push_str(line);
+    }
+
+    // A trailing newline would put the caret on a blank line after accepting,
+    // which is never what was wanted.
+    kept.trim_end_matches(['\n', '\r']).to_string()
 }
 
 /// Removes the parts of a completion that duplicate what is already in the
@@ -418,6 +484,35 @@ mod tests {
         assert_eq!(clean_chat_completion("```rust\n.sum()"), ".sum()");
         // A fence with nothing after it says nothing.
         assert_eq!(clean_chat_completion("```"), "");
+    }
+
+    #[test]
+    fn a_line_that_already_appears_ahead_ends_the_completion() {
+        let suffix = "\n    document.getElementById(\"score\").innerText = score;\n}\n";
+        let completion = "score++;\n    document.getElementById(\"score\").innerText = score;\n";
+        assert_eq!(
+            stop_at_repeated_line(completion.into(), suffix),
+            "score++;\n"
+        );
+    }
+
+    #[test]
+    fn punctuation_lines_do_not_end_the_completion() {
+        // `}` appears everywhere; cutting on it would truncate almost anything.
+        let suffix = "\n}\n";
+        let completion = "if (x) {\n  y();\n}\n";
+        assert_eq!(
+            stop_at_repeated_line(completion.clone().into(), suffix),
+            completion
+        );
+    }
+
+    #[test]
+    fn a_completion_is_capped_and_loses_its_trailing_newline() {
+        assert_eq!(cap_lines("one\ntwo\nthree\nfour\n".into()), "one\ntwo\nthree");
+        assert_eq!(cap_lines("only\n".into()), "only");
+        assert_eq!(cap_lines("a + b".into()), "a + b");
+        assert_eq!(cap_lines(String::new()), "");
     }
 
     #[test]

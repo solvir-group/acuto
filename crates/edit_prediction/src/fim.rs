@@ -14,6 +14,16 @@ use zeta_prompt::{Zeta2PromptInput, compute_editable_and_context_ranges};
 
 const FIM_CONTEXT_TOKENS: usize = 512;
 
+/// How much of the file a chat model is shown before the caret.
+///
+/// Enough to see the enclosing function and how the file is written; not so
+/// much that the request reads as "continue this file".
+const PREFIX_LINES: usize = 60;
+
+/// And after it. Smaller, because what comes next mostly serves to stop the
+/// model from re-writing it.
+const SUFFIX_LINES: usize = 20;
+
 struct FimRequestOutput {
     request_id: String,
     edits: Vec<(std::ops::Range<Anchor>, Arc<str>)>,
@@ -121,14 +131,21 @@ pub fn request_prediction(
         let stop_tokens = get_fim_stop_tokens();
         let display_path = full_path.to_string_lossy().into_owned();
 
-        // A chat model is given the whole cursor excerpt rather than the narrow
-        // editable window the fill-in-the-middle template uses. The editable
-        // window is deliberately small because a FIM model only needs to see
-        // where the hole is; a chat model has to work out what the code around
-        // it means, and 512 tokens is not enough to do that.
+        // A bounded window around the caret -- not the whole 8k-token excerpt.
+        //
+        // Given a large slice of a file, a chat model stops completing and
+        // starts continuing: it writes the next several constructs, repeating
+        // things that are already further down, because that is what "here is a
+        // file, carry on" means to it. A window it cannot mistake for the whole
+        // file keeps the task legible as "finish this line".
+        //
+        // Names that are not in the window come from the retrieved excerpts
+        // instead, which is what they are for.
         let excerpt = inputs.cursor_excerpt.as_ref();
         let caret_in_excerpt = inputs.cursor_offset_in_excerpt.min(excerpt.len());
-        let (excerpt_prefix, excerpt_suffix) = excerpt.split_at(caret_in_excerpt);
+        let (whole_prefix, whole_suffix) = excerpt.split_at(caret_in_excerpt);
+        let excerpt_prefix = last_lines(whole_prefix, PREFIX_LINES);
+        let excerpt_suffix = first_lines(whole_suffix, SUFFIX_LINES);
 
         let max_tokens = settings.max_output_tokens;
 
@@ -231,6 +248,40 @@ pub fn request_prediction(
     })
 }
 
+/// The last `count` lines of `text`, keeping the trailing partial line.
+fn last_lines(text: &str, count: usize) -> &str {
+    let mut start = text.len();
+    let mut seen = 0;
+    for (index, byte) in text.bytes().enumerate().rev() {
+        if byte == b'\n' {
+            seen += 1;
+            if seen > count {
+                start = index + 1;
+                break;
+            }
+        }
+        let _ = index;
+    }
+    if seen <= count {
+        return text;
+    }
+    &text[start..]
+}
+
+/// The first `count` lines of `text`.
+fn first_lines(text: &str, count: usize) -> &str {
+    let mut seen = 0;
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            seen += 1;
+            if seen == count {
+                return &text[..index + 1];
+            }
+        }
+    }
+    text
+}
+
 /// Whether inserting `completion` at `offset` leaves the file with more syntax
 /// errors than it has now.
 ///
@@ -302,6 +353,39 @@ fn error_count(language: &tree_sitter::Language, text: &str) -> Option<usize> {
     }
 
     Some(count)
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::{first_lines, last_lines};
+
+    #[test]
+    fn the_window_keeps_the_lines_nearest_the_caret() {
+        let text = "a\nb\nc\nd\ne";
+        assert_eq!(last_lines(text, 2), "c\nd\ne");
+        assert_eq!(first_lines(text, 2), "a\nb\n");
+    }
+
+    #[test]
+    fn a_short_text_is_returned_whole() {
+        let text = "a\nb";
+        assert_eq!(last_lines(text, 10), text);
+        assert_eq!(first_lines(text, 10), text);
+    }
+
+    #[test]
+    fn an_empty_text_is_handled() {
+        assert_eq!(last_lines("", 3), "");
+        assert_eq!(first_lines("", 3), "");
+    }
+
+    #[test]
+    fn the_partial_line_at_the_caret_survives() {
+        // The caret sits mid-line, so the prefix ends without a newline and
+        // that fragment is the most important part of the window.
+        let text = "one\ntwo\n    let x = ";
+        assert_eq!(last_lines(text, 1), "two\n    let x = ");
+    }
 }
 
 #[cfg(test)]
