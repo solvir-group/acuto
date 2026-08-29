@@ -1781,9 +1781,6 @@ struct SubPageLink {
     search_aliases: &'static [&'static str],
     /// See [`SettingField.json_path`]
     json_path: Option<&'static str>,
-    /// Whether or not the settings in this sub page are configurable in settings.json
-    /// Removes the "Edit in settings.json" button from the page.
-    in_json: bool,
     files: FileMask,
     render:
         fn(&SettingsWindow, &ScrollHandle, &mut Window, &mut Context<SettingsWindow>) -> AnyElement,
@@ -2984,7 +2981,6 @@ impl SettingsWindow {
                 }
             })
             .unwrap_or(OVERFLOW_LIMIT);
-        let edit_in_json_id = SharedString::new(format!("edit-in-json-{}", selected_file_ix));
 
         h_flex()
             .id("settings-ui-files-header")
@@ -3065,19 +3061,6 @@ impl SettingsWindow {
                                 )
                             })
                     }),
-            )
-            .child(
-                Button::new(edit_in_json_id, "Edit in settings.json")
-                    .tab_index(0_isize)
-                    .style(ButtonStyle::OutlinedGhost)
-                    .tooltip(Tooltip::for_action_title_in(
-                        "Edit in settings.json",
-                        &OpenCurrentFile,
-                        &self.focus_handle,
-                    ))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_current_settings_file(window, cx);
-                    })),
             )
     }
 
@@ -3946,21 +3929,6 @@ impl SettingsWindow {
                 .child(
                     div()
                         .flex_shrink_0()
-                        .when(current_sub_page.link.in_json, |this| {
-                            this.child(
-                                Button::new("open-in-settings-file", "Edit in settings.json")
-                                    .tab_index(0_isize)
-                                    .style(ButtonStyle::OutlinedGhost)
-                                    .tooltip(Tooltip::for_action_title_in(
-                                        "Edit in settings.json",
-                                        &OpenCurrentFile,
-                                        &self.focus_handle,
-                                    ))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_current_settings_file(window, cx);
-                                    })),
-                            )
-                        })
                         .when(is_llm_providers_page, |this| {
                             this.child(pages::render_add_llm_provider_popover(self, window, cx))
                         })
@@ -4401,7 +4369,6 @@ impl SettingsWindow {
         title: impl Into<SharedString>,
         section_header: impl Into<SharedString>,
         json_path: Option<&'static str>,
-        in_json: bool,
         render: fn(
             &SettingsWindow,
             &ScrollHandle,
@@ -4418,7 +4385,6 @@ impl SettingsWindow {
             description: None,
             search_aliases: &[],
             json_path,
-            in_json,
             files: USER,
             render,
         };
@@ -4458,7 +4424,6 @@ impl SettingsWindow {
             "Extensions",
             "Extensions",
             None,
-            false,
             render_extensions_sub_page,
             window,
             cx,
@@ -4516,7 +4481,6 @@ impl SettingsWindow {
             description: None,
             search_aliases: &[],
             json_path: None,
-            in_json: false,
             files: USER | PROJECT,
             render: pages::render_skill_creator_page,
         };

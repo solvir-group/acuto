@@ -879,7 +879,6 @@ pub(crate) fn open_mcp_server_form(
         title,
         "Agent Configuration",
         Some("context_servers"),
-        false,
         render_mcp_server_form_page,
         window,
         cx,

@@ -476,7 +476,6 @@ pub(crate) fn open_custom_agent_form(
         title,
         "Agent Configuration",
         Some("agent_servers"),
-        false,
         render_custom_agent_form_page,
         window,
         cx,
