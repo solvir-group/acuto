@@ -865,19 +865,28 @@ impl TeamNotesPanel {
 
         let mut bubbles: Vec<Bubble> = Vec::new();
         let mut previous_author: Option<String> = None;
-        let mut previous_minute: Option<String> = None;
+        let mut previous_at: Option<String> = None;
         for record in &ordered {
             for message in &record.messages {
                 let mine = message.author.eq_ignore_ascii_case(&me);
                 let starts_run = previous_author
                     .as_deref()
                     .is_none_or(|author| !author.eq_ignore_ascii_case(&message.author));
-                let minute = message.at.get(..16).unwrap_or(&message.at).to_string();
-                let stamp = (previous_minute.as_deref() != Some(minute.as_str()))
-                    .then(|| separator_stamp(&message.at, previous_minute.as_deref()));
+
+                // A time only after a real silence. Stamping every message that
+                // fell in a different minute puts a row of text between two
+                // things typed twenty seconds apart, which is most of the space
+                // between messages and none of the information.
+                let stamp = match previous_at.as_deref() {
+                    None => Some(separator_stamp(&message.at, None)),
+                    Some(previous) => match minutes_apart(previous, &message.at) {
+                        Some(gap) if gap < STAMP_AFTER_MINUTES => None,
+                        _ => Some(separator_stamp(&message.at, Some(previous))),
+                    },
+                };
 
                 previous_author = Some(message.author.clone());
-                previous_minute = Some(minute);
+                previous_at = Some(message.at.clone());
                 bubbles.push(Bubble {
                     message: message.clone(),
                     mine,
@@ -926,11 +935,14 @@ impl TeamNotesPanel {
                         // gets air. The spacing is what tells you where one
                         // thought ends, without drawing anything to say so.
                         let space_above = if bubble.stamp.is_some() {
-                            px(5.)
+                            px(10.)
                         } else if bubble.starts_run {
-                            px(2.)
+                            px(8.)
                         } else {
-                            px(0.)
+                            // Enough to see the seam between two bubbles and no
+                            // more. At zero the backgrounds merge into one
+                            // block and you cannot tell where a message ended.
+                            px(2.)
                         };
 
                         v_flex()
@@ -1268,6 +1280,32 @@ fn name_hash(name: &str) -> u32 {
         hash = hash.wrapping_mul(16777619);
     }
     hash
+}
+
+/// How long a silence has to be before it is worth putting a time on it.
+///
+/// Below this, two messages are one thought and a timestamp between them is
+/// noise occupying a whole row.
+const STAMP_AFTER_MINUTES: i64 = 10;
+
+/// Minutes from `earlier` to `later`, when both fall on the same day.
+///
+/// `None` when the day differs, or when either stamp is not the shape this
+/// writes -- both of which the caller treats as far enough apart to label.
+/// Deliberately no date library: these are slices of the RFC 3339 string that
+/// was written to the file, so this cannot disagree with what is stored.
+fn minutes_apart(earlier: &str, later: &str) -> Option<i64> {
+    if earlier.get(..10)? != later.get(..10)? {
+        return None;
+    }
+    Some(clock_minutes(later)? - clock_minutes(earlier)?)
+}
+
+/// `2026-08-29T08:01:42Z` as minutes since midnight.
+fn clock_minutes(at: &str) -> Option<i64> {
+    let hours: i64 = at.get(11..13)?.parse().ok()?;
+    let minutes: i64 = at.get(14..16)?.parse().ok()?;
+    Some(hours * 60 + minutes)
 }
 
 /// The time to draw above a message, given the one before it.
@@ -1623,6 +1661,26 @@ mod tests {
         assert_eq!(name_hash("Drew"), name_hash("Drew"));
         assert_eq!(name_hash("Drew"), name_hash("drew"));
         assert_ne!(name_hash("Drew"), name_hash("Ada"));
+    }
+
+    #[test]
+    fn a_short_pause_earns_no_timestamp() {
+        // The case that made every message carry its own row: two messages six
+        // seconds apart that happened to straddle a minute boundary.
+        assert_eq!(
+            minutes_apart("2026-08-29T07:15:54Z", "2026-08-29T07:16:00Z"),
+            Some(1)
+        );
+        assert_eq!(
+            minutes_apart("2026-08-29T07:16:00Z", "2026-08-29T07:29:48Z"),
+            Some(13)
+        );
+        // A different day is not measured in minutes; the caller stamps it.
+        assert_eq!(
+            minutes_apart("2026-08-29T23:59:00Z", "2026-08-30T00:01:00Z"),
+            None
+        );
+        assert_eq!(minutes_apart("nonsense", "2026-08-30T00:01:00Z"), None);
     }
 
     #[test]
