@@ -2,11 +2,11 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use editor::{Editor, MultiBufferOffset};
+use editor::{Editor, EditorEvent, MultiBufferOffset};
 use fs::Fs;
 use gpui::{
-    Action, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Task,
-    WeakEntity, Window, actions,
+    Action, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription,
+    Task, WeakEntity, Window, actions,
 };
 use language::ToOffset as _;
 use project::Project;
@@ -120,6 +120,12 @@ pub struct TeamNotesPanel {
     author: Arc<str>,
     /// Everyone on the repository, most recently active first.
     team: Vec<Arc<str>>,
+    /// Redraws the panel as the composer is typed in.
+    ///
+    /// Without it the send button cannot know whether there is anything to
+    /// send: nothing else makes the panel re-render between keystrokes, so it
+    /// would sit dimmed until some unrelated event happened to repaint.
+    _composer_edits: Option<Subscription>,
     _reload: Option<Task<()>>,
 }
 
@@ -157,6 +163,7 @@ impl TeamNotesPanel {
             drafting: None,
             author: "unknown".into(),
             team: Vec::new(),
+            _composer_edits: None,
             _reload: None,
         };
 
@@ -251,6 +258,11 @@ impl TeamNotesPanel {
             editor
         });
         composer.focus_handle(cx).focus(window, cx);
+        self._composer_edits = Some(cx.subscribe(&composer, |_this, _composer, event, cx| {
+            if matches!(event, EditorEvent::BufferEdited) {
+                cx.notify();
+            }
+        }));
         self.replying_to = None;
         self.drafting = Some((draft, composer));
         cx.notify();
@@ -338,6 +350,7 @@ impl TeamNotesPanel {
     fn cancel_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.drafting = None;
         self.replying_to = None;
+        self._composer_edits = None;
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -890,7 +903,8 @@ impl TeamNotesPanel {
                 v_flex()
                     .id("team-chat-transcript")
                     .flex_1()
-                    .p_2()
+                    .px_2()
+                    .py_1()
                     .overflow_y_scroll()
                     .when(empty, |this| {
                         this.child(
@@ -912,9 +926,9 @@ impl TeamNotesPanel {
                         // gets air. The spacing is what tells you where one
                         // thought ends, without drawing anything to say so.
                         let space_above = if bubble.stamp.is_some() {
-                            px(10.)
+                            px(7.)
                         } else if bubble.starts_run {
-                            px(8.)
+                            px(4.)
                         } else {
                             px(1.)
                         };
@@ -1008,63 +1022,44 @@ impl TeamNotesPanel {
             .into_any_element()
     }
 
-    /// The bar at the bottom: attach, type, send.
+    /// One pill: attach on the left, what you are typing in the middle, send on
+    /// the right.
     ///
-    /// One row, three items, all the same height and all bottom-aligned, so the
-    /// two round buttons sit level with the input rather than near it. No rule
-    /// above it: the composer is already a different shape from everything in
-    /// the transcript, and a line as well is one separator too many in a panel
-    /// this narrow.
+    /// Everything lives inside a single rounded container rather than floating
+    /// beside it as three separate controls, which is what made the old row look
+    /// unaligned no matter what the spacing was -- three shapes with three
+    /// different heights cannot be lined up, only approximately stacked. One
+    /// container with one padding and one control height has nothing left to
+    /// misalign.
     fn render_chat_composer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        /// Buttons and the collapsed input are all this tall, which is the only
-        /// reason the row lines up.
-        const CONTROL: f32 = 30.;
+        /// Both round buttons and the collapsed text area are this tall.
+        const CONTROL: f32 = 26.;
 
         let composing = matches!(self.drafting, Some((Draft::Message, _)));
+        // Not the same as "the composer is open". A send button that looks
+        // active with an empty box is a button that does nothing when pressed.
+        let ready = composing && !self.draft_is_empty(cx);
         let accent = cx.theme().players().local().cursor;
         let on_accent = gpui::hsla(0., 0., 1., 1.);
 
-        h_flex()
+        div()
             .flex_none()
             .w_full()
-            .p_2()
-            .gap_1p5()
-            .items_end()
-            .bg(cx.theme().colors().panel_background)
+            .px_2()
+            .pt_1()
+            .pb_2()
             .child(
                 h_flex()
-                    .id("chat-attach")
-                    .flex_none()
-                    .size(px(CONTROL))
-                    .justify_center()
-                    .rounded_full()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().colors().element_hover))
-                    .child(
-                        Icon::new(IconName::Plus)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .tooltip(Tooltip::text("Mention the file you are looking at"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.attach_current_file(window, cx)
-                    })),
-            )
-            .child(
-                v_flex()
-                    .id("chat-composer")
                     .key_context("TeamNotesComposer")
-                    .flex_1()
-                    .min_w_0()
-                    .min_h(px(CONTROL))
-                    .justify_center()
-                    .px_3()
-                    .py_1()
+                    .w_full()
+                    .items_end()
+                    .gap_1()
+                    .p_1()
                     .rounded_2xl()
                     .bg(cx.theme().colors().editor_background)
                     .border_1()
                     .border_color(if composing {
-                        cx.theme().colors().border_focused
+                        accent
                     } else {
                         cx.theme().colors().border_variant
                     })
@@ -1074,46 +1069,90 @@ impl TeamNotesPanel {
                     .on_action(cx.listener(|this, _: &CancelDraft, window, cx| {
                         this.cancel_draft(window, cx)
                     }))
-                    .map(|this| match self.drafting.as_ref() {
-                        Some((Draft::Message, composer)) => this.child(composer.clone()),
-                        _ => this.child(
-                            Label::new("Type your message")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if !matches!(this.drafting, Some((Draft::Message, _))) {
-                            this.open_composer(Draft::Message, "Type your message", window, cx);
-                        }
-                    })),
-            )
-            .child(
-                // Send, not a smiley. The reference shows an emoji button
-                // because its field is empty; an emoji button here would be a
-                // control that does nothing, which is worse than one that does
-                // the thing you came to do.
-                h_flex()
-                    .id("chat-send")
-                    .flex_none()
-                    .size(px(CONTROL))
-                    .justify_center()
-                    .rounded_full()
-                    .bg(if composing {
-                        accent
-                    } else {
-                        gpui::Hsla { a: 0.35, ..accent }
-                    })
-                    .cursor_pointer()
                     .child(
-                        Icon::new(IconName::Send)
-                            .size(IconSize::Small)
-                            .color(Color::Custom(on_accent)),
+                        h_flex()
+                            .id("chat-attach")
+                            .flex_none()
+                            .size(px(CONTROL))
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().colors().element_hover))
+                            .child(
+                                Icon::new(IconName::Plus)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .tooltip(Tooltip::text("Mention the file you are looking at"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.attach_current_file(window, cx)
+                            })),
                     )
-                    .tooltip(Tooltip::text("Send"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.send_chat_message(window, cx)
-                    })),
+                    .child(
+                        v_flex()
+                            .id("chat-input")
+                            .flex_1()
+                            .min_w_0()
+                            .min_h(px(CONTROL))
+                            .justify_center()
+                            .cursor_text()
+                            .map(|this| match self.drafting.as_ref() {
+                                Some((Draft::Message, composer)) => this.child(composer.clone()),
+                                _ => this.child(
+                                    Label::new("Type your message")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if !matches!(this.drafting, Some((Draft::Message, _))) {
+                                    this.open_composer(
+                                        Draft::Message,
+                                        "Type your message",
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            })),
+                    )
+                    .child(
+                        // Send, not a smiley. The reference shows an emoji
+                        // button because its field is empty; an emoji button
+                        // here would be a control that does nothing, which is
+                        // worse than one that does the thing you came to do.
+                        h_flex()
+                            .id("chat-send")
+                            .flex_none()
+                            .size(px(CONTROL))
+                            .justify_center()
+                            .rounded_full()
+                            .when(ready, |this| {
+                                this.bg(accent)
+                                    .cursor_pointer()
+                                    .hover(|style| style.opacity(0.85))
+                            })
+                            .when(!ready, |this| this.bg(gpui::Hsla { a: 0.25, ..accent }))
+                            .child(
+                                Icon::new(IconName::Send)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Custom(if ready {
+                                        on_accent
+                                    } else {
+                                        gpui::Hsla {
+                                            a: 0.5,
+                                            ..on_accent
+                                        }
+                                    })),
+                            )
+                            // The keybinding lives in the tooltip rather than
+                            // in a hint line under the box: a line that appears
+                            // when you focus the composer shifts the whole
+                            // transcript up by its own height every time.
+                            .tooltip(Tooltip::text("Send · Enter"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.send_chat_message(window, cx)
+                            })),
+                    ),
             )
             .into_any_element()
     }
