@@ -347,18 +347,23 @@ impl Render for Onboarding {
                                     .child(
                                         h_flex()
                                             .gap_4()
-                                            .child(Vector::square(VectorName::ZedLogo, rems(2.5)))
+                                            .child(
+                                                Vector::square(VectorName::ZedLogo, rems(2.5))
+                                                    .color(Color::Accent),
+                                            )
                                             .child(
                                                 v_flex()
                                                     .child(
                                                         Headline::new("Welcome to Acuto")
-                                                            .size(HeadlineSize::Small),
+                                                            .size(HeadlineSize::Small)
+                                                            .color(Color::Accent),
                                                     )
                                                     .child(
-                                                        Label::new("The editor for what's next")
-                                                            .color(Color::Muted)
-                                                            .size(LabelSize::Small)
-                                                            .italic(),
+                                                        Label::new(
+                                                            "Provably correct agent diff review",
+                                                        )
+                                                        .color(Color::Muted)
+                                                        .size(LabelSize::Small),
                                                     ),
                                             ),
                                     )

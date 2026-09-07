@@ -16,7 +16,8 @@ use project::DisableAiSettings;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
-    DockPosition, DockSide, IntoGpui, LanguageModelParameters, LanguageModelSelection,
+    AgentTerminalMode, DefaultAgent, DockPosition, DockSide, IntoGpui, LanguageModelParameters,
+    LanguageModelSelection,
     NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, Settings, SettingsContent,
     SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
     update_settings_file, update_settings_file_with_completion,
@@ -233,6 +234,9 @@ pub struct AgentSettings {
     pub enable_feedback: bool,
     pub expand_edit_card: bool,
     pub expand_terminal_card: bool,
+    pub terminal_mode: AgentTerminalMode,
+    pub default_agent: DefaultAgent,
+    pub restore_threads_sidebar: bool,
     pub terminal_init_command: Option<String>,
     pub thinking_display: ThinkingBlockDisplay,
     pub cancel_generation_on_terminal_stop: bool,
@@ -807,6 +811,9 @@ impl Settings for AgentSettings {
             enable_feedback: agent.enable_feedback.unwrap(),
             expand_edit_card: agent.expand_edit_card.unwrap(),
             expand_terminal_card: agent.expand_terminal_card.unwrap(),
+            terminal_mode: agent.terminal_mode.unwrap(),
+            default_agent: agent.default_agent.unwrap(),
+            restore_threads_sidebar: agent.restore_threads_sidebar.unwrap(),
             terminal_init_command: agent
                 .terminal_init_command
                 .filter(|command| !command.trim().is_empty()),

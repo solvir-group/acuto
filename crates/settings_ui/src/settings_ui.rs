@@ -558,6 +558,8 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<settings::TerminalDockPosition>(render_dropdown)
         .add_basic_renderer::<settings::DockPosition>(render_dropdown)
         .add_basic_renderer::<settings::SidebarDockPosition>(render_dropdown)
+        .add_basic_renderer::<settings::DefaultAgent>(render_dropdown)
+        .add_basic_renderer::<settings::AgentTerminalMode>(render_dropdown)
         .add_basic_renderer::<settings::GitGutterSetting>(render_dropdown)
         .add_basic_renderer::<settings::GitHunkStyleSetting>(render_dropdown)
         .add_basic_renderer::<settings::GitDiffBaseSetting>(render_dropdown)
@@ -573,6 +575,7 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<settings::ShowDiagnostics>(render_dropdown)
         .add_basic_renderer::<settings::ShowCloseButton>(render_dropdown)
         .add_basic_renderer::<settings::ProjectPanelEntrySpacing>(render_dropdown)
+        .add_basic_renderer::<settings::FileIconColors>(render_dropdown)
         .add_basic_renderer::<settings::ProjectPanelSortMode>(render_dropdown)
         .add_basic_renderer::<settings::ProjectPanelSortOrder>(render_dropdown)
         .add_basic_renderer::<settings::RewrapBehavior>(render_dropdown)
@@ -5513,6 +5516,8 @@ pub mod test {
             };
             Self {
                 title_bar: None,
+                // A test window stands alone; nothing is hosting it in a pane.
+                embedded: false,
                 original_window: None,
                 worktree_root_dirs: HashMap::default(),
                 files: Vec::default(),
@@ -5654,6 +5659,7 @@ pub mod test {
 
         let mut settings_window = SettingsWindow {
             title_bar: None,
+            embedded: false,
             original_window: None,
             worktree_root_dirs: HashMap::default(),
             files: Vec::default(),

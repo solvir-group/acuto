@@ -141,6 +141,15 @@ pub enum ButtonStyle {
     /// Like [`ButtonStyle::Outlined`], but with a caller-provided border color.
     OutlinedCustom(Hsla),
 
+    /// Like [`ButtonStyle::Filled`], but with caller-provided colors.
+    ///
+    /// For a button that carries a colour of its own -- a brand's, an agent's --
+    /// rather than one of the theme's roles.
+    FilledCustom {
+        background: Hsla,
+        foreground: Hsla,
+    },
+
     /// The default button style, used for most buttons. Has a transparent background,
     /// but has a background color to indicate states like hover and active.
     #[default]
@@ -150,6 +159,18 @@ pub enum ButtonStyle {
     ///
     /// TODO: Better docs for this.
     Transparent,
+}
+
+/// The same colour, `amount` further towards white (or towards black, for a
+/// negative amount).
+///
+/// Hover and active states for a caller-provided colour cannot come from the
+/// theme -- the theme does not know the colour -- so they are derived from it.
+fn lighten(color: Hsla, amount: f32) -> Hsla {
+    Hsla {
+        l: (color.l + amount).clamp(0., 1.),
+        ..color
+    }
 }
 
 /// Rounding for a button that may have straight edges.
@@ -239,6 +260,15 @@ impl ButtonStyle {
                 label_color: Color::Default.color(cx),
                 icon_color: Color::Default.color(cx),
             },
+            ButtonStyle::FilledCustom {
+                background,
+                foreground,
+            } => ButtonLikeStyles {
+                background,
+                border_color: transparent_black(),
+                label_color: foreground,
+                icon_color: foreground,
+            },
             ButtonStyle::Subtle => ButtonLikeStyles {
                 background: cx.theme().colors().ghost_element_background,
                 border_color: transparent_black(),
@@ -295,6 +325,15 @@ impl ButtonStyle {
                 label_color: Color::Default.color(cx),
                 icon_color: Color::Default.color(cx),
             },
+            ButtonStyle::FilledCustom {
+                background,
+                foreground,
+            } => ButtonLikeStyles {
+                background: lighten(background, 0.06),
+                border_color: transparent_black(),
+                label_color: foreground,
+                icon_color: foreground,
+            },
             ButtonStyle::Subtle => ButtonLikeStyles {
                 background: cx.theme().colors().ghost_element_hover,
                 border_color: transparent_black(),
@@ -345,6 +384,15 @@ impl ButtonStyle {
                 label_color: Color::Default.color(cx),
                 icon_color: Color::Default.color(cx),
             },
+            ButtonStyle::FilledCustom {
+                background,
+                foreground,
+            } => ButtonLikeStyles {
+                background: lighten(background, -0.06),
+                border_color: transparent_black(),
+                label_color: foreground,
+                icon_color: foreground,
+            },
             ButtonStyle::Transparent => ButtonLikeStyles {
                 background: transparent_black(),
                 border_color: transparent_black(),
@@ -389,6 +437,15 @@ impl ButtonStyle {
                 border_color,
                 label_color: Color::Default.color(cx),
                 icon_color: Color::Default.color(cx),
+            },
+            ButtonStyle::FilledCustom {
+                background,
+                foreground,
+            } => ButtonLikeStyles {
+                background,
+                border_color: cx.theme().colors().border_focused,
+                label_color: foreground,
+                icon_color: foreground,
             },
             ButtonStyle::Transparent => ButtonLikeStyles {
                 background: transparent_black(),
@@ -437,6 +494,12 @@ impl ButtonStyle {
                 border_color: cx.theme().colors().border_disabled,
                 label_color: Color::Default.color(cx),
                 icon_color: Color::Default.color(cx),
+            },
+            ButtonStyle::FilledCustom { .. } => ButtonLikeStyles {
+                background: cx.theme().colors().element_disabled,
+                border_color: transparent_black(),
+                label_color: Color::Disabled.color(cx),
+                icon_color: Color::Disabled.color(cx),
             },
             ButtonStyle::Transparent => ButtonLikeStyles {
                 background: transparent_black(),

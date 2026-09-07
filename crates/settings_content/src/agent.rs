@@ -214,6 +214,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: left
     pub sidebar_side: Option<SidebarDockPosition>,
+    /// Whether to reopen the threads sidebar on launch when it was open at quit.
+    ///
+    /// Default: false
+    pub restore_threads_sidebar: Option<bool>,
     /// Default width in pixels when the agent panel is docked to the left or right.
     ///
     /// Default: 640
@@ -308,6 +312,14 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_terminal_card: Option<bool>,
+    /// Where terminal commands the agent runs should appear.
+    ///
+    /// Default: inline
+    pub terminal_mode: Option<AgentTerminalMode>,
+    /// Which agent a new agent tab opens.
+    ///
+    /// Default: acuto
+    pub default_agent: Option<DefaultAgent>,
     /// Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     /// The command is sent to the shell as if typed, so it is interpreted by your
     /// configured shell (including on Windows and remote/WSL projects).
@@ -1020,6 +1032,62 @@ pub struct ToolRegexRule {
     /// Whether the regex is case-sensitive.
     /// Default: false (case-insensitive)
     pub case_sensitive: Option<bool>,
+}
+
+/// Which agent a new agent tab opens.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultAgent {
+    /// The built-in agent.
+    #[default]
+    Acuto,
+    /// Claude Code, over the agent client protocol, on your Anthropic
+    /// subscription.
+    ClaudeCode,
+}
+
+/// Where an agent's terminal commands run.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTerminalMode {
+    /// In a terminal the thread owns, drawn inline with the tool call.
+    ///
+    /// Keeps the agent's output separate from your own shell history, which is
+    /// what you want when it is running things you did not ask about.
+    #[default]
+    Inline,
+    /// In the terminal panel you already have open.
+    ///
+    /// The same terminal entity, shown in the dock instead of in the thread, so
+    /// you watch the agent work in the window you were already watching. One
+    /// process, one scrollback -- not a copy.
+    Panel,
 }
 
 #[derive(

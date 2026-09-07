@@ -89,6 +89,15 @@ fn is_chat_endpoint(api_url: &str) -> bool {
     api_url.trim_end_matches('/').ends_with("/chat/completions")
 }
 
+/// Whether the configured URL is Anthropic's Messages API.
+///
+/// Same trick as `is_chat_endpoint`, for the same reason: the difference between
+/// these providers is one request shape and one response shape, and the URL is
+/// the only place it is already written down.
+fn is_anthropic_endpoint(api_url: &str) -> bool {
+    api_url.trim_end_matches('/').ends_with("/v1/messages")
+}
+
 pub(crate) async fn send_custom_server_request(
     provider: settings::EditPredictionProvider,
     settings: &OpenAiCompatibleEditPredictionSettings,
@@ -114,6 +123,10 @@ pub(crate) async fn send_custom_server_request(
         // others send a prompt shaped for a base model, and rewriting those for
         // a chat model is a different piece of work. They keep going to the raw
         // endpoint, which is where they already went.
+        _ if caret.is_some() && is_anthropic_endpoint(&settings.api_url) => {
+            let caret = caret.expect("checked immediately above");
+            send_anthropic_messages_request(settings, caret, max_tokens, api_key, http_client).await
+        }
         _ if caret.is_some() && is_chat_endpoint(&settings.api_url) => {
             let caret = caret.expect("checked immediately above");
             send_chat_completion_request(settings, caret, max_tokens, api_key, http_client).await
@@ -244,13 +257,12 @@ const SHOWN_NOTHING_TO_SAY: &str = concat!(
 /// chat turn rather than a few tokens. It exists because a chat endpoint is
 /// frequently the only one on offer, and a slower completion is worth more than
 /// the nothing a 404 produces.
-async fn send_chat_completion_request(
-    settings: &OpenAiCompatibleEditPredictionSettings,
-    caret: CaretContext<'_>,
-    max_tokens: u32,
-    api_key: Option<Arc<str>>,
-    http_client: &Arc<dyn http_client::HttpClient>,
-) -> Result<(String, String)> {
+/// The turn describing where the caret is and what surrounds it.
+///
+/// Shared by both transports so the two cannot drift: a prompt change that
+/// improved one and not the other would show up as one provider quietly getting
+/// worse, which is the kind of bug nobody thinks to look for.
+fn caret_user_message(caret: &CaretContext<'_>) -> String {
     let mut user_message = String::new();
     if !caret.related.is_empty() {
         user_message.push_str(
@@ -267,6 +279,109 @@ async fn send_chat_completion_request(
         "File being edited: {}\n\n{}{CARET_MARKER}{}",
         caret.path, caret.prefix, caret.suffix
     ));
+    user_message
+}
+
+/// Asks Claude to fill in at the caret, over Anthropic's Messages API.
+///
+/// Two differences from the chat-completions path, both forced by the API rather
+/// than chosen: the system prompt is a top-level field instead of a message, and
+/// the "correct answer is nothing" example is dropped, because Anthropic rejects
+/// an assistant turn whose content is empty. Rule 7 of the system prompt still
+/// says an empty reply is correct; it just cannot be demonstrated here.
+async fn send_anthropic_messages_request(
+    settings: &OpenAiCompatibleEditPredictionSettings,
+    caret: CaretContext<'_>,
+    max_tokens: u32,
+    api_key: Option<Arc<str>>,
+    http_client: &Arc<dyn http_client::HttpClient>,
+) -> Result<(String, String)> {
+    let user_message = caret_user_message(&caret);
+
+    let body = serde_json::json!({
+        "model": settings.model,
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "system": COMPLETION_SYSTEM_PROMPT,
+        "messages": [
+            { "role": "user", "content": SHOWN_MID_LINE },
+            { "role": "assistant", "content": SHOWN_MID_LINE_REPLY },
+            { "role": "user", "content": user_message },
+        ],
+    });
+
+    let mut http_request_builder = http_client::Request::builder()
+        .method(http_client::Method::POST)
+        .uri(settings.api_url.as_ref())
+        .header("Content-Type", "application/json")
+        // Pinned rather than tracking latest: a version bump can change response
+        // shapes, and a completion engine that breaks on someone else's release
+        // day is worse than one that asks for an old contract.
+        .header("anthropic-version", "2023-06-01");
+
+    if let Some(api_key) = api_key {
+        http_request_builder = http_request_builder.header("x-api-key", api_key.as_ref());
+    }
+
+    let http_request = http_request_builder
+        .body(http_client::AsyncBody::from(serde_json::to_string(&body)?))?;
+
+    let mut response = http_client.send(http_request).await?;
+    let status = response.status();
+
+    let mut response_body = String::new();
+    response
+        .body_mut()
+        .read_to_string(&mut response_body)
+        .await?;
+
+    if !status.is_success() {
+        anyhow::bail!("anthropic messages error: {} - {}", status, response_body);
+    }
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&response_body).context("Failed to parse Anthropic response")?;
+
+    // `content` is a list of blocks. Only text blocks carry a completion; a
+    // thinking block or a tool-use block is not something to insert.
+    let text = parsed
+        .get("content")
+        .and_then(|content| content.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| {
+                    block.get("type").and_then(|kind| kind.as_str()) == Some("text")
+                })
+                .filter_map(|block| block.get("text").and_then(|text| text.as_str()))
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+
+    let request_id = parsed
+        .get("id")
+        .and_then(|id| id.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let completion = clean_chat_completion(&text);
+    let completion = trim_overlap_with_buffer(completion, caret.prefix, caret.suffix);
+    let completion = stop_at_repeated_line(completion, caret.suffix);
+    let completion = cap_lines(completion);
+
+    log_exchange(&user_message, &text, &completion);
+
+    Ok((completion, request_id))
+}
+
+async fn send_chat_completion_request(
+    settings: &OpenAiCompatibleEditPredictionSettings,
+    caret: CaretContext<'_>,
+    max_tokens: u32,
+    api_key: Option<Arc<str>>,
+    http_client: &Arc<dyn http_client::HttpClient>,
+) -> Result<(String, String)> {
+    let user_message = caret_user_message(&caret);
 
     let body = serde_json::json!({
         "model": settings.model,

@@ -89,6 +89,143 @@ pub struct TerminalPanel {
     active: bool,
 }
 
+
+/// A shell that is installed on this machine and can be opened in a terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AvailableShell {
+    pub label: &'static str,
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// The shells present on this machine, in the order worth offering them.
+///
+/// Probed rather than listed: a menu that offers Git Bash on a machine without
+/// git installed is a menu that opens a broken terminal. Each candidate is
+/// checked on disk or on PATH, and only what resolves is offered.
+///
+/// `+` stays bound to the configured default; this is the "something else"
+/// list, which is why the default is not repeated in it.
+pub fn available_shells() -> Vec<AvailableShell> {
+    fn on_path(program: &str) -> Option<String> {
+        // `which` semantics without the dependency: PATH plus, on Windows, the
+        // extensions the shell would have tried.
+        let path = std::env::var_os("PATH")?;
+        let exts: Vec<String> = if cfg!(windows) {
+            std::env::var("PATHEXT")
+                .unwrap_or_else(|_| ".EXE".into())
+                .split(';')
+                .filter(|e| !e.is_empty())
+                .map(|e| e.to_ascii_lowercase())
+                .collect()
+        } else {
+            vec![String::new()]
+        };
+
+        for dir in std::env::split_paths(&path) {
+            for ext in &exts {
+                let candidate = dir.join(format!("{program}{ext}"));
+                if candidate.is_file() {
+                    return Some(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+        None
+    }
+
+    fn at(path: &str) -> Option<String> {
+        std::path::Path::new(path)
+            .is_file()
+            .then(|| path.to_string())
+    }
+
+    let mut shells = Vec::new();
+    let mut push = |label: &'static str, program: Option<String>, args: &[&str]| {
+        if let Some(program) = program {
+            shells.push(AvailableShell {
+                label,
+                program,
+                args: args.iter().map(|a| a.to_string()).collect(),
+            });
+        }
+    };
+
+    if cfg!(windows) {
+        push("PowerShell", on_path("powershell"), &[]);
+        push("PowerShell 7", on_path("pwsh"), &[]);
+        push("Command Prompt", on_path("cmd"), &[]);
+        push(
+            "Git Bash",
+            at("C:\\Program Files\\Git\\bin\\bash.exe")
+                .or_else(|| at("C:\\Program Files (x86)\\Git\\bin\\bash.exe")),
+            &["-i", "-l"],
+        );
+        push("WSL", on_path("wsl"), &[]);
+        push("Nushell", on_path("nu"), &[]);
+    } else {
+        push("Bash", on_path("bash"), &[]);
+        push("Zsh", on_path("zsh"), &[]);
+        push("Fish", on_path("fish"), &[]);
+        push("Nushell", on_path("nu"), &[]);
+    }
+
+    shells
+}
+
+/// Opens a terminal running `shell`, in the dock.
+///
+/// Goes through the task path because that is the only creation route that
+/// accepts a shell: the ordinary one always uses whatever `terminal.shell`
+/// says. `command` is left empty so the shell starts interactively rather than
+/// running something and exiting.
+fn open_shell(
+    workspace: &WeakEntity<Workspace>,
+    shell: &AvailableShell,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+    let Some(panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
+        return;
+    };
+
+    let label = shell.label.to_string();
+    let task = SpawnInTerminal {
+        id: task::TaskId(format!("acuto-shell-{label}")),
+        full_label: label.clone(),
+        label: label.clone(),
+        command: None,
+        args: Vec::new(),
+        command_label: label.clone(),
+        cwd: None,
+        env: Default::default(),
+        use_new_terminal: true,
+        allow_concurrent_runs: true,
+        reveal: RevealStrategy::Always,
+        reveal_target: zed_actions::RevealTarget::Dock,
+        hide: task::HideStrategy::Never,
+        shell: task::Shell::WithArguments {
+            program: shell.program.clone(),
+            args: shell.args.clone(),
+            title_override: Some(label),
+        },
+        // None of the task chrome applies: this is a shell someone opened, not
+        // a command whose success anyone is waiting on.
+        show_summary: false,
+        show_command: false,
+        show_rerun: false,
+        save: task::SaveStrategy::None,
+    };
+
+    panel.update(cx, |panel, cx| {
+        panel
+            .add_terminal_task(task, RevealStrategy::Always, window, cx)
+            .detach_and_log_err(cx);
+    });
+}
+
 impl TerminalPanel {
     pub fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let project = workspace.project();
@@ -125,10 +262,13 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) {
         let assistant_enabled = self.assistant_enabled;
+        let workspace = self.workspace.clone();
         terminal_pane.update(cx, |pane, cx| {
+            let workspace = workspace.clone();
             // window is unused since the focus guard was removed; every remaining
             // reference below is a closure parameter that shadows it.
             pane.set_render_tab_bar_buttons(cx, move |pane, _window, cx| {
+                let workspace = workspace.clone();
                 let split_context = pane
                     .active_item()
                     .and_then(|item| item.downcast::<TerminalView>())
@@ -170,24 +310,42 @@ impl TerminalPanel {
                             )
                             .anchor(Anchor::TopRight)
                             .with_handle(pane.new_item_context_menu_handle.clone())
-                            .menu(move |window, cx| {
-                                let focus_handle = focus_handle.clone();
-                                let menu = ContextMenu::build(window, cx, |menu, _, _| {
-                                    menu.context(focus_handle.clone())
-                                        .action(
+                            .menu({
+                                let workspace = workspace.clone();
+                                move |window, cx| {
+                                    let focus_handle = focus_handle.clone();
+                                    let workspace = workspace.clone();
+                                    let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                        menu = menu.context(focus_handle.clone()).action(
                                             "New Terminal",
                                             workspace::NewTerminal::default().boxed_clone(),
-                                        )
+                                        );
+
+                                        // Everything installed, so the chevron
+                                        // answers "what else can I open?" --
+                                        // which is the only reason to press it.
+                                        let shells = available_shells();
+                                        if !shells.is_empty() {
+                                            menu = menu.separator().header("Open With");
+                                            for shell in shells {
+                                                let workspace = workspace.clone();
+                                                menu = menu.entry(shell.label, None, move |window, cx| {
+                                                    open_shell(&workspace, &shell, window, cx);
+                                                });
+                                            }
+                                        }
+
                                         // We want the focus to go back to terminal panel once task modal is dismissed,
                                         // hence we focus that first. Otherwise, we'd end up without a focused element, as
                                         // context menu will be gone the moment we spawn the modal.
-                                        .action(
+                                        menu.separator().action(
                                             "Spawn Task",
                                             zed_actions::Spawn::modal().boxed_clone(),
                                         )
-                                });
+                                    });
 
-                                Some(menu)
+                                    Some(menu)
+                                }
                             }),
                     )
                     .when(assistant_enabled, |this| {
@@ -893,6 +1051,46 @@ impl TerminalPanel {
             })?;
             Ok(terminal.downgrade())
         })
+    }
+
+    /// Shows a terminal someone else created in the panel.
+    ///
+    /// Every other entry point here *creates* a terminal; this one takes one
+    /// that already exists. That is the whole point when an agent is running
+    /// commands: the terminal it made and the terminal you are watching should
+    /// be the same process with the same scrollback, not a copy that has to be
+    /// kept in step.
+    ///
+    /// The panel is opened but focus is left alone by default -- an agent
+    /// starting a command should not take the cursor out of the file you are
+    /// typing in.
+    pub fn adopt_terminal(
+        &mut self,
+        terminal: Entity<Terminal>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let (weak_workspace, database_id, project) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.weak_handle(),
+                workspace.database_id(),
+                workspace.project().downgrade(),
+            )
+        });
+
+        let terminal_view = Box::new(cx.new(|cx| {
+            TerminalView::new(terminal, weak_workspace, database_id, project, window, cx)
+        }));
+
+        let pane = self.active_pane.clone();
+        pane.update(cx, |pane, cx| {
+            pane.add_item(terminal_view, true, focus, None, window, cx);
+        });
+        cx.notify();
     }
 
     pub fn add_terminal_task(

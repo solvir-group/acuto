@@ -1367,6 +1367,16 @@ pub enum WindowBackgroundContent {
     Opaque,
     Transparent,
     Blurred,
+    /// The Windows 11 Mica material: the desktop wallpaper, blurred and tinted,
+    /// showing through the window.
+    ///
+    /// Ignored on platforms that have no such material, which fall back to
+    /// whatever the theme's own background colors say.
+    Mica,
+    /// Mica Alt: the same material, tinted more strongly. Windows uses it for
+    /// tabbed windows, where the extra contrast keeps a tab strip legible
+    /// against a bright wallpaper.
+    MicaAlt,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]

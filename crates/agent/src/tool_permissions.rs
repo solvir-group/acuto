@@ -570,6 +570,9 @@ mod tests {
         AgentSettings {
             enabled: true,
             button: true,
+            default_agent: Default::default(),
+            restore_threads_sidebar: false,
+            terminal_mode: Default::default(),
             dock: DockPosition::Right,
             flexible: true,
             default_width: px(300.),

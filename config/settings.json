@@ -2,10 +2,50 @@
   // Fork settings. Source of truth lives here; config\apply.ps1 copies this into
   // <data-dir>\config\settings.json. Hot-reloads - no rebuild, no restart.
 
+  // --------------------------------------------------------------- keybindings
+  //
+  // VS Code's, not Zed's. Almost everyone arriving here has years of VS Code
+  // muscle memory, and an editor that answers ctrl-b with something other than
+  // the sidebar is one they close inside a minute. Zed's own defaults are
+  // already close -- ctrl-b, ctrl-j, ctrl-`, ctrl-shift-e/g/d/x all match --
+  // so this overlay only carries the handful that genuinely diverge, listed in
+  // assets/keymaps/linux/vscode.json.
+  //
+  // Fork bindings live in config/keymap.json and are layered on top of this.
+  "base_keymap": "VSCode",
+
+  // ------------------------------------------------------------- claude code
+  //
+  // Registered here so it is present on a fresh install rather than something
+  // to be discovered in a menu. "Installed" for a registry agent means exactly
+  // this settings entry -- the onboarding "Install" button writes the same
+  // three lines -- so deleting this block is the uninstall, and the settings UI
+  // does it without touching the file.
+  //
+  // No API key is set. Claude Code signs in against the user's Anthropic
+  // account and bills their subscription, which is the point: the editor should
+  // use the plan they already pay for rather than quietly spending API credit.
+  "agent_servers": {
+    "claude-acp": {
+      "type": "registry",
+      // Edits land without a prompt each time; shell commands still ask.
+      //
+      // The next step up is "bypassPermissions", which is Claude Code's
+      // --allow-dangerously-skip-permissions: it stops asking before running
+      // shell commands too. That is a real blast radius on a machine with
+      // credentials and a network, so it is a decision to make deliberately
+      // rather than a default to inherit.
+      "default_mode": "acceptEdits"
+    }
+  },
+
+  // "light" is the frosted glass theme: translucent chrome over the Windows 11
+  // Mica material, so the desktop shows through as a wash of colour. Switch to
+  // it with mode: "light" or mode: "system".
   "theme": {
     "mode": "dark",
     "dark": "Monochrome Dark",
-    "light": "Monochrome Dark"
+    "light": "Acuto Frosted"
   },
 
   // ---------------------------------------------------------------- typography
@@ -20,8 +60,8 @@
   // Mono was installed the whole interface came back monospace, menus and
   // panels included. A first entry that resolves means the fallbacks never have
   // to be guessed at.
-  "ui_font_family": "Segoe UI",
-  "ui_font_fallbacks": ["Segoe UI Variable Text"],
+  "ui_font_family": "Inter",
+  "ui_font_fallbacks": ["Segoe UI Variable Text", "Segoe UI"],
   "ui_font_size": 15.5,
   "ui_font_weight": 400,
 
@@ -39,8 +79,14 @@
   //
   // No setting can undo it; the fix is the licensed font. If that is bought,
   // change this one line back to its family name and delete this note.
-  "buffer_font_family": "Cascadia Mono",
-  "buffer_font_fallbacks": ["Consolas"],
+  // WARNING: this is the *trial* build, and it ships deliberately swapped
+  // glyphs as its watermark -- its own README build log records
+  // "Swapping glyphs: backslash,slash" and "asterisk,numbersign". So `/` draws
+  // as `\`, `#` draws as `*`, and vice versa, in every file. Verified in the
+  // font binary, not inferred. Buying the licensed font fixes it without any
+  // change here beyond the family name.
+  "buffer_font_family": "Berkeley Mono Trial",
+  "buffer_font_fallbacks": ["Cascadia Mono", "Consolas"],
   "buffer_font_size": 14,
   "buffer_font_weight": 400,
   // 1.75 was the original spec value, but these grotesque monos have a tall
@@ -53,8 +99,10 @@
   // Mono for anything that is code. The agent panel follows the same split --
   // its prose in the UI font, the code it quotes in the code font -- rather
   // than introducing a third.
-  "agent_ui_font_family": "Segoe UI",
-  "agent_buffer_font_family": "Cascadia Mono",
+  // Both Inter: the agent panel is prose, including the messages you type into
+  // it. A monospace face there made a chat window look like a diff.
+  "agent_ui_font_family": "Inter",
+  "agent_buffer_font_family": "Inter",
 
   // UNSTABLE upstream ("expect many elements to be broken"). It is the single
   // biggest lever on density. FIRST THING TO REMOVE if the UI looks wrong.
@@ -127,11 +175,26 @@
 
   "agent": {
     "dock": "right",
+    // Where the agent's commands run. "panel" hands them to the terminal dock
+    // you already have open -- the same process, shown in the window you were
+    // already watching, rather than in a card inside the thread.
+    "terminal_mode": "panel",
+    // Elapsed time and token count during a turn. Off upstream; on here
+    // because "is it working or stuck?" is the first question anyone asks of
+    // an agent, and a number answers it where a spinner does not.
+    "show_turn_stats": true,
     // Composer height. Default is 4 lines.
     "message_editor_min_lines": 2,
     // Fixed rather than filling the panel: the composer keeps a constant width
     // as the sidebar is resized, so it does not reflow while typing.
-    "max_content_width": 420,
+    // Content fills the panel rather than sitting in a fixed 420px column.
+    //
+    // The old value kept the composer a constant width while the sidebar was
+    // resized, which it did -- and it also pinned the *transcript* to 420px, so
+    // an answer stayed in a narrow ribbon no matter how wide the panel was
+    // dragged. Text should reflow to the space it is given; a composer that
+    // reflows with it is the smaller cost.
+    "limit_content_width": false,
     // Reasoning stays folded away. The default expands it while streaming and
     // collapses it afterwards, which makes the transcript jump as the model
     // thinks; the summary line still says what it is doing.
@@ -162,8 +225,8 @@
     "env": {
       "EDITOR": "C:/Users/broad/zed/target/debug/zed.exe --user-data-dir C:/Users/broad/zed-fork-data --wait"
     },
-    "font_family": "Cascadia Mono",
-    "font_fallbacks": ["Consolas"],
+    "font_family": "Berkeley Mono Trial",
+    "font_fallbacks": ["Cascadia Mono", "Consolas"],
     "font_size": 14,
     "line_height": { "custom": 1.5 }
   },
@@ -176,7 +239,10 @@
   },
 
   "tabs": {
-    "file_icons": false,
+    // A tab strip of identical grey rectangles is read by shape, which means
+    // reading every label. Icons let a file type, a terminal, an agent thread
+    // and a diff be told apart at a glance.
+    "file_icons": true,
     "git_status": false,
     "show_close_button": "hover",
     "close_position": "right"

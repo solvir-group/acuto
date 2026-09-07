@@ -44,8 +44,8 @@ use rayon::slice::ParallelSliceMut;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{
-    DockSide, ProjectPanelEntrySpacing, Settings, SettingsStore, ShowDiagnostics, ShowIndentGuides,
-    update_settings_file,
+    DockSide, FileIconColors, ProjectPanelEntrySpacing, Settings, SettingsStore, ShowDiagnostics,
+    ShowIndentGuides, update_settings_file,
 };
 use smallvec::SmallVec;
 use std::{
@@ -642,6 +642,17 @@ fn get_item_color(is_sticky: bool, cx: &App) -> ItemColors {
 /// `color_for_index` wraps modulo the array length, so a theme shipping fewer
 /// accents degrades to a repeated color rather than panicking.
 fn entry_icon_color(kind: EntryKind, file_name: &str, cx: &App) -> Color {
+    if ProjectPanelSettings::get_global(cx).file_icon_colors == FileIconColors::Monochrome {
+        return Color::Muted;
+    }
+
+    // A directory is not a kind of file, so it does not take a file's colour.
+    // Tinting every folder with the first accent made the panel read as a
+    // column of blue with the actual files as an afterthought.
+    if !matches!(kind, EntryKind::File) {
+        return Color::Muted;
+    }
+
     let index = match kind {
         EntryKind::File => {
             let extension = Path::new(file_name)
@@ -6739,8 +6750,16 @@ impl ProjectPanel {
             .get(&(worktree_id, entry.path.clone()))
             .copied();
 
+        // Green filenames for anything added or untracked meant a fresh
+        // checkout, or any branch with new files on it, rendered most of the
+        // tree in green -- which says "new" about so many rows that it stops
+        // meaning anything and just makes the panel hard to read. Modified and
+        // deleted keep their colours: those are the ones worth spotting.
         let filename_text_color =
-            entry_git_aware_label_color(git_status, entry.is_ignored, is_marked);
+            match entry_git_aware_label_color(git_status, entry.is_ignored, is_marked) {
+                Color::Created => Color::Default,
+                color => color,
+            };
 
         let is_cut = self
             .clipboard

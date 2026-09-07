@@ -1369,6 +1369,12 @@ impl Render for AgentDiffToolbar {
 pub struct AgentDiff {
     reviewing_editors: HashMap<WeakEntity<Editor>, EditorState>,
     workspace_threads: HashMap<WeakEntity<Workspace>, WorkspaceThread>,
+    /// The in-flight verdict on each workspace's last agent turn.
+    ///
+    /// Held so it can be cancelled: starting another turn before the last one
+    /// has been judged should replace the report, not race it. Dropping the task
+    /// is the cancellation.
+    change_reports: HashMap<WeakEntity<Workspace>, Task<()>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1566,6 +1572,13 @@ impl AgentDiff {
             }
             AcpThreadEvent::Stopped(_) => {
                 self.update_reviewing_editors(workspace, window, cx);
+                // The agent has finished. Ask the language servers what they
+                // make of what it wrote, rather than leaving the user to find
+                // out by reading every line of it.
+                let action_log = thread.read(cx).action_log().clone();
+                let report =
+                    crate::change_report::report(action_log, workspace.clone(), cx);
+                self.change_reports.insert(workspace.clone(), report);
             }
             AcpThreadEvent::Error | AcpThreadEvent::LoadError(_) | AcpThreadEvent::Refusal => {
                 self.update_reviewing_editors(workspace, window, cx);

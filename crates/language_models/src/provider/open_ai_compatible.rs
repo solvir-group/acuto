@@ -505,6 +505,7 @@ mod tests {
             max_output_tokens: None,
             max_completion_tokens: None,
             reasoning_effort,
+            extra_body: Default::default(),
             capabilities: ModelCapabilities {
                 chat_completions: false,
                 ..Default::default()

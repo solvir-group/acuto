@@ -77,9 +77,83 @@ pub(crate) fn settings_data(cx: &App) -> Vec<SettingsPage> {
         version_control_page(),
         collaboration_page(),
         ai_page(cx),
+        agents_page(),
         network_page(),
         developer_page(cx),
     ]
+}
+
+/// Settings for the agents themselves, as opposed to the models behind them.
+///
+/// Separate from the general AI page because the questions are different in
+/// kind: the AI page is about which model answers, and this is about which
+/// agent opens and how much of the machine it is allowed to drive. Someone
+/// deciding whether an agent may run commands in their live terminal should not
+/// have to find that decision between two model pickers.
+fn agents_page() -> SettingsPage {
+    SettingsPage {
+        title: "Agents",
+        items: vec![
+            SettingsPageItem::SectionHeader("Threads"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Default Agent",
+                description: "Which agent a new agent tab opens with. The other one stays available from the agent picker in any thread.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.default_agent"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.default_agent.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.agent.get_or_insert_default().default_agent = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Restore Threads Sidebar",
+                description: "Reopen the threads sidebar on launch if it was open when you quit. Off by default, so a window starts with the space given to your code.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.restore_threads_sidebar"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .restore_threads_sidebar
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .restore_threads_sidebar = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SectionHeader("Terminal"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Where Commands Run",
+                description: "Inline keeps the agent's commands in the thread, in a terminal it owns. Panel runs them in the terminal dock you already have open, so you watch the agent work in the window you were already watching. It is the same process either way, not a copy.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.terminal_mode"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.terminal_mode.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.agent.get_or_insert_default().terminal_mode = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+        .into_boxed_slice(),
+    }
 }
 
 fn developer_page(cx: &App) -> SettingsPage {
@@ -5133,7 +5207,7 @@ fn window_and_layout_page() -> SettingsPage {
 }
 
 fn panels_page() -> SettingsPage {
-    fn project_panel_section() -> [SettingsPageItem; 29] {
+    fn project_panel_section() -> [SettingsPageItem; 30] {
         [
             SettingsPageItem::SectionHeader("Project Panel"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -5191,6 +5265,29 @@ fn panels_page() -> SettingsPage {
                             .project_panel
                             .get_or_insert_default()
                             .hide_gitignore = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "File Icon Colors",
+                description: "Tint file and folder icons by what kind of file they are, or draw them all in one muted color.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("project_panel.file_icon_colors"),
+                    pick: |settings_content| {
+                        settings_content
+                            .project_panel
+                            .as_ref()?
+                            .file_icon_colors
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .project_panel
+                            .get_or_insert_default()
+                            .file_icon_colors = value;
                     },
                 }),
                 metadata: None,

@@ -42,13 +42,19 @@ use language_model::{
 use notifications::status_toast::StatusToast;
 use settings::{update_settings_file, update_settings_file_with_completion};
 use ui::{
-    ButtonLike, CalloutBorderPosition, Checkbox, DotSpinner, SpinnerLabel, SpinnerVariant,
+    ButtonLike, CalloutBorderPosition, Checkbox, DotSpinner, ShimmerLabel, SpinnerLabel,
+    SpinnerVariant,
     SplitButton,
     SplitButtonStyle, Tab, ToggleState,
 };
 use util::markdown::{source_position_from_fragment, split_local_url_fragment};
 use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 
+use super::claude_brand::{
+    RemoteControlStatus, UsageLimit, claude_clay, claude_greeting,
+    mode_skips_permission_prompts, parse_usage_limit, relaxed_permissions_warning,
+    remote_control_indicator, thinking_word, usage_limit_reset_label,
+};
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
@@ -211,9 +217,20 @@ impl GeneratingSpinner {
     }
 }
 
+/// How wide the composer is allowed to get.
+///
+/// Wide enough for a paragraph without wrapping mid-thought, narrow enough that
+/// the controls stay in reach of the text rather than stranded at the far edge
+/// of a maximised window.
+const COMPOSER_MAX_WIDTH: f32 = 440.;
+
 impl Render for GeneratingSpinner {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        SpinnerLabel::with_variant(self.variant).size(LabelSize::Small)
+        let label = SpinnerLabel::with_variant(self.variant).size(LabelSize::Small);
+        match self.variant {
+            SpinnerVariant::Claude => label.color(Color::Custom(claude_clay())),
+            _ => label,
+        }
     }
 }
 
@@ -233,6 +250,7 @@ impl RenderOnce for GeneratingSpinnerElement {
         let id = match self.variant {
             SpinnerVariant::Dots => "generating-spinner-view",
             SpinnerVariant::Sand => "confirmation-spinner-view",
+            SpinnerVariant::Claude => "claude-spinner-view",
             _ => "spinner-view",
         };
         window.with_id(id, |window| {
@@ -637,6 +655,14 @@ pub struct ThreadView {
     pending_sandbox_status_key: Option<SandboxStatusKey>,
     pub multi_root_callout_dismissed: bool,
     pub generating_indicator_in_list: bool,
+    /// Which list row the generating spinner occupies, recorded when it is
+    /// spliced in.
+    ///
+    /// Held rather than derived: the render closure runs while the list holds
+    /// its own `RefCell` borrow, so asking the list anything from in there
+    /// panics, and deriving it from the entry count is what let a newly
+    /// arrived entry steal the spinner's row for a frame.
+    generating_indicator_index: Option<usize>,
     pub skill_loading_issues: Vec<SkillLoadingIssue>,
     /// Issues the user has explicitly dismissed. Each entry is matched against
     /// emitted issues by full equality; when an issue no longer appears in the
@@ -1047,6 +1073,7 @@ impl ThreadView {
             pending_sandbox_status_key: None,
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
+            generating_indicator_index: None,
             skill_loading_issues: Vec::new(),
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
@@ -1233,6 +1260,29 @@ impl ThreadView {
 
     fn is_subagent(&self) -> bool {
         self.parent_session_id.is_some()
+    }
+
+    /// Whether the agent is currently allowed to act without asking first.
+    ///
+    /// Read from the agent's own reported mode rather than from a setting, so
+    /// it follows the dropdown the moment it changes -- including a mode the
+    /// agent switched to on its own mid-session.
+    fn permissions_are_relaxed(&self, cx: &App) -> bool {
+        self.config_options_view
+            .as_ref()
+            .and_then(|view| {
+                view.read(cx)
+                    .current_value_for_category(acp::SessionConfigOptionCategory::Mode)
+            })
+            .is_some_and(|value| mode_skips_permission_prompts(value.0.as_ref()))
+    }
+
+    /// Whether this thread is being answered by Claude Code.
+    ///
+    /// Drives appearance only. Every behavioural difference between agents
+    /// comes from the capabilities the agent reports, not from its name.
+    fn is_claude(&self) -> bool {
+        self.agent_id.as_ref() == agent_servers::CLAUDE_AGENT_ID
     }
 
     /// Returns the currently active editor, either for a message that is being
@@ -4348,7 +4398,6 @@ impl ThreadView {
             (IconName::Maximize, "Expand Message Editor")
         };
 
-        let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let has_messages = self.list_state.item_count() > 0;
         // Previously `!has_messages || editor_expanded`. On an empty thread the
         // composer stretched to fill the panel; now it keeps its natural height so
@@ -4372,19 +4421,39 @@ impl ThreadView {
                     // Empty thread: centre the composer in the panel instead of
                     // stretching it. justify_center on this row handles the
                     // horizontal axis already; items_center handles the vertical.
-                    this.flex_1().size_full().items_center()
+                    //
+                    // For Claude the row becomes a column so the mascot can sit
+                    // above the composer: an empty panel is otherwise a box and
+                    // a caret, which says nothing about who is about to answer.
+                    this.flex_1()
+                        .size_full()
+                        .items_center()
+                        .when(self.is_claude(), |this| {
+                            this.flex_col().gap_2().child(claude_greeting(cx))
+                        })
                 }
             })
             .child(
                 v_flex()
-                    .when_some(max_content_width, |this, max_w| this.flex_basis(max_w))
-                    .when(max_content_width.is_none(), |this| this.w_full())
+                    // The composer keeps a constant width while the transcript
+                    // reflows. They want opposite things: an answer should use
+                    // whatever width it is given, and an input that grows with
+                    // the panel makes the caret travel further with every drag
+                    // for no benefit -- nobody writes a prompt 1400px wide.
+                    //
+                    // `max_w` rather than a fixed width so a narrow panel still
+                    // gets a usable composer instead of one clipped at its edge.
+                    .w_full()
+                    .max_w(px(COMPOSER_MAX_WIDTH))
                     .min_w_0()
                     .when(fills_container, |this| this.h_full())
                     // The box wraps this container rather than the editor alone,
                     // so the send button, model selector and context controls sit
                     // inside the input instead of floating beneath it.
                     .border_1()
+                    // Plain. A permanently tinted input is decoration, and the
+                    // permission warning it used to carry now sits beside the
+                    // control that sets it.
                     .border_color(cx.theme().colors().border)
                     .rounded_md()
                     // Not editor_background: the composer should read as a raised
@@ -4448,30 +4517,65 @@ impl ThreadView {
                                 )
                             }),
                     )
-                    .child(
+                    .child({
+                        // An external agent enforces its own permissions and
+                        // reports its own modes, so the native controls for
+                        // following, auto-accept, fast mode and thinking either
+                        // do nothing there or duplicate something the agent's
+                        // own config selector already shows. Five extra buttons
+                        // is what pushed this row onto a second and third line.
+                        let is_native = self.agent_id.as_ref() == agent::ZED_AGENT_ID.as_ref();
+                        let has_slash_commands =
+                            self.session_capabilities.read().has_slash_completions();
+
                         h_flex()
                             .w_full()
                             .min_w_0()
                             .flex_none()
-                            .flex_wrap()
+                            // Deliberately not wrapping. Wrapping is what made
+                            // the composer grow downwards as controls were
+                            // added; a single row that stays a single row is
+                            // the point.
                             .justify_between()
+                            .gap_1()
                             .child(
                                 h_flex()
                                     .min_w_0()
-                                    .flex_wrap()
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
-                                    .child(self.render_follow_toggle(cx))
-                                    .child(self.render_auto_accept_control(cx))
-                                    .children(self.render_fast_mode_control(cx))
-                                    .children(self.render_thinking_control(cx)),
+                                    .when(has_slash_commands, |this| {
+                                        this.child(self.render_slash_command_button(cx))
+                                    })
+                                    // How full the context window is, as a ring.
+                                    // It was written and then never placed, so
+                                    // the one number that decides whether a long
+                                    // thread is about to be compacted was not on
+                                    // screen anywhere.
+                                    .children(self.render_token_usage(cx))
+                                    // Claude threads only: the bridge drives
+                                    // Claude sessions, so on a native thread the
+                                    // light would be true but irrelevant.
+                                    .when(
+                                        self.is_claude() && RemoteControlStatus::bridge_running(cx),
+                                        |this| this.child(remote_control_indicator()),
+                                    )
+                                    .when(is_native, |this| {
+                                        this.child(self.render_follow_toggle(cx))
+                                            .child(self.render_auto_accept_control(cx))
+                                            .children(self.render_fast_mode_control(cx))
+                                            .children(self.render_thinking_control(cx))
+                                    }),
                             )
                             .child(
                                 h_flex()
                                     .min_w_0()
-                                    .flex_wrap()
                                     .gap_1()
-                                    .children(self.profile_selector.clone())
+                                    .when(self.permissions_are_relaxed(cx), |this| {
+                                        this.child(relaxed_permissions_warning())
+                                    })
+                                    .when(is_native, |this| {
+                                        this.children(self.profile_selector.clone())
+                                    })
                                     .map(|this| match self.config_options_view.clone() {
                                         Some(config_view) => this.child(config_view),
                                         None => this
@@ -4479,8 +4583,8 @@ impl ThreadView {
                                             .children(self.model_selector.clone()),
                                     })
                                     .child(self.render_send_button(cx)),
-                            ),
-                    ),
+                            )
+                    }),
             )
             .into_any()
     }
@@ -5515,11 +5619,20 @@ impl ThreadView {
             } else {
                 IconName::Send
             };
+            let is_claude = self.is_claude();
             IconButton::new("send-message", send_icon)
                 .style(ButtonStyle::Filled)
                 .map(|this| {
                     if is_editor_empty && !is_generating {
                         this.disabled(true).icon_color(Color::Muted)
+                    } else if is_claude {
+                        // Brand in the glyph, not in the box. A filled orange
+                        // button is the single most conspicuous thing in an
+                        // otherwise monochrome editor, and it made the panel
+                        // read as an advert for the agent rather than a control
+                        // for it. The tinted icon still says whose thread this
+                        // is, at a fraction of the volume.
+                        this.icon_color(Color::Custom(claude_clay()))
                     } else {
                         this.icon_color(Color::Accent)
                     }
@@ -6190,13 +6303,17 @@ impl ThreadView {
             self.list_state.clone(),
             cx.processor(move |this, index: usize, window, cx| {
                 let entries = this.thread.read(cx).entries();
-                if let Some(entry) = entries.get(index) {
-                    let rendered = this.render_entry(index, entries.len(), entry, window, cx);
-                    centered_container(rendered.into_any_element()).into_any_element()
-                } else if this.generating_indicator_in_list {
+                // The spinner owns the last slot, and the list is the authority
+                // on where that is. Deriving it from `entries` instead let a
+                // newly arrived entry claim the spinner's row for the frame
+                // before the list was re-spliced.
+                if this.generating_indicator_index == Some(index) {
                     let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
                         || this.has_pending_request_elicitation(cx);
                     let rendered = this.render_generating(confirmation, cx);
+                    centered_container(rendered.into_any_element()).into_any_element()
+                } else if let Some(entry) = entries.get(index) {
+                    let rendered = this.render_entry(index, entries.len(), entry, window, cx);
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else {
                     Empty.into_any()
@@ -7400,11 +7517,46 @@ impl ThreadView {
             let entries_count = self.thread.read(cx).entries().len();
             self.list_state.splice(entries_count..entries_count, 1);
             self.generating_indicator_in_list = true;
+            self.generating_indicator_index = Some(entries_count);
+        } else if is_generating && self.generating_indicator_in_list {
+            // A new entry is spliced in *before* this row, so the list shifts
+            // the spinner down by one on its own. Re-reading the count here is
+            // what keeps the recorded row in step with where it actually moved
+            // to; until this runs the old value is still correct, which is the
+            // whole point -- the row stays put for the frames between the
+            // thread appending an entry and the list being told about it.
+            self.generating_indicator_index = Some(thread.entries().len());
         } else if !is_generating && self.generating_indicator_in_list {
-            let entries_count = self.thread.read(cx).entries().len();
-            self.list_state.splice(entries_count..entries_count + 1, 0);
+            // Remove the row the spinner was actually put in, not the one
+            // the entry count implies: if an entry arrived since the splice
+            // those two differ, and the mismatch takes a real row with it.
+            let last = self
+                .generating_indicator_index
+                .unwrap_or_else(|| self.thread.read(cx).entries().len());
+            self.list_state.splice(last..last + 1, 0);
             self.generating_indicator_in_list = false;
+            self.generating_indicator_index = None;
         }
+    }
+
+    /// Types `/` into the composer and focuses it.
+    ///
+    /// Slash commands are already discoverable by typing the character, which
+    /// is invisible to anyone who has not been told. A button costs one glyph
+    /// of space and turns a secret into an affordance.
+    fn render_slash_command_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        IconButton::new("insert-slash-command", IconName::Slash)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(Tooltip::text("Commands"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.message_editor.update(cx, |editor, cx| {
+                    editor.insert_text("/", window, cx);
+                });
+                this.message_editor
+                    .focus_handle(cx)
+                    .focus(window, cx);
+            }))
     }
 
     fn render_generating(&self, confirmation: bool, cx: &App) -> impl IntoElement {
@@ -7460,6 +7612,35 @@ impl ThreadView {
                     )
                 } else if is_blocked_on_terminal_command {
                     this
+                } else if self.is_claude() {
+                    // Claude thinks with its own mascot and its own vocabulary.
+                    // Someone who has used Claude Code in a terminal recognises
+                    // this without reading anything, which is the whole point of
+                    // it being different from the house spinner.
+                    let elapsed = self
+                        .turn_fields
+                        .turn_started_at
+                        .map(|started_at| started_at.elapsed().as_secs())
+                        .unwrap_or_default();
+
+                    this.child(
+                        h_flex()
+                            .w_4()
+                            .justify_center()
+                            .child(GeneratingSpinnerElement::new(SpinnerVariant::Claude)),
+                    )
+                    .child(
+                        // The word itself is plain text, not brand colour. The
+                        // clay is already carried by the mascot beside it, and
+                        // saying it twice made the pair read as a warning rather
+                        // than as something working.
+                        ShimmerLabel::new(
+                            "claude-thinking-word",
+                            thinking_word(elapsed),
+                            cx.theme().colors().text,
+                        )
+                        .size(LabelSize::Small),
+                    )
                 } else {
                     this.child(
                         h_flex()
@@ -11142,7 +11323,11 @@ impl ThreadView {
     ) -> Option<Div> {
         let callout = match self.thread_error.as_ref()? {
             ThreadError::Other { message, .. } => {
-                self.render_any_thread_error(message.clone(), window, cx)
+                let message = message.clone();
+                match parse_usage_limit(&message) {
+                    Some(limit) => self.render_usage_limit_callout(&limit, cx),
+                    None => self.render_any_thread_error(message, window, cx),
+                }
             }
             ThreadError::Refusal => self.render_refusal_error(cx),
             ThreadError::DataRetentionConsentRequired => {
@@ -11251,6 +11436,32 @@ impl ThreadView {
         };
 
         Some(div().child(callout.border_position(self.callout_border_position())))
+    }
+
+    /// A spent Claude subscription window, said plainly.
+    ///
+    /// Claude reports this as an ordinary error, so it otherwise arrives as "An
+    /// Error Happened" with a wall of prose under it -- indistinguishable from a
+    /// crash, and offering a retry button that cannot possibly work. Nothing is
+    /// broken here and there is nothing to fix, so the callout says when the
+    /// limit lifts and stops.
+    fn render_usage_limit_callout(&self, limit: &UsageLimit, cx: &mut Context<Self>) -> Callout {
+        let mut description = String::from(
+            "Claude's usage limit for this window has been reached, so it cannot answer \
+             until the window rolls over. The thread is saved and picks up where it left off.",
+        );
+        if let Some(reset) = usage_limit_reset_label(limit) {
+            description.push(' ');
+            description.push_str(&reset);
+        }
+
+        Callout::new()
+            .severity(Severity::Warning)
+            .icon(IconName::CountdownTimer)
+            .title("Claude Usage Limit Reached")
+            .description(description.clone())
+            .actions_slot(self.create_copy_button(description))
+            .dismiss_action(self.dismiss_error_button(cx))
     }
 
     fn render_refusal_error(&self, cx: &mut Context<'_, Self>) -> Callout {

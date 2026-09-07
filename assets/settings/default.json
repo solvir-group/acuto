@@ -835,6 +835,13 @@
     "entry_spacing": "comfortable",
     // Whether to show file icons in the project panel.
     "file_icons": true,
+    // Whether file and folder icons are tinted by what kind of file they are.
+    //
+    // "colored" tints each icon from the theme's accent colours; "monochrome"
+    // draws them all in the same muted foreground.
+    //
+    // Default: colored
+    "file_icon_colors": "colored",
     // Whether to show folder icons or chevrons for directories in the project panel.
     "folder_icons": true,
     // Whether to show the git status in the project panel.
@@ -1301,6 +1308,22 @@
     //
     // Default: true
     "expand_terminal_card": true,
+    // Where terminal commands the agent runs should appear.
+    //
+    // "inline" keeps them in the thread, in a terminal it owns.
+    // "panel" runs them in the terminal dock you already have open, so you
+    // watch the agent work in the window you were already watching.
+    //
+    // Default: inline
+    "terminal_mode": "inline",
+    // Which agent a new agent tab opens.
+    //
+    // Default: acuto
+    "default_agent": "acuto",
+    // Whether to reopen the threads sidebar on launch when it was open at quit.
+    //
+    // Default: false
+    "restore_threads_sidebar": false,
     // Command to automatically run when Acuto creates a Terminal Thread shell in the agent panel.
     // The command is sent to the shell as if typed, so it is interpreted by your
     // configured shell (including on Windows and remote/WSL projects).

@@ -6,6 +6,7 @@ mod agent_panel;
 pub mod agent_thread_item;
 mod agent_registry_ui;
 mod buffer_codegen;
+mod change_report;
 mod completion_provider;
 mod config_options;
 mod context;
@@ -26,6 +27,7 @@ mod model_selector;
 mod model_selector_popover;
 mod profile_selector;
 mod terminal_codegen;
+mod terminal_fix;
 mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;
 #[cfg(any(test, feature = "test-support"))]
@@ -383,6 +385,28 @@ pub struct ToggleCommandPattern {
 #[serde(deny_unknown_fields)]
 pub struct NewThread;
 
+/// Creates a new agent thread in the active pane, using whichever agent is
+/// configured for new tabs.
+#[derive(Default, Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct NewThreadInPane;
+
+/// Creates a new external agent conversation thread in the active pane rather
+/// than in the side panel.
+///
+/// A side panel is the right shape for a thread you glance at while reading
+/// code, and the wrong one for a thread that *is* the work -- which is what an
+/// agent opened deliberately from the launchpad is.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct NewExternalAgentThreadInPane {
+    /// The agent id to use for the conversation.
+    #[serde(deserialize_with = "deserialize_external_agent_id")]
+    pub agent: AgentId,
+}
+
 /// Creates a new external agent conversation thread.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = agent)]
@@ -589,6 +613,8 @@ pub fn init(
 ) {
     agent::ThreadStore::init_global(cx);
     prompt_store::init(cx);
+    terminal_fix::init(cx);
+    conversation_view::claude_brand::RemoteControlStatus::init(cx);
 
     cx.set_global(agent_skills::SkillsUpdatedHook(std::rc::Rc::new(|cx| {
         let workspaces: Vec<_> = workspace::AppState::global(cx)
@@ -976,6 +1002,9 @@ mod tests {
         let agent_settings = AgentSettings {
             enabled: true,
             button: true,
+            default_agent: Default::default(),
+            restore_threads_sidebar: false,
+            terminal_mode: Default::default(),
             dock: DockPosition::Right,
             flexible: true,
             default_width: px(300.),

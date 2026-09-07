@@ -778,6 +778,10 @@ pub struct ProjectPanelSettingsContent {
     ///
     /// Default: true
     pub file_icons: Option<bool>,
+    /// Whether file and folder icons are tinted by what kind of file they are.
+    ///
+    /// Default: colored
+    pub file_icon_colors: Option<FileIconColors>,
     /// Whether to show folder icons or chevrons for directories in the project panel.
     ///
     /// Default: true
@@ -878,6 +882,36 @@ pub enum ProjectPanelEntrySpacing {
     Comfortable,
     /// The standard spacing of entries.
     Standard,
+}
+
+/// Whether file and folder icons are tinted by file kind.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FileIconColors {
+    /// Tint each icon by what kind of file it is, from the theme's accents.
+    ///
+    /// Colour is what makes a long file list scannable without reading it: the
+    /// block of config files is visible as a shape before any name is read.
+    #[default]
+    Colored,
+    /// Draw every icon in the same muted foreground.
+    ///
+    /// For a theme whose whole point is restraint, and for anyone who finds a
+    /// coloured list noisier than a plain one.
+    Monochrome,
 }
 
 #[derive(

@@ -150,6 +150,12 @@ pub struct TerminalView {
     show_breadcrumbs: bool,
     block_below_cursor: Option<Rc<BlockProperties>>,
     scroll_top: Pixels,
+    /// The failed command the notice is currently offering to fix.
+    ///
+    /// Cleared the moment anything else runs: an offer to fix a build that is
+    /// three commands old is noise, and acting on it would send the wrong
+    /// output to the model.
+    failure_notice: Option<terminal::blocks::BlockId>,
     /// Command history and the suggestion drawn from it.
     ///
     /// Per view rather than global: two terminals in different directories
@@ -310,6 +316,7 @@ impl TerminalView {
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
+            failure_notice: None,
             history: {
                 let mut history = terminal_completion::HistoryStore::new(
                     uuid::Uuid::new_v4().to_string(),
@@ -318,14 +325,19 @@ impl TerminalView {
                 // Seeded so the very first prompt already suggests. Nothing is
                 // written back to the shell's file; it belongs to the shell.
                 let program = TerminalSettings::get_global(cx).shell.program();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs() as i64)
+                    .unwrap_or_default();
                 if let Some(kind) = terminal_completion::ShellHistoryKind::from_program(&program) {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|elapsed| elapsed.as_secs() as i64)
-                        .unwrap_or_default();
                     let seeded = history.seed_from_shell_history(kind, now);
                     log::info!("terminal completion: seeded {seeded} commands from {kind:?}");
                 }
+                // Everything installed, not only everything already typed. A
+                // history-only completion is blind to the tool the user just
+                // installed, which is exactly when they need help spelling it.
+                let from_path = history.seed_from_path_commands(now);
+                log::info!("terminal completion: seeded {from_path} commands from PATH");
                 history
             },
             suggestion: None,
@@ -1182,6 +1194,19 @@ fn subscribe_for_terminal_events(
                     cx.emit(SearchEvent::MatchesInvalidated);
                 }
 
+                Event::CommandBlockFinished(id) => {
+                    // Only the newest command is ever on offer, so a success
+                    // clears a previous failure's notice rather than leaving it
+                    // to be dismissed by hand.
+                    let failed = terminal
+                        .read(cx)
+                        .blocks()
+                        .get(*id)
+                        .is_some_and(|block| block.failed());
+                    terminal_view.failure_notice = failed.then_some(*id);
+                    cx.notify();
+                }
+
                 Event::Bell => {
                     terminal_view.has_bell = true;
                     if let TerminalBell::System = TerminalSettings::get_global(cx).bell {
@@ -1585,6 +1610,125 @@ impl TerminalView {
     }
 }
 
+impl TerminalView {
+    /// The bar that appears when a command fails.
+    ///
+    /// The whole point of tracking blocks: the editor already knows the command
+    /// failed, what it printed, and where it ran, so the user should not have to
+    /// select the error, copy it, and describe the situation to something else.
+    ///
+    /// Anchored over the terminal rather than added above or below it, so
+    /// appearing does not resize the grid -- a reflow on every failed command
+    /// would move the output you are trying to read.
+    fn render_failure_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let id = self.failure_notice?;
+        let terminal = self.terminal.read(cx);
+        let block = terminal.blocks().get(id)?;
+
+        let command = block.command.clone();
+        let rerun_command = command.clone();
+        let exit = block
+            .exit_code
+            .map(|code| format!("exit {code}"))
+            .unwrap_or_else(|| "failed".to_string());
+        let duration = block
+            .slow_duration()
+            .map(|elapsed| format!("{:.1}s", elapsed.as_secs_f32()));
+
+        Some(
+            h_flex()
+                .absolute()
+                .bottom_2()
+                .right_3()
+                .max_w_2_3()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_lg()
+                .bg(cx.theme().colors().elevated_surface_background)
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .shadow_md()
+                .child(
+                    Icon::new(IconName::XCircle)
+                        .size(IconSize::Small)
+                        .color(Color::Error),
+                )
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_1p5()
+                        .child(
+                            Label::new(command)
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        )
+                        .child(
+                            Label::new(exit)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .children(duration.map(|duration| {
+                            Label::new(duration)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                        })),
+                )
+                .child(
+                    Button::new("terminal-fix-failure", "Fix")
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                        .tooltip(Tooltip::text("Turn this failure into a diff you can review"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.fix_failure(window, cx)
+                        })),
+                )
+                .child(
+                    IconButton::new("terminal-rerun-failure", IconName::RotateCw)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Run it again"))
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.rerun(rerun_command.clone(), cx)
+                        })),
+                )
+                .child(
+                    IconButton::new("terminal-dismiss-failure", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Dismiss"))
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.failure_notice = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Types the command back at the prompt and runs it.
+    fn rerun(&mut self, command: String, cx: &mut Context<Self>) {
+        self.failure_notice = None;
+        self.terminal.update(cx, |terminal, _| {
+            terminal.input(format!("{command}\r").into_bytes());
+        });
+        cx.notify();
+    }
+
+    /// Hands the failure to whatever can turn it into a patch.
+    ///
+    /// Dispatched by name rather than by calling into the agent directly: this
+    /// crate has no business depending on a language model, and the handler
+    /// lives where the model already is.
+    fn fix_failure(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.failure_notice = None;
+        cx.notify();
+        if let Some(action) = cx.build_action("agent::FixTerminalFailure", None).log_err() {
+            window.dispatch_action(action, cx);
+        }
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // TODO: this should be moved out of render
@@ -1635,7 +1779,20 @@ impl Render for TerminalView {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    if !this.terminal.read(cx).mouse_mode(event.modifiers.shift) {
+                    if this.terminal.read(cx).mouse_mode(event.modifiers.shift) {
+                        return;
+                    }
+
+                    // Right-click is copy-or-paste, the way every other Windows
+                    // terminal behaves: with a selection it copies and clears,
+                    // without one it pastes. Reaching for a context menu to
+                    // paste is the single most jarring difference between this
+                    // terminal and the one people came from.
+                    //
+                    // The menu is still there on shift-right-click, so nothing
+                    // is lost -- and shift is already the modifier this handler
+                    // uses to opt out of the application's own mouse handling.
+                    if event.modifiers.shift {
                         let had_selection = this.terminal.read(cx).last_content.selection.is_some();
                         if !had_selection {
                             this.terminal.update(cx, |terminal, _| {
@@ -1652,7 +1809,23 @@ impl Render for TerminalView {
                                 .is_some_and(|text| !text.is_empty());
                         this.deploy_context_menu(event.position, has_selection, window, cx);
                         cx.notify();
+                        return;
                     }
+
+                    let selection = this
+                        .terminal
+                        .read(cx)
+                        .last_content
+                        .selection_text
+                        .clone()
+                        .filter(|text| !text.is_empty());
+
+                    if selection.is_some() {
+                        this.copy(&Copy, window, cx);
+                    } else {
+                        this.paste(&Paste, window, cx);
+                    }
+                    cx.notify();
                 }),
             )
             .child(
@@ -1686,6 +1859,7 @@ impl Render for TerminalView {
                         )
                     }),
             )
+            .children(self.render_failure_notice(cx))
             .children(self.render_ghost_text(cx))
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(

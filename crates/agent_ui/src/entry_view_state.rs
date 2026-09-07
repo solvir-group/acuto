@@ -17,7 +17,7 @@ use language::language_settings::SoftWrap;
 use project::{AgentId, Project, project_settings::DiagnosticSeverity};
 use rope::Point;
 use settings::{Settings as _, ThinkingBlockDisplay};
-use terminal_view::TerminalView;
+use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use theme_settings::ThemeSettings;
 use ui::{Context, TextSize};
 use workspace::Workspace;
@@ -638,15 +638,47 @@ fn create_terminal(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<TerminalView> {
+    let inner = terminal.read(cx).inner().clone();
+
+    // In `panel` mode the same terminal is also shown in the dock, so the agent
+    // runs its command in the window the user is already watching rather than
+    // in a card they have to scroll the thread to find.
+    //
+    // The same entity, not a second one: one process, one scrollback, two views
+    // of it. The inline card stays either way -- it carries the exit status and
+    // the tool call it belongs to, which the dock has no way to show.
+    if AgentSettings::get_global(cx).terminal_mode == settings::AgentTerminalMode::Panel
+        && let Some(workspace_entity) = workspace.upgrade()
+    {
+        // The panel handle is looked up first and the borrow released before
+        // anything is done with it. `adopt_terminal` reads the workspace as its
+        // first act, so calling it from inside `workspace.update` asked GPUI to
+        // read an entity that was already leased for writing -- an immediate
+        // double-lease panic, on every thread containing a terminal tool call,
+        // not just when a command was run.
+        let panel = workspace_entity.read_with(cx, |workspace, cx| {
+            workspace.panel::<TerminalPanel>(cx)
+        });
+
+        if let Some(panel) = panel {
+            panel.update(cx, |panel, cx| {
+                // Never focused: a command starting should not take the cursor
+                // out of the file being typed in.
+                panel.adopt_terminal(inner.clone(), false, window, cx);
+            });
+
+            // Reveal the dock afterwards, in its own update. Adopting into a
+            // panel the user has closed puts the terminal somewhere real and
+            // completely invisible, which is indistinguishable from the setting
+            // doing nothing at all.
+            workspace_entity.update(cx, |workspace, cx| {
+                workspace.open_panel::<TerminalPanel>(window, cx);
+            });
+        }
+    }
+
     cx.new(|cx| {
-        let mut view = TerminalView::new(
-            terminal.read(cx).inner().clone(),
-            workspace,
-            None,
-            project,
-            window,
-            cx,
-        );
+        let mut view = TerminalView::new(inner, workspace, None, project, window, cx);
         view.set_embedded_mode(Some(1000), cx);
         view
     })

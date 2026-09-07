@@ -72,6 +72,7 @@ impl Drop for EditClaim {
 }
 
 /// Why a file could not be claimed.
+#[derive(Debug)]
 pub(crate) struct Blocked {
     pub holder_label: String,
 }

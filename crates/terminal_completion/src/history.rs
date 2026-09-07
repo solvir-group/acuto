@@ -142,6 +142,38 @@ impl HistoryStore {
         count
     }
 
+    /// Seeds every command available on `PATH`.
+    ///
+    /// Ranked below shell history on purpose: that a command exists is far
+    /// weaker evidence than that this user has run it. Back-dated a full day
+    /// past the seeded history so the decay curve keeps them underneath rather
+    /// than interleaved.
+    ///
+    /// This is what makes the first keystroke useful for a tool the user has
+    /// installed but never typed here -- the case a history-only completion can
+    /// never cover.
+    pub fn seed_from_path_commands(&mut self, now: i64) -> usize {
+        /// One day, in seconds. Far enough back that no seeded history entry
+        /// sorts below a bare command name.
+        const BACKDATE: i64 = 60 * 60 * 24;
+
+        let commands = crate::path_commands::read();
+        let count = commands.len();
+
+        for command in commands {
+            self.record(HistoryEntry {
+                command,
+                cwd: None,
+                exit_code: None,
+                started_at: now - BACKDATE,
+                duration_ms: 0,
+                session_id: SEEDED_SESSION.to_string(),
+            });
+        }
+
+        count
+    }
+
     /// Records a finished command.
     ///
     /// Blank commands are dropped, and so are immediate repeats — a user

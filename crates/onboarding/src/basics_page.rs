@@ -26,12 +26,17 @@ use crate::{
     theme_preview::{ThemePreviewStyle, ThemePreviewTile},
 };
 
-const LIGHT_THEMES: [&str; 3] = ["One Light", "Ayu Light", "Gruvbox Light"];
-const DARK_THEMES: [&str; 3] = ["One Dark", "Ayu Dark", "Gruvbox Dark"];
+// Acuto's own themes lead, because the first screen of a first launch is
+// where the product says what it looks like. The upstream families stay as the
+// alternatives rather than being removed.
+// Paired by index: the light theme and the dark theme of one family. Acuto's
+// own two families lead, with an upstream one kept as the familiar option.
+const LIGHT_THEMES: [&str; 3] = ["Acuto Frosted", "Acuto Paper", "One Light"];
+const DARK_THEMES: [&str; 3] = ["Acuto Glass", "Acuto Noir", "One Dark"];
 const FAMILY_NAMES: [SharedString; 3] = [
+    SharedString::new_static("Acuto Glass"),
+    SharedString::new_static("Acuto Solid"),
     SharedString::new_static("One"),
-    SharedString::new_static("Ayu"),
-    SharedString::new_static("Gruvbox"),
 ];
 
 fn get_theme_family_themes(theme_name: &str) -> Option<(&'static str, &'static str)> {
@@ -126,7 +131,14 @@ fn render_theme_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement
             Appearance::Dark => DARK_THEMES,
         };
 
-        let themes = theme_names.map(|theme| theme_registry.get(theme).unwrap());
+        // A named theme that is not registered -- renamed, or an install whose
+        // themes failed to load -- used to take the whole onboarding window
+        // down with it, on the one screen a user cannot skip past.
+        let themes = theme_names.map(|theme| {
+            theme_registry
+                .get(theme)
+                .unwrap_or_else(|_| cx.theme().clone())
+        });
 
         [0, 1, 2].map(|index| {
             let theme = &themes[index];

@@ -82,8 +82,20 @@ impl Item for AgentThreadItem {
             .into_any_element()
     }
 
-    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
-        Some(Icon::new(IconName::ZedAssistant))
+    /// The mark of whichever agent is in the thread.
+    ///
+    /// A Claude thread carries Claude's logo, a Gemini thread Gemini's. With
+    /// several agent tabs open, one shared assistant glyph makes them
+    /// indistinguishable until you read every title -- which is the moment the
+    /// icon was supposed to save.
+    fn tab_icon(&self, _window: &Window, cx: &App) -> Option<Icon> {
+        let icon = self
+            .conversation_view
+            .read(cx)
+            .root_thread_view()
+            .map(|thread_view| thread_view.read(cx).agent_icon)
+            .unwrap_or(IconName::ZedAssistant);
+        Some(Icon::new(icon))
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {

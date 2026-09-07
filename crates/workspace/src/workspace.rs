@@ -9864,7 +9864,13 @@ pub async fn apply_restored_multiworkspace_state(
             .ok();
     }
 
-    if *sidebar_open {
+    // The threads sidebar starts hidden unless it is asked for. It costs a
+    // third of the window's width and most sessions never touch it, so having
+    // it reappear at every launch because it was open once is the wrong
+    // default -- the toggle is still one keystroke away.
+    let restore_sidebar =
+        cx.update(|cx| agent_settings::AgentSettings::get_global(cx).restore_threads_sidebar);
+    if *sidebar_open && restore_sidebar {
         window_handle
             .update(cx, |multi_workspace, _, cx| {
                 multi_workspace.restore_open_sidebar(cx);

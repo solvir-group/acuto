@@ -73,6 +73,13 @@ pub struct ShellState {
     running_command: Option<String>,
     /// Unix seconds when the running command started.
     started_at: Option<i64>,
+    /// Where the command's output begins -- the cursor at `133;C`, which is the
+    /// end of the line the user typed.
+    ///
+    /// Recorded at the marker rather than derived later for the same reason
+    /// `command_start` is: by the time the command finishes, its output has
+    /// scrolled and nothing on screen says where it started.
+    output_start: Option<GridPoint>,
 }
 
 /// What handling an OSC produced.
@@ -92,6 +99,10 @@ pub struct FinishedCommand {
     pub started_at: i64,
     pub duration_ms: i64,
     pub cwd: Option<PathBuf>,
+    /// Where this command's output starts in the grid, when the shell reported
+    /// an execution marker. `None` for shells that only report prompt
+    /// boundaries, where there is no way to tell output from prompt.
+    pub output_start: Option<GridPoint>,
 }
 
 impl ShellState {
@@ -101,6 +112,10 @@ impl ShellState {
 
     pub fn command_start(&self) -> Option<GridPoint> {
         self.command_start
+    }
+
+    pub fn output_start(&self) -> Option<GridPoint> {
+        self.output_start
     }
 
     pub fn cwd(&self) -> Option<&PathBuf> {
@@ -200,12 +215,14 @@ impl ShellState {
                 self.integration_seen = true;
                 self.phase = PromptPhase::Unknown;
                 self.command_start = None;
+                self.output_start = None;
                 Some(HandledOsc::Changed)
             }
             b"B" => {
                 self.integration_seen = true;
                 self.phase = PromptPhase::AtPrompt;
                 self.command_start = Some(cursor);
+                self.output_start = None;
                 Some(HandledOsc::Changed)
             }
             b"C" => {
@@ -216,11 +233,15 @@ impl ShellState {
                     self.observe_prompt_line(line, now);
                 }
                 self.phase = PromptPhase::Executing;
+                self.output_start = Some(cursor);
                 Some(HandledOsc::Changed)
             }
             b"D" => {
                 self.integration_seen = true;
                 self.phase = PromptPhase::Unknown;
+                // Where the user's input began, read before it is cleared. It
+                // is the fallback anchor for output capture below.
+                let input_start = self.command_start.take();
                 self.command_start = None;
                 // A missing or unparsable exit code is recorded as absent
                 // rather than as zero: "we do not know" and "it succeeded"
@@ -230,6 +251,21 @@ impl ShellState {
                     .and_then(|code| code.trim().parse::<i32>().ok());
 
                 let started_at = self.started_at.take();
+                // Prefer the execution marker, fall back to where the user
+                // started typing.
+                //
+                // PowerShell never sends `C` over a pty -- its only
+                // pre-execution hook is a PSReadLine key handler, which does not
+                // fire there -- so on Windows the execution marker is simply
+                // absent and every block would carry no output at all. The line
+                // the command was typed on is a sound anchor anyway: output
+                // begins on the line after it, which is what the caller reads.
+                //
+                // The cost is a wrapped command line whose tail is counted as
+                // the first line of output. That is a cosmetic error on long
+                // commands, against capturing nothing at all on an entire
+                // platform.
+                let output_start = self.output_start.take().or(input_start);
                 match (self.running_command.take(), started_at) {
                     (Some(command), Some(started_at)) => {
                         Some(HandledOsc::CommandFinished(FinishedCommand {
@@ -238,6 +274,7 @@ impl ShellState {
                             started_at,
                             duration_ms: (now - started_at).max(0) * 1000,
                             cwd: self.cwd.clone(),
+                            output_start,
                         }))
                     }
                     // Nothing was typed at the previous prompt — the first
@@ -344,6 +381,52 @@ mod tests {
 
     const CURSOR: GridPoint = GridPoint { line: 4, column: 7 };
     const NOW: i64 = 1_700_000_000;
+
+    #[test]
+    fn a_shell_that_never_sends_c_still_anchors_its_output() {
+        // PowerShell over a pty: A, B, then D, with no execution marker between
+        // them. Before the fallback this produced a block with no output at all,
+        // which is every block on Windows.
+        const PROMPT_END: GridPoint = GridPoint { line: 9, column: 2 };
+        let mut state = ShellState::default();
+
+        state.handle_osc(&osc(&["133", "A"]), PROMPT_END, None, NOW);
+        state.handle_osc(&osc(&["133", "B"]), PROMPT_END, None, NOW);
+        state.observe_prompt_line("cargo build", NOW);
+
+        let finished = state.handle_osc(&osc(&["133", "D", "101"]), CURSOR, None, NOW + 4);
+        let Some(HandledOsc::CommandFinished(finished)) = finished else {
+            panic!("expected a finished command, got {finished:?}");
+        };
+        assert_eq!(finished.command, "cargo build");
+        assert_eq!(finished.exit_code, Some(101));
+        assert_eq!(
+            finished.output_start,
+            Some(PROMPT_END),
+            "output should be anchored to where the command was typed"
+        );
+    }
+
+    #[test]
+    fn an_execution_marker_wins_over_the_prompt_anchor() {
+        const PROMPT_END: GridPoint = GridPoint { line: 9, column: 2 };
+        const EXEC: GridPoint = GridPoint { line: 9, column: 13 };
+        let mut state = ShellState::default();
+
+        state.handle_osc(&osc(&["133", "A"]), PROMPT_END, None, NOW);
+        state.handle_osc(&osc(&["133", "B"]), PROMPT_END, None, NOW);
+        state.handle_osc(&osc(&["133", "C"]), EXEC, Some("cargo build"), NOW);
+
+        let finished = state.handle_osc(&osc(&["133", "D", "0"]), CURSOR, None, NOW + 1);
+        let Some(HandledOsc::CommandFinished(finished)) = finished else {
+            panic!("expected a finished command, got {finished:?}");
+        };
+        assert_eq!(
+            finished.output_start,
+            Some(EXEC),
+            "a shell that reports execution should be believed over the fallback"
+        );
+    }
 
     #[test]
     fn completions_stay_dark_without_integration() {
@@ -473,6 +556,9 @@ mod tests {
                 started_at: NOW,
                 duration_ms: 3000,
                 cwd: Some(PathBuf::from("/work/repo")),
+                // The execution marker in this test reports the same cursor the
+                // others do, so output starts where the typed line ended.
+                output_start: Some(CURSOR),
             })),
             "the trimmed command, its outcome, its duration and where it ran"
         );

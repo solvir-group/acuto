@@ -2,6 +2,7 @@ mod mappings;
 
 mod alacritty;
 mod pty_info;
+pub mod blocks;
 pub mod shell_state;
 pub mod shell_integration;
 pub mod terminal_settings;
@@ -706,6 +707,11 @@ pub enum Event {
     SelectionsChanged,
     NewNavigationTarget(Option<MaybeNavigationTarget>),
     Open(MaybeNavigationTarget),
+    /// A command finished and was recorded as a block.
+    ///
+    /// Carries the id rather than the block so a listener cannot hold a
+    /// reference into the history while the terminal keeps writing to it.
+    CommandBlockFinished(blocks::BlockId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1033,6 +1039,7 @@ impl TerminalBuilder {
             title_override: None,
             events: VecDeque::with_capacity(10),
             shell_state: Default::default(),
+            blocks: Default::default(),
             finished_commands: Vec::new(),
             last_content: Content {
                 terminal_bounds,
@@ -1384,6 +1391,7 @@ impl TerminalBuilder {
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
                 shell_state: Default::default(),
+                blocks: Default::default(),
                 finished_commands: Vec::new(),
                 last_mouse: None,
                 mouse_down_position: None,
@@ -1588,6 +1596,7 @@ pub struct Terminal {
     /// Drained by the view, which owns the store; the terminal itself has no
     /// business talking to a database.
     finished_commands: Vec<shell_state::FinishedCommand>,
+    blocks: blocks::BlockHistory,
     pub selection_head: Option<Point>,
 
     pub breadcrumb_text: String,
@@ -1750,7 +1759,22 @@ impl Terminal {
                     .handle_osc(&params, cursor, typed_line.as_deref(), now)
                 {
                     Some(shell_state::HandledOsc::CommandFinished(finished)) => {
+                        // Read now, while the output is still on the grid. One
+                        // more screenful and the top of it is gone.
+                        let output = finished
+                            .output_start
+                            .map(|start| self.capture_output(start, cursor))
+                            .unwrap_or_default();
+                        let id = self.blocks.record(
+                            finished.command.clone(),
+                            finished.cwd.clone(),
+                            finished.started_at,
+                            finished.duration_ms,
+                            finished.exit_code,
+                            &output,
+                        );
                         self.finished_commands.push(finished);
+                        cx.emit(Event::CommandBlockFinished(id));
                         cx.emit(Event::Wakeup);
                         cx.notify();
                     }
@@ -2108,6 +2132,82 @@ impl Terminal {
     }
 
     /// Takes the commands that have finished since the last call.
+    /// The commands this terminal has run.
+    pub fn blocks(&self) -> &blocks::BlockHistory {
+        &self.blocks
+    }
+
+    /// Reads what a command printed, from the end of the line it was typed on to
+    /// wherever the cursor is now.
+    ///
+    /// Works off `last_content`, which the caller refreshes before handling the
+    /// marker, so this sees the output that carried the completion sequence.
+    ///
+    /// The first line is skipped: `start` is the cursor at the execution marker,
+    /// which sits at the end of the echoed command, so the row it points at is
+    /// the command itself rather than its output.
+    fn capture_output(
+        &self,
+        start: shell_state::GridPoint,
+        end: shell_state::GridPoint,
+    ) -> String {
+        let mut rows: Vec<(i32, String)> = Vec::new();
+        for cell in &self.last_content.cells {
+            let point = cell.point;
+            if point.line <= start.line {
+                continue;
+            }
+            if point.line > end.line {
+                break;
+            }
+
+            // Wide characters occupy a second, glyphless spacer cell.
+            let character = cell.cell.character();
+            match rows.last_mut() {
+                Some((line, text)) if *line == point.line => {
+                    if character != '\0' {
+                        text.push(character);
+                    }
+                }
+                _ => {
+                    let mut text = String::new();
+                    if character != '\0' {
+                        text.push(character);
+                    }
+                    rows.push((point.line, text));
+                }
+            }
+        }
+
+        let mut output = String::new();
+        for (index, (_, row)) in rows.iter().enumerate() {
+            // Trailing spaces are the grid padding every row out to its full
+            // width, not something the command printed.
+            output.push_str(row.trim_end());
+            if index + 1 < rows.len() {
+                output.push('\n');
+            }
+        }
+        let output = output.trim().to_string();
+        if !output.is_empty() {
+            return output;
+        }
+
+        // The anchor described a row that is no longer on screen: a command that
+        // prints more than a screenful scrolls its own starting line away, and
+        // the recorded line number then points at unrelated content or at
+        // nothing at all.
+        //
+        // Falling back to the visible tail rather than returning nothing,
+        // because the tail is what a failure is diagnosed from -- the error
+        // summary is at the end of a long log, not the beginning -- and an empty
+        // capture would silently disable the whole feature on exactly the long
+        // builds it is most useful for.
+        const FALLBACK_LINES: usize = 200;
+        self.last_n_non_empty_lines(FALLBACK_LINES).join("
+")
+    }
+
     pub fn take_finished_commands(&mut self) -> Vec<shell_state::FinishedCommand> {
         std::mem::take(&mut self.finished_commands)
     }

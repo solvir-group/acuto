@@ -23,6 +23,7 @@
 //!    whatever you are doing now is the best predictor of what you will do next.
 
 pub mod history;
+pub mod path_commands;
 pub mod shell_history;
 
 /// Commands kept per terminal. Large enough to cover a long working session,

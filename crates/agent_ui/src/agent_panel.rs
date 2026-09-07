@@ -46,7 +46,7 @@ use crate::terminal_thread_metadata_store::{
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
-    NewNativeAgentThreadFromSummary,
+    NewExternalAgentThreadInPane, NewNativeAgentThreadFromSummary, NewThreadInPane,
 };
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
@@ -425,6 +425,26 @@ pub fn init(cx: &mut App) {
                         });
                     }
                 })
+                .register_action(|workspace, _: &NewThreadInPane, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.new_thread_in_pane(window, cx);
+                        });
+                    }
+                })
+                .register_action(
+                    |workspace, action: &NewExternalAgentThreadInPane, window, cx| {
+                        if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                            panel.update(cx, |panel, cx| {
+                                panel.new_external_agent_thread_in_pane(
+                                    action.agent.clone(),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                    },
+                )
                 .register_action(|workspace, action: &SelectAgent, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| {
@@ -1939,6 +1959,77 @@ impl AgentPanel {
         self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
     }
 
+    /// Starts an external agent thread and moves it straight into the active
+    /// pane.
+    ///
+    /// Built by making the thread the way the panel always does and then
+    /// detaching it, rather than constructing a view here: a second
+    /// construction path would drift from the panel's the moment either
+    /// changes.
+    /// Opens a new thread in the active pane using whichever agent is
+    /// configured for new tabs.
+    ///
+    /// The built-in agent unless the Claude Code page says otherwise, so the
+    /// default stays ours and preferring Claude is a deliberate choice rather
+    /// than something a launchpad button decided.
+    pub fn new_thread_in_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let agent = match AgentSettings::get_global(cx).default_agent {
+            settings::DefaultAgent::ClaudeCode => {
+                AgentId::new(agent_servers::CLAUDE_AGENT_ID).into()
+            }
+            settings::DefaultAgent::Acuto => Agent::NativeAgent,
+        };
+        self.open_new_thread_in_pane_for(agent, window, cx);
+    }
+
+    pub fn new_external_agent_thread_in_pane(
+        &mut self,
+        agent: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_new_thread_in_pane_for(agent.into(), window, cx);
+    }
+
+    fn open_new_thread_in_pane_for(
+        &mut self,
+        agent: Agent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.has_open_project(cx) {
+            return;
+        }
+
+        self.selected_agent = agent;
+
+        // A blank draft is normally reused rather than replaced, which is right
+        // for the panel's `+` -- it means "go to my new-thread slot" -- and
+        // wrong here. Opening Claude Code from the launchpad twice should give
+        // two tabs, not silently move the one that already exists.
+        //
+        // Discarding it the same way the wrong-agent case below does: an empty
+        // ephemeral draft has nothing in it to lose, and leaving its metadata
+        // behind would accumulate a row per click.
+        if let Some(draft) = self.draft_thread.clone()
+            && !self.draft_has_content(&draft, cx)
+        {
+            let draft_id = draft.read(cx).thread_id;
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.delete(draft_id, cx);
+            });
+            self.draft_thread = None;
+            self._draft_editor_observation = None;
+        }
+
+        self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+
+        let Some(id) = self.active_thread_id(cx) else {
+            return;
+        };
+        self.open_thread_in_pane(id, window, cx);
+    }
+
     fn set_selected_agent_and_persist(&mut self, agent: Agent, cx: &mut Context<Self>) {
         if self.selected_agent != agent {
             self.selected_agent = agent.clone();
@@ -2221,6 +2312,10 @@ impl AgentPanel {
                 TerminalEvent::BlinkChanged(_)
                 | TerminalEvent::SelectionsChanged
                 | TerminalEvent::NewNavigationTarget(_)
+                // The agent's own terminals record blocks like any other, but
+                // the failure notice belongs to the terminal panel; surfacing it
+                // here as well would offer the same fix twice.
+                | TerminalEvent::CommandBlockFinished(_)
                 | TerminalEvent::Open(_) => {}
             },
         );
@@ -4154,11 +4249,23 @@ impl AgentPanel {
             return;
         };
         let item = cx.new(|_| AgentThreadItem::new(view));
-        self.workspace
-            .update(cx, |workspace, cx| {
-                workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
-            })
-            .log_err();
+        let workspace = self.workspace.clone();
+
+        // Deferred because this is reached from a workspace action handler,
+        // which runs with the workspace already leased for writing. Updating it
+        // again from in here is a double lease, and GPUI panics rather than
+        // deadlocking -- which took the whole window down every time a thread
+        // was opened into a pane from the launchpad.
+        //
+        // By the time the deferred closure runs, the dispatch that leased the
+        // workspace has finished with it.
+        cx.defer_in(window, move |_panel, window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+                })
+                .log_err();
+        });
     }
 
     /// Creates a thread and places it directly in `pane`.
@@ -6563,12 +6670,23 @@ impl AgentPanel {
                 .with_handle(self.new_thread_menu_handle.clone())
                 .menu(move |window, cx| new_thread_menu_builder(window, cx));
 
-            let sandbox_status = self
-                .active_conversation_view()
-                .and_then(|conversation_view| conversation_view.read(cx).root_thread_view())
-                .and_then(|thread_view| {
-                    thread_view.update(cx, |thread_view, cx| thread_view.render_sandbox_status(cx))
-                });
+            // Only for the native agent. An external agent enforces its own
+            // permissions and shows its own control for them, so a second lock
+            // on the opposite side of the same bar describes a policy this one
+            // does not govern.
+            let sandbox_status = matches!(self.selected_agent, Agent::NativeAgent)
+                .then(|| {
+                    self.active_conversation_view()
+                        .and_then(|conversation_view| {
+                            conversation_view.read(cx).root_thread_view()
+                        })
+                        .and_then(|thread_view| {
+                            thread_view.update(cx, |thread_view, cx| {
+                                thread_view.render_sandbox_status(cx)
+                            })
+                        })
+                })
+                .flatten();
 
             base_container
                 .child(

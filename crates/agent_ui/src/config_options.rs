@@ -130,6 +130,25 @@ impl ConfigOptionsView {
         true
     }
 
+    /// The value the agent currently has selected for a category.
+    ///
+    /// An external agent reports its mode as one of these options rather than
+    /// through `mode_selector`, so this is the only place the view can learn
+    /// which permission mode is actually in force.
+    pub fn current_value_for_category(
+        &self,
+        category: acp::SessionConfigOptionCategory,
+    ) -> Option<acp::SessionConfigValueId> {
+        self.config_options
+            .config_options()
+            .into_iter()
+            .find(|option| option.category.as_ref() == Some(&category))
+            .and_then(|option| match &option.kind {
+                acp::SessionConfigKind::Select(select) => Some(select.current_value.clone()),
+                _ => None,
+            })
+    }
+
     fn first_config_option_id_matching(
         &self,
         category: acp::SessionConfigOptionCategory,
@@ -253,6 +272,18 @@ impl ConfigOptionsView {
         config_options
             .config_options()
             .into_iter()
+            // Only the two an agent is actually steered with. An adapter
+            // advertises everything it can be configured with -- thought level,
+            // model config, and whatever it adds next -- and rendering one
+            // dropdown per option is what turned the composer into three rows
+            // of controls. The rest stay reachable from the agent's own menu.
+            .filter(|option| {
+                matches!(
+                    option.category,
+                    Some(acp::SessionConfigOptionCategory::Model)
+                        | Some(acp::SessionConfigOptionCategory::Mode)
+                )
+            })
             .map(|option| {
                 let config_options = config_options.clone();
                 let agent_server = agent_server.clone();
@@ -280,7 +311,8 @@ impl Render for ConfigOptionsView {
 
         h_flex()
             .min_w_0()
-            .flex_wrap()
+            // Not wrapping: a control row that grows downwards is what made the
+            // composer taller every time an agent gained an option.
             .gap_1()
             .children(self.selectors.iter().cloned())
             .into_any_element()
@@ -835,6 +867,28 @@ impl PickerDelegate for ConfigOptionPickerDelegate {
 
                 let option_name = option.name.clone();
                 let description = option.description.clone();
+                // The exact id the agent will be asked for, under the friendly
+                // label. "Sonnet" and "Default" do not say which model you are
+                // about to spend a turn on, or what effort level "default"
+                // currently resolves to -- and those are the two questions this
+                // menu exists to answer.
+                //
+                // Shown only when it adds something: an adapter that sends the
+                // same string for both gets no second line rather than the word
+                // twice.
+                let value_id = option.value.0.to_string();
+                // "Opus" does not say which Opus. The full name is recovered
+                // from what the agent itself sends rather than guessed or
+                // hardcoded -- a table of model names is wrong the week after
+                // it is written.
+                let option_name = full_model_name(
+                    option_name.as_str(),
+                    option.description.as_deref(),
+                    &value_id,
+                )
+                .unwrap_or(option_name);
+                let value_id =
+                    (!value_id.eq_ignore_ascii_case(option_name.as_str())).then_some(value_id);
 
                 Some(
                     div()
@@ -856,7 +910,18 @@ impl PickerDelegate for ConfigOptionPickerDelegate {
                                 .inset(true)
                                 .spacing(ListItemSpacing::Sparse)
                                 .toggle_state(selected)
-                                .child(h_flex().w_full().child(Label::new(option_name).truncate()))
+                                .child(
+                                    v_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .child(Label::new(option_name).truncate())
+                                        .children(value_id.map(|value_id| {
+                                            Label::new(value_id)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                                .truncate()
+                                        })),
+                                )
                                 .end_slot(div().pr_2().when(is_selected, |this| {
                                     this.child(Icon::new(IconName::Check).color(Color::Accent))
                                 }))
@@ -932,6 +997,10 @@ fn extract_options(
         acp::SessionConfigKind::Select(select) => match &select.options {
             acp::SessionConfigSelectOptions::Ungrouped(options) => options
                 .iter()
+                // "Default" names no choice: whatever it resolves to is already
+                // in this list under its own name, so it is one entry that
+                // tells the reader nothing and one more thing to scroll past.
+                .filter(|opt| !names_the_default(&opt.name))
                 .map(|opt| ConfigOptionValue {
                     value: opt.value.clone(),
                     name: opt.name.clone(),
@@ -942,7 +1011,11 @@ fn extract_options(
             acp::SessionConfigSelectOptions::Grouped(groups) => groups
                 .iter()
                 .flat_map(|group| {
-                    group.options.iter().map(|opt| ConfigOptionValue {
+                    group
+                        .options
+                        .iter()
+                        .filter(|opt| !names_the_default(&opt.name))
+                        .map(|opt| ConfigOptionValue {
                         value: opt.value.clone(),
                         name: opt.name.clone(),
                         description: opt.description.clone(),
@@ -1062,6 +1135,107 @@ async fn fuzzy_search_options(
         .collect()
 }
 
+/// The longest name for a model that the agent has actually given us.
+///
+/// Claude sends the generation in the option's description rather than its
+/// name -- `name: "Opus"`, `description: "Opus 5 · Best for everyday tasks"` --
+/// so the label the picker would otherwise show is the one word that does not
+/// say which model a turn is about to be spent on. The description's first
+/// segment is that name in full, and using it means the picker says whatever
+/// the agent says, with no table here to fall out of date.
+///
+/// Falls back to recovering the generation from the value id, for an agent
+/// that describes its models some other way.
+fn full_model_name(name: &str, description: Option<&str>, value_id: &str) -> Option<String> {
+    /// Long enough for "Opus 5 with 1M context", short enough to reject a
+    /// sentence that merely happens to open with the model's name.
+    const LONGEST: usize = 40;
+
+    let name = name.trim();
+    let leading_word = |text: &str| -> String {
+        text.split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_ascii_lowercase()
+    };
+
+    if let Some(description) = description {
+        // `·` separates the name from the blurb; some agents use a dash.
+        let head = description
+            .split(['\u{b7}', '\u{2013}', '\u{2014}'])
+            .next()
+            .unwrap_or(description)
+            .trim();
+
+        let names_the_same_model = !head.is_empty()
+            && leading_word(head) == leading_word(name)
+            && head.chars().any(|c| c.is_ascii_digit())
+            && head.chars().count() <= LONGEST;
+
+        if names_the_same_model {
+            return Some(head.to_string());
+        }
+    }
+
+    versioned_model_name(name, value_id)
+}
+
+/// `("Opus", "claude-opus-4-5-20251101")` becomes `"Opus 4.5"`.
+///
+/// Only when the id actually names the same family the label does, so an
+/// adapter whose ids look nothing like its labels is left alone rather than
+/// given a version it never claimed. Returns `None` when there is nothing to
+/// add, which keeps the caller's existing label.
+fn versioned_model_name(name: &str, value_id: &str) -> Option<String> {
+    let lower_name = name.trim().to_ascii_lowercase();
+    if lower_name.is_empty() {
+        return None;
+    }
+
+    // Already carries a digit: the adapter named the generation itself.
+    if name.chars().any(|character| character.is_ascii_digit()) {
+        return None;
+    }
+
+    let lower_id = value_id.to_ascii_lowercase();
+    let family_at = lower_id.find(&lower_name)?;
+    let after_family = &lower_id[family_at + lower_name.len()..];
+
+    // The digits immediately following the family, as `-4-5-...` or `-4.5-...`.
+    let mut parts = Vec::new();
+    for segment in after_family.split(['-', '.', '_']) {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment.chars().all(|character| character.is_ascii_digit()) {
+            // A date stamp is not a version.
+            if segment.len() >= 6 {
+                break;
+            }
+            parts.push(segment.to_string());
+            if parts.len() == 2 {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    (!parts.is_empty()).then(|| format!("{name} {}", parts.join(".")))
+}
+
+/// Whether an option is the agent's "whatever I would have picked" entry.
+///
+/// Matched on the first word rather than the whole label because Claude sends
+/// `"Default (recommended)"`, which an equality test lets straight through.
+fn names_the_default(name: &str) -> bool {
+    name.trim()
+        .split_whitespace()
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case("default"))
+}
+
 fn find_option_name(
     options: &acp::SessionConfigSelectOptions,
     value_id: &acp::SessionConfigValueId,
@@ -1092,6 +1266,122 @@ fn count_config_options(option: &acp::SessionConfigOption) -> usize {
             _ => 0,
         },
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod versioned_model_name_tests {
+    use super::versioned_model_name;
+
+    #[test]
+    fn the_generation_comes_from_the_id() {
+        assert_eq!(
+            versioned_model_name("Opus", "claude-opus-4-5-20251101").as_deref(),
+            Some("Opus 4.5")
+        );
+        assert_eq!(
+            versioned_model_name("Sonnet", "claude-sonnet-5").as_deref(),
+            Some("Sonnet 5")
+        );
+    }
+
+    #[test]
+    fn a_date_stamp_is_not_a_version() {
+        // Without the length guard this would read "Haiku 4.5.20251001".
+        assert_eq!(
+            versioned_model_name("Haiku", "claude-haiku-4-5-20251001").as_deref(),
+            Some("Haiku 4.5")
+        );
+        assert_eq!(
+            versioned_model_name("Haiku", "claude-haiku-20251001").as_deref(),
+            None,
+            "a bare date is not a generation"
+        );
+    }
+
+    #[test]
+    fn a_label_that_already_names_its_generation_is_left_alone() {
+        assert_eq!(versioned_model_name("Opus 5", "claude-opus-5"), None);
+        assert_eq!(versioned_model_name("GPT-4", "gpt-4-turbo"), None);
+    }
+
+    #[test]
+    fn an_unrelated_id_adds_nothing() {
+        assert_eq!(versioned_model_name("Default", "medium"), None);
+        assert_eq!(versioned_model_name("Fast", "gemini-2-0-flash"), None);
+        assert_eq!(versioned_model_name("", "claude-opus-4"), None);
+    }
+}
+
+/// The strings here are the ones Claude Code's ACP adapter actually sends,
+/// captured from a live `session/new`, rather than invented examples.
+#[cfg(test)]
+mod full_model_name_tests {
+    use super::{full_model_name, names_the_default};
+
+    #[test]
+    fn the_full_name_comes_from_the_description() {
+        assert_eq!(
+            full_model_name("Opus", Some("Opus 5 \u{b7} Best for everyday, complex tasks"), "opus")
+                .as_deref(),
+            Some("Opus 5")
+        );
+        assert_eq!(
+            full_model_name("Sonnet", Some("Sonnet 5 \u{b7} Efficient for routine tasks"), "sonnet")
+                .as_deref(),
+            Some("Sonnet 5")
+        );
+        assert_eq!(
+            full_model_name("Haiku", Some("Haiku 4.5 \u{b7} Fastest for quick answers"), "haiku")
+                .as_deref(),
+            Some("Haiku 4.5")
+        );
+    }
+
+    #[test]
+    fn a_context_variant_keeps_what_makes_it_different() {
+        assert_eq!(
+            full_model_name(
+                "Opus (1M context)",
+                Some("Opus 5 with 1M context \u{b7} Best for everyday, complex tasks"),
+                "opus[1m]",
+            )
+            .as_deref(),
+            Some("Opus 5 with 1M context")
+        );
+    }
+
+    #[test]
+    fn a_description_about_something_else_is_not_a_name() {
+        // Mode options describe what the mode does; adopting that as the label
+        // would replace "Plan" with a sentence.
+        assert_eq!(
+            full_model_name("Plan", Some("Create a plan before making changes"), "plan"),
+            None
+        );
+        assert_eq!(
+            full_model_name("Auto", Some("Claude handles permission decisions"), "auto"),
+            None
+        );
+    }
+
+    #[test]
+    fn without_a_usable_description_it_falls_back_to_the_id() {
+        assert_eq!(
+            full_model_name("Opus", None, "claude-opus-4-5-20251101").as_deref(),
+            Some("Opus 4.5")
+        );
+        assert_eq!(full_model_name("Sonnet", Some("Fast and cheap"), "sonnet"), None);
+    }
+
+    #[test]
+    fn the_recommended_default_is_still_the_default() {
+        // Claude sends "Default (recommended)", which an equality test missed.
+        assert!(names_the_default("Default (recommended)"));
+        assert!(names_the_default("default"));
+        assert!(names_the_default("  Default  "));
+        assert!(!names_the_default("Defaulting Model"), "only the whole first word counts");
+        assert!(!names_the_default("Sonnet"));
     }
 }
 

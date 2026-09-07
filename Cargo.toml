@@ -1040,6 +1040,21 @@ syn = { opt-level = 3 }
 proc-macro2 = { opt-level = 3 }
 # proc-macros end
 
+# Fork change. Everything drawn on screen goes through these every frame, and
+# at opt-level 0 a debug build spends most of its frame budget in layout and
+# paint -- which is what makes the editor feel like it is running at ten frames
+# a second rather than sixty. They are rebuilt only when they themselves change,
+# so this costs one long build and nothing after it.
+#
+# The complete fix is a release build; this is what makes the debug build usable
+# to work in.
+gpui = { opt-level = 2 }
+gpui_wgpu = { opt-level = 2 }
+gpui_windows = { opt-level = 2 }
+wgpu = { opt-level = 2 }
+wgpu-hal = { opt-level = 2 }
+naga = { opt-level = 2 }
+
 tree-sitter = { opt-level = 3 }
 taffy = { opt-level = 3 }
 resvg = { opt-level = 3 }
@@ -1048,6 +1063,16 @@ cranelift-codegen = { opt-level = 3 }
 wasmtime-environ = { opt-level = 3 }
 wasmtime-internal-cranelift = { opt-level = 3 }
 minidumper = { opt-level = 3 }
+
+# Fork change. The `zed` bin is by far the largest translation unit in the tree
+# and rustc ran out of memory compiling it on a 14 GB machine -- "memory
+# allocation of 2097152 bytes failed", with the commit limit exhausted rather
+# than the disk.
+#
+# More codegen units means each one is smaller, so peak memory during codegen
+# drops. Scoped to this package so the rest of the tree keeps its fingerprint
+# and does not rebuild.
+zed = { codegen-units = 256 }
 serde_json = { opt-level = 3 }
 # Build single-source-file crates with cg=1 as it helps make `cargo build` of a whole workspace a bit faster
 activity_indicator = { codegen-units = 1 }

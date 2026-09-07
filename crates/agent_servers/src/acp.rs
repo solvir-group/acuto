@@ -41,9 +41,47 @@ use acp_thread::{AcpThread, AuthRequired, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
-use crate::{CURSOR_ID, GEMINI_ID};
+use crate::{CLAUDE_AGENT_ID, CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
+
+/// Signing in to Claude with an Anthropic account.
+///
+/// Deliberately not the adapter's own `claude-login`: that spawns the full
+/// Claude Code TUI and watches its output for "Type your message", so signing in
+/// means being dropped into a terminal chat session and closing it. `claude auth
+/// login` opens the browser, waits for the confirmation, and exits -- which is
+/// what someone clicking "Sign in" is asking for.
+///
+/// A distinct id also keeps it away from the `claude-login` success-pattern
+/// branch, so completion is judged on the exit code, which is what a
+/// one-shot command actually reports.
+pub const CLAUDE_TERMINAL_AUTH_METHOD_ID: &str = "claude-anthropic-login";
+
+/// Where the Claude CLI is, if it is anywhere.
+///
+/// Checked in order: the `CLAUDE_CODE_PATH` override, then the per-user install
+/// location its installer uses, then bare `claude` for a PATH lookup. The bare
+/// name is the last resort rather than the first because a login that resolves
+/// through PATH resolves differently depending on which shell the terminal
+/// happens to spawn.
+fn claude_cli_path() -> String {
+    if let Ok(explicit) = std::env::var("CLAUDE_CODE_PATH") {
+        if !explicit.trim().is_empty() {
+            return explicit;
+        }
+    }
+
+    let installed = util::paths::home_dir()
+        .join(".local")
+        .join("bin")
+        .join(if cfg!(windows) { "claude.exe" } else { "claude" });
+    if installed.exists() {
+        return installed.to_string_lossy().into_owned();
+    }
+
+    "claude".to_string()
+}
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 const MAX_DEBUG_BACKLOG_MESSAGES: usize = 2000;
 
@@ -1079,6 +1117,31 @@ impl AcpConnection {
                 acp::AuthMethodAgent::new(GEMINI_TERMINAL_AUTH_METHOD_ID, "Login")
                     .description("Login with your Google or Vertex AI account")
                     .meta(meta),
+            )]
+        } else if agent_id.0.as_ref() == CLAUDE_AGENT_ID {
+            // Replaces whatever the adapter advertised. Its own method drops the
+            // user into the Claude TUI; this one opens the browser, takes the
+            // confirmation, and exits.
+            let value = serde_json::json!({
+                "label": "Sign in with Anthropic",
+                "command": claude_cli_path(),
+                // `--claudeai` is the subscription flow. Without it the CLI can
+                // fall through to Console sign-in, which bills API usage rather
+                // than the plan the user already pays for.
+                "args": ["auth", "login", "--claudeai"],
+                "env": {},
+            });
+            let meta = acp::Meta::from_iter([("terminal-auth".to_string(), value)]);
+            vec![acp::AuthMethod::Agent(
+                acp::AuthMethodAgent::new(
+                    CLAUDE_TERMINAL_AUTH_METHOD_ID,
+                    "Sign in with Anthropic",
+                )
+                .description(
+                    "Opens your browser to confirm. Uses your Claude subscription, \
+                     not API credit.",
+                )
+                .meta(meta),
             )]
         } else {
             response.auth_methods

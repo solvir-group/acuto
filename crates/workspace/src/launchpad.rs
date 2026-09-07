@@ -3,7 +3,7 @@
 // to resolve at all - and Button, Label, LabelSize, Color along with them.
 // Only the items it does not cover are imported explicitly.
 use gpui::{EventEmitter, FocusHandle, Focusable};
-use ui::prelude::*;
+use ui::{Icon, IconName, IconSize, prelude::*};
 use util::ResultExt as _;
 
 use crate::item::Item;
@@ -14,6 +14,14 @@ use crate::item::Item;
 /// Upstream's `+` creates an untitled file, which assumes the next thing you
 /// want is always to type code. This gives the same click a short list of
 /// entry points instead.
+/// The registry id Claude Code is installed under.
+///
+/// Duplicated from `agent_servers` rather than imported: `workspace` does not
+/// depend on that crate, and taking the dependency for one string would pull a
+/// large subtree into this crate's rebuild graph. A wrong id degrades to a
+/// logged warning from `build_action`, not a panic.
+pub(crate) const CLAUDE_AGENT_ID: &str = "claude-acp";
+
 pub struct Launchpad {
     focus_handle: FocusHandle,
 }
@@ -32,11 +40,33 @@ impl Launchpad {
     /// dependencies for a handful of buttons would pull large subtrees into its
     /// rebuild graph. `build_action` returns a `Result`, so an action renamed
     /// upstream degrades to a logged warning and an inert button, not a panic.
-    fn entry(id: &'static str, label: &'static str, action_name: &'static str) -> Button {
+    fn entry(
+        id: &'static str,
+        label: &'static str,
+        icon: IconName,
+        action_name: &'static str,
+    ) -> Button {
+        Self::entry_with(id, label, icon, action_name, None)
+    }
+
+    /// An entry whose action carries data.
+    ///
+    /// Actions built by name take their payload as JSON because the registry
+    /// deserializes them the same way a keymap entry would, so an agent id
+    /// arrives here as a string rather than as the typed `AgentId` this crate
+    /// cannot name.
+    fn entry_with(
+        id: &'static str,
+        label: &'static str,
+        icon: IconName,
+        action_name: &'static str,
+        payload: Option<serde_json::Value>,
+    ) -> Button {
         Button::new(id, label)
             .full_width()
+            .start_icon(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
             .on_click(move |_, window, cx: &mut App| {
-                if let Some(action) = cx.build_action(action_name, None).log_err() {
+                if let Some(action) = cx.build_action(action_name, payload.clone()).log_err() {
                     window.dispatch_action(action, cx);
                 }
             })
@@ -60,21 +90,36 @@ impl Render for Launchpad {
                     .child(Self::entry(
                         "launchpad-file",
                         "Open a File",
+                        IconName::File,
                         "file_finder::Toggle",
                     ))
                     .child(Self::entry(
                         "launchpad-terminal",
                         "New Terminal",
+                        IconName::Terminal,
                         "terminal_panel::Toggle",
                     ))
                     .child(Self::entry(
                         "launchpad-agent",
                         "New Agent Thread",
-                        "agent::NewThread",
+                        IconName::Sparkle,
+                        "agent::NewThreadInPane",
+                    ))
+                    // Opens the panel straight onto Claude rather than only
+                    // selecting it: `agent::SelectAgent` takes effect the next
+                    // time the panel opens, which from a launchpad button reads
+                    // as the click having done nothing.
+                    .child(Self::entry_with(
+                        "launchpad-claude-code",
+                        "Claude Code",
+                        IconName::AiClaude,
+                        "agent::NewExternalAgentThreadInPane",
+                        Some(serde_json::json!({ "agent": CLAUDE_AGENT_ID })),
                     ))
                     .child(Self::entry(
                         "launchpad-git",
                         "Git Status",
+                        IconName::GitBranch,
                         "git_panel::ToggleFocus",
                     )),
             )
@@ -99,5 +144,9 @@ impl Item for Launchpad {
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
         "New Tab".into()
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<ui::Icon> {
+        Some(ui::Icon::new(IconName::Plus))
     }
 }

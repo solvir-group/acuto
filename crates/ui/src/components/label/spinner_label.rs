@@ -9,6 +9,13 @@ pub enum SpinnerVariant {
     Dots,
     DotsVariant,
     Sand,
+    /// Claude Code's mascot: a sparkle that swells and settles.
+    ///
+    /// The frames are the ones the Claude Code CLI itself cycles, because the
+    /// point of this variant is recognition. Someone who has used Claude in a
+    /// terminal should see the same thing thinking at them here, and know
+    /// without reading a label which agent is running.
+    Claude,
 }
 
 /// A spinner indication, based on the label component, that loops through
@@ -47,6 +54,35 @@ impl SpinnerVariant {
                 "⣮", "⣶", "⣷", "⣿", "⡿", "⠿", "⢟", "⠟", "⡛", "⠛", "⠫", "⢋", "⠋", "⠍", "⡉", "⠉",
                 "⠑", "⠡", "⢁",
             ],
+            // Grows to the full sparkle and comes back down, rather than
+            // looping in one direction: the breathing motion is what reads as
+            // "thinking" instead of "loading".
+            // U+2733 is deliberately absent, and U+2732 stands in for it.
+            //
+            // It is the only frame in the CLI's sequence with an emoji
+            // presentation, and the UI font has no glyph for it, so Windows
+            // font fallback resolved that one frame to Segoe UI Emoji and drew
+            // the colour emoji: a green flash, once per cycle, in a mark that
+            // is one colour throughout. U+2732 is the same weight at the same
+            // point in the swell and has no emoji form.
+            //
+            // U+FE0E on every frame is the belt to that pair of braces: it
+            // pins each one to its text presentation, so a future font cannot
+            // decide some other frame deserves a colour either.
+            SpinnerVariant::Claude => {
+                vec![
+                    "·\u{fe0e}",
+                    "✢\u{fe0e}",
+                    "✲\u{fe0e}",
+                    "∗\u{fe0e}",
+                    "✻\u{fe0e}",
+                    "✽\u{fe0e}",
+                    "✻\u{fe0e}",
+                    "∗\u{fe0e}",
+                    "✲\u{fe0e}",
+                    "✢\u{fe0e}",
+                ]
+            }
         }
     }
 
@@ -55,6 +91,9 @@ impl SpinnerVariant {
             SpinnerVariant::Dots => Duration::from_millis(1000),
             SpinnerVariant::DotsVariant => Duration::from_millis(1000),
             SpinnerVariant::Sand => Duration::from_millis(2000),
+            // Slower than the loaders. A fast pulse reads as urgency; this one
+            // is meant to feel like something considering the question.
+            SpinnerVariant::Claude => Duration::from_millis(1400),
         }
     }
 
@@ -63,6 +102,7 @@ impl SpinnerVariant {
             SpinnerVariant::Dots => "spinner_label_dots",
             SpinnerVariant::DotsVariant => "spinner_label_dots_variant",
             SpinnerVariant::Sand => "spinner_label_dots_variant_2",
+            SpinnerVariant::Claude => "spinner_label_claude",
         }
     }
 }
@@ -94,6 +134,10 @@ impl SpinnerLabel {
 
     pub fn sand() -> Self {
         Self::with_variant(SpinnerVariant::Sand)
+    }
+
+    pub fn claude() -> Self {
+        Self::with_variant(SpinnerVariant::Claude)
     }
 }
 

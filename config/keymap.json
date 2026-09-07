@@ -3,6 +3,16 @@
   // Hot-reloads - no rebuild.
 
   {
+    // Turn the last failed command into a diff without reaching for the mouse.
+    // Scoped to the terminal so it cannot fire while you are editing, where
+    // "fix" would be ambiguous about what it is fixing.
+    "context": "Terminal",
+    "bindings": {
+      "ctrl-alt-f": "agent::FixTerminalFailure"
+    }
+  },
+
+  {
     // Enter sends in the team chat, shift-enter starts a new line. This is the
     // one place in the editor where that inversion is right: the composer is a
     // chat box, and every chat anyone has used works this way.

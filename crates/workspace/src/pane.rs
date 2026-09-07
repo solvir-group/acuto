@@ -45,9 +45,9 @@ use std::{
 };
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, ContextMenuEntry, ContextMenuItem, DecoratedIcon, IconButtonShape, IconDecoration,
-    IconDecorationKind, Indicator, PopoverMenu, PopoverMenuHandle, Tab, TabBar, TabPosition,
-    Tooltip, prelude::*, right_click_menu,
+    ContextMenu, ContextMenuEntry, ContextMenuItem, DecoratedIcon, Icon, IconButtonShape,
+    IconDecoration, IconDecorationKind, IconName, IconSize, Indicator, PopoverMenu,
+    PopoverMenuHandle, Tab, TabBar, TabPosition, Tooltip, prelude::*, right_click_menu,
 };
 use util::{
     ResultExt, debug_panic, markdown::MarkdownInlineCode, maybe, paths::PathStyle,
@@ -3468,14 +3468,36 @@ impl Pane {
     /// graph. `build_action` returns a `Result`, so an action renamed upstream
     /// degrades to a logged warning and a dead button rather than a panic.
     fn render_launchpad(&self) -> impl IntoElement {
-        fn entry(id: &'static str, label: &'static str, action_name: &'static str) -> Button {
-            Button::new(id, label).full_width().on_click(
-                move |_, window, cx: &mut App| {
-                    if let Some(action) = cx.build_action(action_name, None).log_err() {
+        fn entry(
+            id: &'static str,
+            label: &'static str,
+            icon: IconName,
+            action_name: &'static str,
+        ) -> Button {
+            entry_with(id, label, icon, action_name, None)
+        }
+
+        /// An entry whose action carries data.
+        ///
+        /// Actions built by name take their payload as JSON because the registry
+        /// deserializes them the same way a keymap entry would, so an agent id
+        /// arrives here as a string rather than as the typed `AgentId` this
+        /// crate cannot name.
+        fn entry_with(
+            id: &'static str,
+            label: &'static str,
+            icon: IconName,
+            action_name: &'static str,
+            payload: Option<serde_json::Value>,
+        ) -> Button {
+            Button::new(id, label)
+                .full_width()
+                .start_icon(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                .on_click(move |_, window, cx: &mut App| {
+                    if let Some(action) = cx.build_action(action_name, payload.clone()).log_err() {
                         window.dispatch_action(action, cx);
                     }
-                },
-            )
+                })
         }
 
         v_flex()
@@ -3486,20 +3508,41 @@ impl Pane {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
-            .child(entry("launchpad-file", "Open a File", "file_finder::Toggle"))
+            .child(entry(
+                "launchpad-file",
+                "Open a File",
+                IconName::File,
+                "file_finder::Toggle",
+            ))
             .child(entry(
                 "launchpad-terminal",
                 "New Terminal",
+                IconName::Terminal,
                 "terminal_panel::Toggle",
             ))
             .child(entry(
                 "launchpad-agent",
                 "New Agent Thread",
-                "agent::NewThread",
+                IconName::Sparkle,
+                "agent::NewThreadInPane",
+            ))
+            // Opens the panel straight onto Claude rather than only selecting
+            // it: `agent::SelectAgent` takes effect the next time the panel
+            // opens, which from a launchpad button reads as the click having
+            // done nothing.
+            .child(entry_with(
+                "launchpad-claude-code",
+                "Claude Code",
+                IconName::AiClaude,
+                "agent::NewExternalAgentThreadInPane",
+                Some(serde_json::json!({
+                    "agent": crate::launchpad::CLAUDE_AGENT_ID
+                })),
             ))
             .child(entry(
                 "launchpad-git",
                 "Git Status",
+                IconName::GitBranch,
                 "git_panel::ToggleFocus",
             ))
     }
@@ -4413,18 +4456,18 @@ fn default_render_tab_bar_buttons(
     let right_children = h_flex()
         // Instead we need to replicate the spacing from the [TabBar]'s `end_slot` here.
         .gap(DynamicSpacing::Base04.rems(cx))
-        // `+` makes a new file. It used to open a Launchpad tab, on the theory
-        // that the next thing you do should be a choice -- but the button is
-        // pressed to get a tab, and answering with a menu of things you did not
-        // ask for is a step, not a choice. The Launchpad still fills an empty
-        // pane, which is where it was actually useful.
+        // `+` opens the Launchpad. An empty buffer assumes the next thing you
+        // want is always to type code; the Launchpad offers the entry points you
+        // actually start from, including a new file, so nothing is lost by
+        // asking. `New File` keeps its own binding and its place in the menu
+        // beside this button for anyone who wants the buffer directly.
         .child(
             IconButton::new("new-tab", IconName::Plus)
                 .icon_size(IconSize::Small)
-                .tooltip(Tooltip::text("New File"))
+                .tooltip(Tooltip::text("New Tab"))
                 .on_click(cx.listener(|pane, _, window, cx| {
-                    let focus_handle = pane.focus_handle(cx);
-                    focus_handle.dispatch_action(&NewFile, window, cx);
+                    let launchpad = cx.new(|cx| crate::launchpad::Launchpad::new(cx));
+                    pane.add_item(Box::new(launchpad), true, true, None, window, cx);
                 })),
         )
         .child(

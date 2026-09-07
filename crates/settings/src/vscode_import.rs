@@ -821,6 +821,10 @@ impl VsCodeSettings {
             drag_and_drop: None,
             entry_spacing: None,
             file_icons: None,
+            // VS Code's icon colouring rides on whichever icon theme is
+            // installed rather than on a setting of its own, so there is
+            // nothing here to carry across.
+            file_icon_colors: None,
             folder_icons: None,
             // VS Code has no equivalent for row geometry; leave it to our defaults.
             row: None,

@@ -5991,6 +5991,98 @@ impl GitPanel {
         )
     }
 
+    /// A proportional bar over the working tree: staged, modified, new,
+    /// conflicted.
+    ///
+    /// The list already says what changed, one row at a time. What it does not
+    /// say is the shape of the change -- whether this is three staged files or
+    /// forty untracked ones -- and that is the thing you want before deciding
+    /// whether to commit, and the thing you currently have to count rows to
+    /// learn. A bar answers it without reading.
+    ///
+    /// Hidden when there is nothing to summarise: an empty bar is furniture.
+    fn render_change_summary(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        self.active_repository.as_ref()?;
+
+        let staged = self.total_staged_count();
+        let conflicted = self.conflicted_count.saturating_sub(self.conflicted_staged_count);
+        let modified = self
+            .tracked_count
+            .saturating_sub(self.tracked_staged_count);
+        let new = self.new_count.saturating_sub(self.new_staged_count);
+
+        let total = staged + conflicted + modified + new;
+        if total == 0 {
+            return None;
+        }
+
+        let status = cx.theme().status();
+        let colors = cx.theme().colors();
+
+        // Order matters: the segments read left to right in the order the work
+        // moves -- conflicted, then untracked, then modified, then staged.
+        let segments = [
+            (conflicted, status.conflict, "conflicted"),
+            (new, colors.text_muted, "new"),
+            (modified, status.modified, "modified"),
+            (staged, status.created, "staged"),
+        ];
+
+        let bar = h_flex()
+            .w_full()
+            .h(px(3.))
+            .rounded_full()
+            .overflow_hidden()
+            .bg(colors.element_background)
+            .children(segments.iter().filter(|(count, _, _)| *count > 0).map(
+                |(count, color, key)| {
+                    div()
+                        .id(*key)
+                        .h_full()
+                        // `flex_basis` in percent rather than a fixed width, so
+                        // the bar keeps its proportions as the panel resizes.
+                        .flex_basis(relative(*count as f32 / total as f32))
+                        .bg(*color)
+                },
+            ));
+
+        let counts = h_flex()
+            .w_full()
+            .gap_2()
+            .flex_wrap()
+            .children(
+                segments
+                    .iter()
+                    .filter(|(count, _, _)| *count > 0)
+                    .map(|(count, color, key)| {
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .size(px(6.))
+                                    .rounded_full()
+                                    .bg(*color),
+                            )
+                            .child(
+                                Label::new(format!("{count} {key}"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                    }),
+            );
+
+        Some(
+            v_flex()
+                .w_full()
+                .flex_none()
+                .px_2()
+                .pb_1p5()
+                .gap_1p5()
+                .child(bar)
+                .child(counts),
+        )
+    }
+
     fn render_changes_header(
         &self,
         _window: &mut Window,
@@ -6210,7 +6302,15 @@ impl GitPanel {
                     .id("commit-editor-container")
                     .w_full()
                     .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
-                    .border_t_1()
+                    // Same frame as the agent composer: a full border and a
+                    // rounded corner, inset from the panel edges, rather than a
+                    // rule across the bottom of the panel. Writing a commit
+                    // message and writing a prompt are the same act, and looked
+                    // like different features.
+                    .m_2()
+                    .p_1p5()
+                    .rounded_md()
+                    .border_1()
                     .border_color(if title_exceeds_limit {
                         cx.theme().status().warning_border
                     } else {
@@ -6224,8 +6324,6 @@ impl GitPanel {
                             .size_full()
                             .child(
                                 div()
-                                    .pt_2()
-                                    .px_2()
                                     .h_full()
                                     .flex_grow_1()
                                     .cursor_text()
@@ -7483,6 +7581,19 @@ impl GitPanel {
         rems(1.75)
     }
 
+    /// How many selectable rows sit under the header at `ix`.
+    ///
+    /// Counted by walking forward rather than held as state: the entry list is
+    /// rebuilt whenever the working tree changes, and a cached count is one more
+    /// thing that can disagree with what is on screen.
+    fn section_entry_count(&self, header_ix: usize) -> usize {
+        self.entries
+            .iter()
+            .skip(header_ix + 1)
+            .take_while(|entry| entry.is_selectable())
+            .count()
+    }
+
     fn render_list_header(
         &self,
         ix: usize,
@@ -7539,7 +7650,25 @@ impl GitPanel {
                         Label::new(header.title())
                             .color(Color::Muted)
                             .size(LabelSize::Small),
-                    ),
+                    )
+                    // How many files are under this heading. "Changes" alone is
+                    // a label; "Changes 12" is information, and it is the number
+                    // you are looking for when you collapse a section to get it
+                    // out of the way.
+                    .when(!section_is_empty, |this| {
+                        let count = self.section_entry_count(ix);
+                        this.child(
+                            div()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(cx.theme().colors().element_background)
+                                .child(
+                                    Label::new(count.to_string())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    }),
             )
             .child(if section_is_empty {
                 gpui::Empty.into_any_element()
@@ -8576,6 +8705,9 @@ impl Render for GitPanel {
                         GitPanelTab::Changes => this
                             .children(self.render_changes_header(window, cx))
                             .when(!self.commit_editor_expanded, |this| {
+                                this.children(self.render_change_summary(cx))
+                            })
+                            .when(!self.commit_editor_expanded, |this| {
                                 this.map(|this| {
                                     if let Some(repo) = self.active_repository.clone()
                                         && has_entries
@@ -8728,7 +8860,11 @@ impl PanelHeader for GitPanel {}
 pub fn panel_editor_container(_window: &mut Window, cx: &mut App) -> Div {
     v_flex()
         .size_full()
-        .bg(cx.theme().colors().editor_background)
+        // `element_background`, matching the agent composer: an input should
+        // read as a raised surface sitting on the panel, not as a hole punched
+        // through it. `editor_background` is the colour of the void behind a
+        // buffer, which is why the two inputs looked like different species.
+        .bg(cx.theme().colors().element_background)
 }
 
 pub(crate) fn git_commit_editor_style(font_size: gpui::Pixels, cx: &App) -> EditorStyle {

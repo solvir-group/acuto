@@ -1050,20 +1050,38 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                 .map(|(id, candidate)| StringMatchCandidate::new(id, candidate.name()))
                 .collect::<Vec<_>>();
 
+            // Every candidate, not a fixed hundred. Claude Code advertises
+            // well over a hundred commands once a project's own `.claude`
+            // directory is counted, and a cap silently truncated the tail --
+            // worst of all on the empty query, which is exactly the "show me
+            // what there is" case that pressing `/` performs.
+            let match_limit = string_match_candidates.len().max(1);
+
             let matches = fuzzy::match_strings(
                 &string_match_candidates,
                 &query,
                 false,
                 true,
-                100,
+                match_limit,
                 &Arc::new(AtomicBool::default()),
                 cx.background_executor().clone(),
             )
             .await;
 
+            // An agent can advertise the same command twice -- the same name
+            // reaching it by two routes -- and with identical descriptions
+            // there is nothing on screen to tell the two rows apart. Differing
+            // descriptions are kept: then they are genuinely two entries.
+            let mut seen = collections::HashSet::default();
             matches
                 .into_iter()
                 .map(|mat| candidates[mat.candidate_id].clone())
+                .filter(|candidate| match candidate {
+                    SlashCompletionCandidate::Command(command) => {
+                        seen.insert((command.name.clone(), command.description.clone()))
+                    }
+                    _ => true,
+                })
                 .collect()
         })
     }
