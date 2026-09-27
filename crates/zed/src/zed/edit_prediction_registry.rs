@@ -133,7 +133,14 @@ fn edit_prediction_provider_config_for_settings(cx: &App) -> Option<EditPredicti
                 if let Some(inferred_format) = infer_prompt_format(&custom_settings.model) {
                     format = inferred_format;
                 } else {
-                    // todo: notify user that prompt format inference failed
+                    // Said out loud. Returning quietly left the provider
+                    // unregistered with nothing in the log, so predictions
+                    // simply never appeared and there was no way to tell why.
+                    log::warn!(
+                        "edit predictions: cannot infer a prompt format for model {:?}; \
+                         set `prompt_format` explicitly. Predictions are off until then.",
+                        custom_settings.model
+                    );
                     return None;
                 }
             }
@@ -158,7 +165,35 @@ fn edit_prediction_provider_config_for_settings(cx: &App) -> Option<EditPredicti
 }
 
 fn infer_prompt_format(model: &str) -> Option<EditPredictionPromptFormat> {
+    // Hosted endpoints name models `vendor/family-version` -- `z-ai/glm-5.3`,
+    // `mistralai/codestral-22b` -- where a local server says `glm:latest`.
+    // Matching the whole string exactly recognised neither, so the vendor is
+    // dropped and the family matched by prefix, and a new version of a family
+    // this already knows is not a reason to switch predictions off.
     let model_base = model.split(':').next().unwrap_or(model);
+    let model_base = model_base.rsplit('/').next().unwrap_or(model_base);
+    let lower = model_base.to_ascii_lowercase();
+    if lower.starts_with("glm") {
+        return Some(EditPredictionPromptFormat::Glm);
+    }
+    if lower.starts_with("codestral") {
+        return Some(EditPredictionPromptFormat::Codestral);
+    }
+    if lower.starts_with("qwen") && lower.contains("coder") {
+        return Some(EditPredictionPromptFormat::Qwen);
+    }
+    if lower.starts_with("deepseek-coder") {
+        return Some(EditPredictionPromptFormat::DeepseekCoder);
+    }
+    if lower.starts_with("starcoder") {
+        return Some(EditPredictionPromptFormat::StarCoder);
+    }
+    if lower.starts_with("codegemma") {
+        return Some(EditPredictionPromptFormat::CodeGemma);
+    }
+    if lower.starts_with("codellama") {
+        return Some(EditPredictionPromptFormat::CodeLlama);
+    }
 
     Some(match model_base {
         "zeta2" => EditPredictionPromptFormat::Zeta(ZetaVersion::Zeta2),
@@ -247,6 +282,13 @@ fn assign_edit_prediction_provider(
     // TODO: Do we really want to collect data only for singleton buffers?
     let singleton_buffer = editor.buffer().read(cx).as_singleton();
 
+    // Once per editor, so a prediction that never appears can be told apart
+    // from one whose provider was never attached.
+    log::info!(
+        "edit predictions: editor gets {}",
+        provider_config.map_or("no provider", |config| config.name())
+    );
+
     match provider_config {
         None => {
             editor.set_edit_prediction_provider::<ZedEditPredictionDelegate>(
@@ -321,6 +363,27 @@ mod tests {
     use gpui::{BorrowAppContext, TestAppContext};
     use settings::{EditPredictionPromptFormatContent, EditPredictionProvider, SettingsStore};
     use workspace::AppState;
+
+    // Hosted endpoints name models `vendor/family-version`. Exact matching
+    // recognised none of them, inference returned nothing, and the provider was
+    // never registered -- predictions silently never appeared.
+    #[test]
+    fn prompt_format_is_inferred_through_vendor_prefixes_and_new_versions() {
+        let format = |model| infer_prompt_format(model);
+        assert!(matches!(format("z-ai/glm-5.3"), Some(EditPredictionPromptFormat::Glm)));
+        assert!(matches!(format("z-ai/glm-5.3-flash"), Some(EditPredictionPromptFormat::Glm)));
+        assert!(matches!(format("glm-4"), Some(EditPredictionPromptFormat::Glm)));
+        assert!(matches!(
+            format("mistralai/codestral-22b-instruct-v0.1"),
+            Some(EditPredictionPromptFormat::Codestral)
+        ));
+        assert!(matches!(
+            format("qwen/qwen2.5-coder-32b-instruct"),
+            Some(EditPredictionPromptFormat::Qwen)
+        ));
+        assert!(matches!(format("qwen2.5-coder:7b"), Some(EditPredictionPromptFormat::Qwen)));
+        assert!(format("meta/llama-3.1-8b-instruct").is_none());
+    }
 
     #[gpui::test]
     async fn test_sweep_prompt_format_routes_to_sweep_prompt_model(cx: &mut TestAppContext) {

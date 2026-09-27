@@ -158,9 +158,12 @@ pub fn prepare(
         return None;
     }
 
-    // TERM_PROGRAM gates every script: copied elsewhere they become no-ops
+    // ACUTO_TERM gates every script: copied elsewhere they become no-ops
     // rather than painting escape sequences into an unrelated terminal.
-    let mut env = vec![("TERM_PROGRAM".to_string(), "Acuto".to_string())];
+    //
+    // Not TERM_PROGRAM, which has to report a name other tools recognise --
+    // see `insert_zed_terminal_env`.
+    let mut env = vec![("ACUTO_TERM".to_string(), "true".to_string())];
 
     match shell {
         IntegrationShell::Zsh => {
@@ -543,7 +546,7 @@ mod tests {
         // printing escape sequences into it.
         for script in [ZSH_SCRIPT, BASH_SCRIPT, FISH_SCRIPT, POWERSHELL_SCRIPT] {
             assert!(
-                script.contains("TERM_PROGRAM"),
+                script.contains("ACUTO_TERM"),
                 "every script must check it is running inside Acuto"
             );
         }

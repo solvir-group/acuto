@@ -40,8 +40,16 @@ function Get-VSArch {
     }
 }
 
+# Any edition of Visual Studio, found the way Microsoft documents: GitHub's
+# runners ship Enterprise, a developer may have Community or Build Tools, and a
+# hard-coded path to one of them fails on every other.
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vsInstall) {
+    throw "Visual Studio with the C++ build tools was not found"
+}
 Push-Location
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
+& "$vsInstall\Common7\Tools\Launch-VsDevShell.ps1" -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
 Pop-Location
 
 $target = "$Architecture-pc-windows-msvc"
@@ -116,8 +124,8 @@ function GenerateLicenses {
 function BuildZedAndItsFriends {
     Write-Output "Building Zed and its friends, for channel: $channel"
     # Build zed.exe, cli.exe and auto_update_helper.exe
-    cargo build --release --package zed --package cli --package auto_update_helper --target $target
-    Copy-Item -Path ".\$CargoOutDir\zed.exe" -Destination "$innoDir\Zed.exe" -Force
+    cargo build --release --package acuto --package cli --package auto_update_helper --target $target
+    Copy-Item -Path ".\$CargoOutDir\acuto.exe" -Destination "$innoDir\Acuto.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\cli.exe" -Destination "$innoDir\cli.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\auto_update_helper.exe" -Destination "$innoDir\auto_update_helper.exe" -Force
     # Build explorer_command_injector.dll
@@ -156,12 +164,16 @@ function BuildRemoteServer {
 
 function ZipZedAndItsFriendsDebug {
     $items = @(
-        ".\$CargoOutDir\zed.pdb",
+        ".\$CargoOutDir\acuto.pdb",
         ".\$CargoOutDir\cli.pdb",
         ".\$CargoOutDir\auto_update_helper.pdb",
         ".\$CargoOutDir\explorer_command_injector.pdb",
         ".\$CargoOutDir\remote_server.pdb"
-    )
+    ) | Where-Object { Test-Path $_ }
+    if (-not $items) {
+        Write-Output "No debug symbols to archive."
+        return
+    }
 
     Compress-Archive -Path $items -DestinationPath ".\$CargoOutDir\zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip" -Force
 }
@@ -218,7 +230,7 @@ function SignZedAndItsFriends {
         return
     }
 
-    $files = "$innoDir\Zed.exe,$innoDir\cli.exe,$innoDir\auto_update_helper.exe,$innoDir\zed_explorer_command_injector.dll,$innoDir\zed_explorer_command_injector.appx"
+    $files = "$innoDir\Acuto.exe,$innoDir\cli.exe,$innoDir\auto_update_helper.exe,$innoDir\zed_explorer_command_injector.dll,$innoDir\zed_explorer_command_injector.appx"
     & "$innoDir\sign.ps1" $files
 }
 
@@ -242,7 +254,7 @@ function DownloadConpty {
 function CollectFiles {
     Move-Item -Path "$innoDir\zed_explorer_command_injector.appx" -Destination "$innoDir\appx\zed_explorer_command_injector.appx" -Force
     Move-Item -Path "$innoDir\zed_explorer_command_injector.dll" -Destination "$innoDir\appx\zed_explorer_command_injector.dll" -Force
-    Move-Item -Path "$innoDir\cli.exe" -Destination "$innoDir\bin\zed.exe" -Force
+    Move-Item -Path "$innoDir\cli.exe" -Destination "$innoDir\bin\acuto.exe" -Force
     Move-Item -Path "$innoDir\zed.sh" -Destination "$innoDir\bin\zed" -Force
     Move-Item -Path "$innoDir\auto_update_helper.exe" -Destination "$innoDir\tools\auto_update_helper.exe" -Force
     if($Architecture -eq "aarch64") {
@@ -261,63 +273,67 @@ function CollectFiles {
 }
 
 function BuildInstaller {
+    # Identity below is this fork's own, deliberately. The AppIds in particular
+    # were Zed's: Windows identifies an installed product by that GUID, so
+    # shipping them would have made installing Acuto an upgrade of whatever Zed
+    # the user already had, replacing or removing their editor.
     $issFilePath = "$innoDir\zed.iss"
     switch ($channel) {
         "stable" {
-            $appId = "{{2DB0DA96-CA55-49BB-AF4F-64AF36A86712}"
+            $appId = "{{E7E84F03-0AD5-432E-BA22-D17342F67C44}"
             $appIconName = "app-icon"
-            $appName = "Zed"
-            $appDisplayName = "Zed"
-            $appSetupName = "Zed-$Architecture"
+            $appName = "Acuto"
+            $appDisplayName = "Acuto"
+            $appSetupName = "Acuto-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Stable-Instance-Mutex"
-            $appExeName = "Zed"
-            $regValueName = "Zed"
-            $appUserId = "ZedIndustries.Zed"
-            $appShellNameShort = "Z&ed"
-            $appAppxFullName = "ZedIndustries.Zed_1.0.0.0_neutral__japxn1gcva8rg"
+            $appMutex = "Acuto-Stable-Instance-Mutex"
+            $appExeName = "Acuto"
+            $regValueName = "Acuto"
+            $appUserId = "Acuto.Acuto"
+            $appShellNameShort = "A&cuto"
+            $appAppxFullName = "Acuto.Acuto_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "preview" {
-            $appId = "{{F70E4811-D0E2-4D88-AC99-D63752799F95}"
+            $appId = "{{DB21CCC7-7F30-4ADA-8559-08D2B0F6D24D}"
             $appIconName = "app-icon-preview"
-            $appName = "Zed Preview"
-            $appDisplayName = "Zed Preview"
-            $appSetupName = "Zed-$Architecture"
+            $appName = "Acuto Preview"
+            $appDisplayName = "Acuto Preview"
+            $appSetupName = "Acuto-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Preview-Instance-Mutex"
-            $appExeName = "Zed"
-            $regValueName = "ZedPreview"
-            $appUserId = "ZedIndustries.Zed.Preview"
-            $appShellNameShort = "Z&ed Preview"
-            $appAppxFullName = "ZedIndustries.Zed.Preview_1.0.0.0_neutral__japxn1gcva8rg"
+            $appMutex = "Acuto-Preview-Instance-Mutex"
+            $appExeName = "Acuto"
+            $regValueName = "AcutoPreview"
+            $appUserId = "Acuto.Acuto.Preview"
+            $appShellNameShort = "A&cuto Preview"
+            $appAppxFullName = "Acuto.Acuto.Preview_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "nightly" {
-            $appId = "{{1BDB21D3-14E7-433C-843C-9C97382B2FE0}"
+            $appId = "{{40CD6969-A072-4789-9E48-4DBC1AF6B70C}"
             $appIconName = "app-icon-nightly"
-            $appName = "Zed Nightly"
-            $appDisplayName = "Zed Nightly"
-            $appSetupName = "Zed-$Architecture"
+            $appName = "Acuto Nightly"
+            $appDisplayName = "Acuto Nightly"
+            $appSetupName = "Acuto-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Nightly-Instance-Mutex"
-            $appExeName = "Zed"
-            $regValueName = "ZedNightly"
-            $appUserId = "ZedIndustries.Zed.Nightly"
-            $appShellNameShort = "Z&ed Editor Nightly"
-            $appAppxFullName = "ZedIndustries.Zed.Nightly_1.0.0.0_neutral__japxn1gcva8rg"
+            $appMutex = "Acuto-Nightly-Instance-Mutex"
+            $appExeName = "Acuto"
+            $regValueName = "AcutoNightly"
+            $appUserId = "Acuto.Acuto.Nightly"
+            $appShellNameShort = "A&cuto Nightly"
+            $appAppxFullName = "Acuto.Acuto.Nightly_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "dev" {
-            $appId = "{{8357632E-24A4-4F32-BA97-E575B4D1FE5D}"
+            $appId = "{{D1550CAB-CE95-4BA3-AA33-24EB4828B97C}"
             $appIconName = "app-icon-dev"
-            $appName = "Zed Dev"
-            $appDisplayName = "Zed Dev"
-            $appSetupName = "Zed-$Architecture"
+            $appName = "Acuto Dev"
+            $appDisplayName = "Acuto Dev"
+            $appSetupName = "Acuto-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Dev-Instance-Mutex"
-            $appExeName = "Zed"
-            $regValueName = "ZedDev"
-            $appUserId = "ZedIndustries.Zed.Dev"
-            $appShellNameShort = "Z&ed Dev"
-            $appAppxFullName = "ZedIndustries.Zed.Dev_1.0.0.0_neutral__japxn1gcva8rg"
+            $appMutex = "Acuto-Dev-Instance-Mutex"
+            $appExeName = "Acuto"
+            $regValueName = "AcutoDev"
+            $appUserId = "Acuto.Acuto.Dev"
+            $appShellNameShort = "A&cuto Dev"
+            $appAppxFullName = "Acuto.Acuto.Dev_1.0.0.0_neutral__japxn1gcva8rg"
         }
         default {
             Write-Error "can't bundle installer for $channel."
@@ -329,6 +345,14 @@ function BuildInstaller {
     # Currently, we are using Windows 2022 runner.
     # Windows runner 2025 doesn't have iscc in PATH for now, https://github.com/actions/runner-images/issues/11228
     $innoSetupPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+    if (-not (Test-Path $innoSetupPath)) {
+        $iscc = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
+        if ($iscc) {
+            $innoSetupPath = $iscc.Source
+        } else {
+            throw "Inno Setup 6 was not found. Install it with: choco install innosetup"
+        }
+    }
 
     $definitions = @{
         "AppId"          = $appId
@@ -385,7 +409,9 @@ CheckEnvironmentVariables
 PrepareForBundle
 GenerateLicenses
 BuildZedAndItsFriends
-BuildRemoteServer
+if (-not $env:ACUTO_SKIP_REMOTE_SERVER) {
+    BuildRemoteServer
+}
 MakeAppx
 SignZedAndItsFriends
 ZipZedAndItsFriendsDebug
@@ -401,8 +427,8 @@ if($env:CI) {
 if ($buildSuccess) {
     Write-Output "Build successful"
     if ($Install) {
-        Write-Output "Installing Zed..."
-        Start-Process -FilePath "$env:ZED_WORKSPACE/target/ZedEditorUserSetup-x64-$env:RELEASE_VERSION.exe"
+        Write-Output "Installing Acuto..."
+        Start-Process -FilePath "$env:ZED_WORKSPACE/target/Acuto-$Architecture.exe"
     }
     exit 0
 }

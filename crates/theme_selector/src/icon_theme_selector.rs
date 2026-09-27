@@ -389,6 +389,7 @@ mod tests {
         cx.update(|cx| {
             let registry = ThemeRegistry::global(cx);
             let make_icon_theme = |name: &str, appearance: Appearance| IconTheme {
+                colored: false,
                 id: name.to_lowercase().replace(' ', "-"),
                 name: SharedString::from(name.to_string()),
                 appearance,

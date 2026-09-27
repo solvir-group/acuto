@@ -11759,17 +11759,26 @@ impl EditorSnapshot {
 
             let is_singleton = self.buffer_snapshot().is_singleton();
 
+            // Fork change: each of these was a character wider. The gutter's
+            // left padding is dead space between the file tree and the first
+            // digit of a line number -- it exists to hold the runnable,
+            // breakpoint and bookmark glyphs, and those need about one
+            // character, not three. The wider values left a visible channel
+            // down the left of every file.
+            //
+            // Still enough room for the glyphs, which are drawn centred in this
+            // space rather than filling it.
             let left_padding = git_blame_entries_width.unwrap_or(Pixels::ZERO)
                 + if !is_singleton {
-                    ch_width * 4.0
+                    ch_width * 2.5
                 // runnables, breakpoints and bookmarks are shown in the same place
                 // if all three are there only the runnable is shown
                 } else if show_runnables || show_breakpoints || show_bookmarks {
-                    ch_width * 3.0
+                    ch_width * 1.75
                 } else if show_git_gutter && show_line_numbers {
-                    ch_width * 2.0
+                    ch_width * 1.0
                 } else if show_git_gutter || show_line_numbers {
-                    ch_width
+                    ch_width * 0.5
                 } else {
                     px(0.)
                 };

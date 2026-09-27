@@ -60,3 +60,8 @@ crates/docs_preprocessor/actions.json
 .nixos-test-history
 
 .local*
+# Scratch left in the repository root by script/bundle-windows.ps1
+/inno/
+/AGS_SDK*
+/conpty/
+/*.nupkg

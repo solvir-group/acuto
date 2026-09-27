@@ -112,8 +112,14 @@ impl Panel for ProblemsPanel {
         px(280.)
     }
 
+    /// No status bar button.
+    ///
+    /// The error and warning counts at the left of the status bar open this
+    /// panel, and they say how many of each there are first. A second control
+    /// at the other end of the bar, showing only a triangle, was the same
+    /// action with less information attached.
     fn icon(&self, _window: &Window, _cx: &gpui::App) -> Option<IconName> {
-        Some(IconName::Warning)
+        None
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &gpui::App) -> Option<&'static str> {

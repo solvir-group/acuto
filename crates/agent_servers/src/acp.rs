@@ -1672,7 +1672,11 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let mcp_servers = mcp_servers_for_project(
+            &project,
+            self.agent_capabilities.mcp_capabilities.http,
+            cx,
+        );
 
         cx.spawn(async move |cx| {
             let response = self
@@ -1803,7 +1807,11 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let mcp_servers = mcp_servers_for_project(
+            &project,
+            self.agent_capabilities.mcp_capabilities.http,
+            cx,
+        );
         self.open_or_create_session(
             session_id,
             project,
@@ -1847,7 +1855,11 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let mcp_servers = mcp_servers_for_project(
+            &project,
+            self.agent_capabilities.mcp_capabilities.http,
+            cx,
+        );
         self.open_or_create_session(
             session_id,
             project,
@@ -4457,10 +4469,35 @@ mod tests {
     }
 }
 
-fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
+fn mcp_servers_for_project(
+    project: &Entity<Project>,
+    agent_accepts_http: bool,
+    cx: &App,
+) -> Vec<acp::McpServer> {
+    // The editor's own controls come first, so an external agent can run an
+    // action or change a setting the way the built-in agent already can.
+    //
+    // Offered only to agents that said they take HTTP MCP servers. The protocol
+    // makes this conditional on `mcp_capabilities.http`, and an agent that
+    // declared otherwise does not ignore the entry -- it fails the handshake.
+    //
+    // Absence is not an error either way: the server is optional, and an agent
+    // without it simply gets the user's own MCP servers, as before.
+    let mut servers: Vec<acp::McpServer> = ide_control_mcp::endpoint(cx)
+        .filter(|_| agent_accepts_http)
+        .map(|endpoint| {
+            acp::McpServer::Http(
+                acp::McpServerHttp::new("acuto-ide-control", endpoint.url).headers(vec![
+                    acp::HttpHeader::new("Authorization", endpoint.authorization),
+                ]),
+            )
+        })
+        .into_iter()
+        .collect();
+
     let context_server_store = project.read(cx).context_server_store().read(cx);
     let is_local = project.read(cx).is_local();
-    context_server_store
+    servers.extend(context_server_store
         .configured_server_ids()
         .iter()
         .filter_map(|id| {
@@ -4501,8 +4538,8 @@ fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpS
                 )),
                 _ => None,
             }
-        })
-        .collect()
+        }));
+    servers
 }
 
 fn config_state(

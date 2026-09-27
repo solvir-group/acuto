@@ -14,7 +14,7 @@ if [[ -n "${ACUTO_SHELL_INTEGRATION_LOADED:-}" ]]; then
 fi
 ACUTO_SHELL_INTEGRATION_LOADED=1
 
-if [[ "${TERM_PROGRAM:-}" != "Acuto" ]]; then
+if [[ "${ACUTO_TERM:-}" != "true" ]]; then
   return 0
 fi
 

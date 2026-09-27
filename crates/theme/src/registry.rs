@@ -112,12 +112,12 @@ impl ThemeRegistry {
         // for tests.
         registry.insert_theme_families([crate::fallback_themes::zed_default_themes()]);
 
-        let default_icon_theme = crate::default_icon_theme();
-        registry
-            .state
-            .write()
-            .icon_themes
-            .insert(default_icon_theme.name.clone(), default_icon_theme);
+        {
+            let mut state = registry.state.write();
+            for icon_theme in crate::bundled_icon_themes() {
+                state.icon_themes.insert(icon_theme.name.clone(), icon_theme);
+            }
+        }
 
         registry
     }
@@ -284,6 +284,7 @@ impl ThemeRegistry {
             ));
 
             let icon_theme = IconTheme {
+                colored: icon_theme.colored,
                 id: uuid::Uuid::new_v4().to_string(),
                 name: icon_theme.name.into(),
                 appearance: match icon_theme.appearance {

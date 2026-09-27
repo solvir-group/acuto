@@ -993,6 +993,10 @@ impl VsCodeSettings {
     fn theme_settings_content(&self) -> ThemeSettingsContent {
         let (buffer_font_family, buffer_font_fallbacks) = self.read_fonts("editor.fontFamily");
         ThemeSettingsContent {
+            // Someone importing their VS Code settings wants their code to look
+            // the way it did there, and the syntax palette is most of what that
+            // means. The theme itself is still theirs to choose.
+            token_theme: Some(settings_content::TokenTheme::VsCode),
             ui_font_size: None,
             ui_font_family: None,
             ui_font_fallbacks: None,

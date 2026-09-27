@@ -687,9 +687,17 @@ pub fn insert_zed_terminal_env(
     version: &impl std::fmt::Display,
 ) {
     env.insert("ZED_TERM".to_string(), "true".to_string());
-    // The shell integration scripts gate on this, and they are inert in any
-    // terminal that is not this one.
-    env.insert("TERM_PROGRAM".to_string(), "Acuto".to_string());
+    // The fork's own name, for the shell integration scripts to gate on. They
+    // are inert in any terminal that is not this one, and nothing outside this
+    // repository reads this variable.
+    env.insert("ACUTO_TERM".to_string(), "true".to_string());
+    // Deliberately not "Acuto". `TERM_PROGRAM` is read as a capability probe
+    // rather than a label: the libraries every CLI is built on match it against
+    // a list of terminals they know, and a name they have never seen means
+    // "assume nothing" -- no colour, no hyperlinks, no alternate screen. The
+    // terminal here is Zed's, with Zed's capabilities, so this is also the
+    // honest answer to the question being asked.
+    env.insert("TERM_PROGRAM".to_string(), "zed".to_string());
     env.insert("TERM".to_string(), "xterm-256color".to_string());
     env.insert("COLORTERM".to_string(), "truecolor".to_string());
     env.insert("TERM_PROGRAM_VERSION".to_string(), version.to_string());

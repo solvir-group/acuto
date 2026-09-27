@@ -60,8 +60,8 @@ pub use rpc::*;
 pub use telemetry_events::Event;
 pub use user::*;
 
-static ZED_SERVER_URL: LazyLock<Option<String>> =
-    LazyLock::new(|| std::env::var("ZED_SERVER_URL").ok());
+static ACUTO_SERVER_URL: LazyLock<Option<String>> =
+    LazyLock::new(|| std::env::var("ACUTO_SERVER_URL").ok());
 static ZED_RPC_URL: LazyLock<Option<String>> = LazyLock::new(|| std::env::var("ZED_RPC_URL").ok());
 
 pub static IMPERSONATE_LOGIN: LazyLock<Option<String>> = LazyLock::new(|| {
@@ -116,7 +116,7 @@ pub struct ClientSettings {
 
 impl Settings for ClientSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
-        if let Some(server_url) = &*ZED_SERVER_URL {
+        if let Some(server_url) = &*ACUTO_SERVER_URL {
             return Self {
                 server_url: server_url.clone(),
                 credentials_url: content.credentials_url.clone(),

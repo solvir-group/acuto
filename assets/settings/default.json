@@ -11,10 +11,16 @@
   // appearance underneath them when the OS decides the sun went down.
   "theme": {
     "mode": "dark",
-    "light": "One Light",
-    "dark": "One Dark",
+    "light": "Acuto Frosted",
+    "dark": "Acuto Noir",
   },
-  "icon_theme": "Zed (Default)",
+  "icon_theme": "VS Code",
+  // Which syntax palette colours code, independently of the theme.
+  //
+  //  - "acuto" — violet keywords and tags, gold types, no orange
+  //  - "vs_code" — Visual Studio Code's Dark+ and Light+ values
+  //  - "theme" — whatever syntax colours the active theme ships with
+  "token_theme": "acuto",
   // The name of a base set of key bindings to use.
   // This setting can take the following values:
   //
@@ -28,10 +34,12 @@
   // 8. "Cursor"
   // 9. "None"
   "base_keymap": "Zed",
-  // The name of a font to use for rendering text in the editor
-  // ".ZedMono" currently aliases to Lilex
-  // but this may change in the future.
-  "buffer_font_family": ".ZedMono",
+  // The name of a font to use for rendering text in the editor.
+  //
+  // Fork change: Consolas. It ships with Windows, so it is there on a first
+  // run without waiting on a download, and it is the font most people on this
+  // platform already read code in.
+  "buffer_font_family": "Consolas",
   // Set the buffer text's font fallbacks, this will be merged with
   // the platform's default fallbacks.
   "buffer_font_fallbacks": null,
@@ -59,7 +67,7 @@
   // You can set this to ".SystemUIFont" to use the system font
   // ".ZedSans" currently aliases to "IBM Plex Sans", but this may
   // change in the future
-  "ui_font_family": ".ZedSans",
+  "ui_font_family": "Acuto Sans",
   // Set the UI's font fallbacks, this will be merged with the platform's
   // default font fallbacks.
   "ui_font_fallbacks": null,
@@ -338,10 +346,17 @@
   "minimum_contrast_for_highlights": 45,
   // Whether to pop the completions menu while typing in an editor without
   // explicitly requesting it.
-  "show_completions_on_input": true,
+  //
+  // Off, so the AI prediction shows as ghost text in the line and Tab takes
+  // it. While the menu is open the editor files the prediction inside it, as
+  // one entry among many. The list is still a keystroke away with ctrl-space.
+  "show_completions_on_input": false,
   // Whether to display inline and alongside documentation for items in the
   // completions menu
-  "show_completion_documentation": true,
+  //
+  // Off: a definition panel opening beside the menu on every keystroke covered
+  // the code being typed. Hovering a symbol still shows its documentation.
+  "show_completion_documentation": false,
   // Whether to colorize brackets in the editor.
   // (also known as "rainbow brackets")
   //
@@ -572,15 +587,23 @@
     // Whether to show the project host and name in the titlebar.
     "show_project_items": true,
     // Whether to show onboarding banners in the titlebar.
-    "show_onboarding_banner": true,
+    "show_onboarding_banner": false,
     // Whether to show user picture in the titlebar.
-    "show_user_picture": true,
+    //
+    // The next three are all Zed-account chrome, and there is no Zed account
+    // here -- collaboration and telemetry are gone, so a sign-in button leads
+    // nowhere and a user menu has nothing to put in it.
+    "show_user_picture": false,
     // Whether to show the user menu in the titlebar.
-    "show_user_menu": true,
+    "show_user_menu": false,
     // Whether to show the sign in button in the titlebar.
-    "show_sign_in": true,
+    "show_sign_in": false,
     // Whether to show the menus in the titlebar.
-    "show_menus": false,
+    //
+    // On by default. File / Edit / View is where anyone opening an editor for
+    // the first time looks for "open folder", and a window without one gives a
+    // new user nothing to press.
+    "show_menus": true,
     // The layout of window control buttons in the title bar (Linux only).
     "button_layout": "platform_default",
   },
@@ -1030,9 +1053,12 @@
   },
   "git_panel": {
     // Whether to show the git panel button in the status bar.
-    "button": true,
+    //
+    // Off: the rail above the file tree already carries git, and a second
+    // toggle in the corner is a duplicate of the larger control.
+    "button": false,
     // Where to dock the git panel. Can be 'left' or 'right'.
-    "dock": "right",
+    "dock": "left",
     // Default width of the git panel.
     "default_width": 360,
     // Style of the git status indicator in the panel.
@@ -1109,7 +1135,10 @@
     // Whether to show the agent panel button in the status bar.
     "button": true,
     // Where to dock the agent panel. Can be 'left', 'right' or 'bottom'.
-    "dock": "left",
+    //
+    // Right in this fork: the file tree owns the left, and an agent reading
+    // your code should sit beside the code rather than pushing it across.
+    "dock": "right",
     // Whether the agent panel should use flexible (proportional) sizing.
     //
     // Default: true
@@ -1200,7 +1229,11 @@
       },
     },
     // When enabled, agent edits will be displayed in single-file editors for review
-    "single_file_review": false,
+    //
+    // Fork change: on. This is the switch that turns an opened file into a
+    // red/green diff with per-hunk keep and reject, so with it off "review
+    // changes" opened the post-edit file and showed nothing to review.
+    "single_file_review": true,
     // Settings for automatic agent context compaction, which summarizes earlier
     // messages to free up room in the model's context window once it grows too
     // large.
@@ -1288,10 +1321,14 @@
     // Where to show notifications when the agent has either completed
     // its response, or else needs confirmation before it can run a
     // tool action.
-    // "primary_screen" - Show the notification only on your primary screen (default)
+    // "primary_screen" - Show the notification only on your primary screen
     // "all_screens" - Show these notifications on all screens
-    // "never" - Never show these notifications
-    "notify_when_agent_waiting": "primary_screen",
+    // "never" - Never show these notifications (default)
+    //
+    // Fork change: never. These are pop-up windows that appear over whatever
+    // you are doing every time a turn ends, which is often, and the panel
+    // already shows the same thing where you are looking.
+    "notify_when_agent_waiting": "never",
     // When to play a sound when the agent has either completed
     // its response, or needs user input.
     // "never" - Never play the sound
@@ -1303,11 +1340,18 @@
     // Whether to have edit cards in the agent panel expanded, showing a preview of the full diff.
     //
     // Default: true
-    "expand_edit_card": true,
+    // Collapsed. An edit card open by default puts the whole diff of every
+    // file the agent touched into the transcript, so the reply you are reading
+    // is pushed off the screen by the changes it is describing. One click opens
+    // the one you care about.
+    "expand_edit_card": false,
     // Whether to have terminal cards in the agent panel expanded, showing the whole command output.
     //
     // Default: true
-    "expand_terminal_card": true,
+    // Collapsed, for the same reason: a build's output is hundreds of lines
+    // and the only part that matters is whether it succeeded, which the card
+    // header already says.
+    "expand_terminal_card": false,
     // Where terminal commands the agent runs should appear.
     //
     // "inline" keeps them in the thread, in a terminal it owns.
@@ -1318,8 +1362,32 @@
     "terminal_mode": "inline",
     // Which agent a new agent tab opens.
     //
-    // Default: acuto
-    "default_agent": "acuto",
+    // "ask" lists whichever agents are configured and lets you pick, unless
+    // only one is set up. The named agents open straight into that agent:
+    // "claude_code", "codex", "copilot", "gemini", or "acuto" for the built-in
+    // one.
+    //
+    // Default: ask
+    "default_agent": "ask",
+    // Whether to hold an agent's edits for review rather than leaving them
+    // applied in place.
+    //
+    // When on, the end of a turn opens a review panel beside your code: every
+    // file the agent changed, as one diff, with accept and reject on each hunk.
+    // Toggled from the button in the composer.
+    //
+    // Default: true
+    "review_changes": true,
+    // Which agent opens in the side panel, and which opens in a centre-pane
+    // tab, when they should differ from `default_agent`.
+    //
+    // The two surfaces get used for different work -- the panel for a question
+    // asked while reading code, a tab for a job left running -- so they can be
+    // pointed at different agents. null means "follow default_agent".
+    //
+    // Default: null
+    "panel_agent": null,
+    "tab_agent": null,
     // Whether to reopen the threads sidebar on launch when it was open at quit.
     //
     // Default: false
@@ -1333,8 +1401,13 @@
     "terminal_init_command": "",
     // How thinking blocks should be displayed by default in the agent panel.
     //
-    // Default: auto
-    "thinking_display": "auto",
+    // Collapsed. Reasoning is worth having on tap when an answer surprises you,
+    // and worth nothing the rest of the time -- expanded by default it is
+    // several screens of text between you and the thing you asked for, and the
+    // transcript stops being readable.
+    //
+    // Default: always_collapsed
+    "thinking_display": "always_collapsed",
     // Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     // Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     //
@@ -1346,8 +1419,13 @@
     "use_modifier_to_send": false,
     // Minimum number of lines to display in the agent message editor.
     //
-    // Default: 4
-    "message_editor_min_lines": 4,
+    // Two. Most prompts are a sentence, so a composer that rests four lines
+    // tall is mostly empty space between the transcript and the send button --
+    // and it springs back to that height after every message, which reads as
+    // the box growing. It still grows with what you type, up to twelve lines.
+    //
+    // Default: 2
+    "message_editor_min_lines": 2,
     // Whether to show turn statistics (elapsed time during generation, final turn duration).
     //
     // Default: false
@@ -1407,7 +1485,12 @@
   //     "autosave": { "after_delay": {"milliseconds": 500} },
   "autosave": "off",
   // Maximum number of tabs per pane. Unset for unlimited.
-  "max_tabs": null,
+  //
+  // Capped. Unlimited tabs are unlimited in name only -- past a dozen the
+  // titles are too narrow to read and the tab you want is faster to reach from
+  // the file finder than from the bar. The cap evicts the least recently used,
+  // so the tabs you are actually working in stay put.
+  "max_tabs": 12,
   // Settings related to the editor's tab bar.
   "tab_bar": {
     // Whether or not to show the tab bar in the editor
@@ -1429,7 +1512,11 @@
     // One of: ["right", "left"]
     "close_position": "right",
     // Whether to show the file icon for a tab.
-    "file_icons": false,
+    //
+    // On. The icon is what makes a tab identifiable at a glance once the title
+    // is truncated, and it is the only thing in the tab that stays legible at
+    // the narrow end.
+    "file_icons": true,
     // Controls the appearance behavior of the tab's close button.
     //
     // 1. Show it just upon hovering the tab. (default)
@@ -1624,9 +1711,12 @@
   // Control what info is collected by Acuto.
   "telemetry": {
     // Send debug info like crash reports.
-    "diagnostics": true,
+    //
+    // Fork change: off. Acuto talks to the agent the user chose and nothing
+    // else, and a first run should not have to opt out of that.
+    "diagnostics": false,
     // Send anonymized usage data like what languages you're using Acuto with.
-    "metrics": true,
+    "metrics": false,
     // Allow sending requests to Anthropic models that cannot be offered with
     // Zero Data Retention
     "anthropic_retention": false,
@@ -1637,7 +1727,14 @@
   "disable_ai": false,
   // Automatically update Acuto. This setting may be ignored on Linux if
   // installed through a package manager.
-  "auto_update": true,
+  //
+  // Off. The updater polls Zed's release service once an hour, sending a stable
+  // install identifier with every check, and on a version bump it would fetch
+  // and install an upstream Zed build over this one. Both halves are wrong for
+  // a fork: the beacon is somebody else's telemetry and the payload is somebody
+  // else's product. Turn this back on once it points at a release service of
+  // our own.
+  "auto_update": false,
   // How to render LSP `textDocument/documentColor` colors in the editor.
   //
   // Possible values:
@@ -1832,7 +1929,13 @@
   "load_direnv": "direct",
   "edit_predictions": {
     // Which edit prediction provider to use.
-    "provider": "zed",
+    //
+    // An OpenAI-compatible endpoint you point at yourself, rather than a hosted
+    // service tied to an account. The key is never stored here: it is read from
+    // ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY, or from the system
+    // credential store, so a settings file can be shared or committed without
+    // carrying a secret.
+    "provider": "open_ai_compatible_api",
     // A list of globs representing files that edit predictions should be disabled for.
     // There's a sensible default list of globs already included.
     // Any addition to this list will be merged with the default list.
@@ -1888,10 +1991,13 @@
       "prediction_debounce": 0,
     },
     "open_ai_compatible_api": {
-      "api_url": "",
-      "model": "",
-      "prompt_format": "infer",
-      "max_output_tokens": 64,
+      "api_url": "https://integrate.api.nvidia.com/v1/chat/completions",
+      // Not the "flash" variants: they are reasoning models that answer with
+      // `reasoning_content` and leave `content` null, so a prediction request
+      // spends its whole budget thinking and returns nothing to insert.
+      "model": "z-ai/glm-5.3",
+      "prompt_format": "glm",
+      "max_output_tokens": 512,
       "prediction_debounce": 0,
     },
     "zed": {
@@ -2865,7 +2971,8 @@
   "context_servers": {},
   // Configures agent servers available in the agent panel.
   // External agents, spoken to over the Agent Client Protocol. Registered here
-  // rather than left empty so Claude Code, Codex and Gemini appear in the agent
+  // rather than left empty so Claude Code, Codex, Copilot, Gemini and
+  // Antigravity appear in the agent
   // picker on a fresh install: an agent nobody can find is an agent nobody
   // uses, and each of these is a one-line npx away already.
   //
@@ -2878,7 +2985,14 @@
     "codex-acp": {
       "type": "registry",
     },
+    "github-copilot-cli": {
+      "type": "registry",
+    },
     "gemini": {
+      "type": "registry",
+    },
+    // Google's own ACP server for Antigravity, shipped as a native binary.
+    "antigravity-acp": {
       "type": "registry",
     },
   },
@@ -2889,7 +3003,8 @@
     "dock": "bottom",
     "log_dap_communications": true,
     "format_dap_log_messages": true,
-    "button": true,
+    // Off: the debugger lives in the bottom dock's own tab strip.
+    "button": false,
   },
   // Configures any number of settings profiles that are temporarily applied
   // when selected from `settings profile selector: toggle`.

@@ -107,6 +107,7 @@ members = [
     "crates/http_client_tls",
     "crates/http_proxy",
     "crates/icons",
+    "crates/ide_control_mcp",
     "crates/image_viewer",
     "crates/input_latency_ui",
     "crates/inspector_ui",
@@ -376,6 +377,7 @@ http_client = { path = "crates/http_client" }
 http_client_tls = { path = "crates/http_client_tls" }
 http_proxy = { path = "crates/http_proxy" }
 icons = { path = "crates/icons" }
+ide_control_mcp = { path = "crates/ide_control_mcp" }
 image_viewer = { path = "crates/image_viewer" }
 input_latency_ui = { path = "crates/input_latency_ui" }
 inspector_ui = { path = "crates/inspector_ui" }
@@ -1072,7 +1074,20 @@ minidumper = { opt-level = 3 }
 # More codegen units means each one is smaller, so peak memory during codegen
 # drops. Scoped to this package so the rest of the tree keeps its fingerprint
 # and does not rebuild.
-zed = { codegen-units = 256 }
+#
+# `debug = 0` for the same reason: debuginfo for a crate that links every other
+# crate in the workspace is the single largest allocation in the build, and it
+# kept OOMing even at 256 units. Only this crate's own frames lose line numbers
+# in a backtrace -- every dependency keeps `line-tables-only`, which is where
+# the interesting frames have been anyway.
+acuto = { codegen-units = 256, debug = 0 }
+
+# Fork change, same failure as `zed` above and the same remedy. This crate is a
+# few thousand lines of settings structs, each with half a dozen derives on it
+# (Serialize, Deserialize, JsonSchema, MergeFrom, strum), so the generated code
+# is an order of magnitude larger than the source and LLVM ran out of memory
+# codegenning it: "rustc-LLVM ERROR: out of memory".
+settings_content = { codegen-units = 256, debug = 0 }
 serde_json = { opt-level = 3 }
 # Build single-source-file crates with cg=1 as it helps make `cargo build` of a whole workspace a bit faster
 activity_indicator = { codegen-units = 1 }
@@ -1116,7 +1131,7 @@ lto = "thin"
 codegen-units = 1
 
 [profile.release.package]
-zed = { codegen-units = 16 }
+acuto = { codegen-units = 16 }
 
 [profile.release-fast]
 inherits = "release"

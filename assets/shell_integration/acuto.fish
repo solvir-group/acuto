@@ -13,7 +13,7 @@ if set --query ACUTO_SHELL_INTEGRATION_LOADED
 end
 set --global ACUTO_SHELL_INTEGRATION_LOADED 1
 
-if test "$TERM_PROGRAM" != "Acuto"
+if test "$ACUTO_TERM" != "true"
     exit 0
 end
 

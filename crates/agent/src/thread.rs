@@ -405,6 +405,12 @@ impl UserMessage {
                         MentionUri::Thread { .. } => {
                             write!(&mut thread_context, "\n{}\n", content).ok();
                         }
+                        // A ticket is already a brief written for an agent, so
+                        // it goes in as prose beside the other threads of
+                        // context rather than fenced as code.
+                        MentionUri::Ticket { .. } => {
+                            write!(&mut thread_context, "\n{}\n", content).ok();
+                        }
                         MentionUri::Rule { .. } => {
                             // Deprecated: keeps legacy rule mentions as context.
                             write!(

@@ -8,7 +8,7 @@ use gpui::{App, AppContext as _, Entity, Task};
 use language_model::{ApiKey, EnvVar};
 use project::{
     Project,
-    agent_server_store::{AgentId, AllAgentServersSettings},
+    agent_server_store::{AgentId, AgentServersUpdated, AllAgentServersSettings},
 };
 use settings::{AgentConfigOptionValue, SettingsStore, update_settings_file};
 use std::{rc::Rc, sync::Arc};
@@ -18,6 +18,14 @@ pub const GEMINI_ID: &str = "gemini";
 pub const CLAUDE_AGENT_ID: &str = "claude-acp";
 pub const CODEX_ID: &str = "codex-acp";
 pub const CURSOR_ID: &str = "cursor";
+pub const COPILOT_ID: &str = "github-copilot-cli";
+pub const ANTIGRAVITY_ID: &str = "antigravity-acp";
+
+/// How long to wait for the agent registry before giving up on an agent.
+///
+/// Long enough for a cold fetch on an ordinary connection, short enough that
+/// someone offline is told so rather than left watching a spinner.
+const REGISTRY_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// A generic agent server implementation for custom user-defined agents
 pub struct CustomAgentServer {
@@ -250,6 +258,14 @@ impl AgentServer for CustomAgentServer {
                         extra_env.insert("OPEN_AI_API_KEY".into(), api_key);
                     }
                 }
+                COPILOT_ID => {
+                    // Copilot CLI signs in on its own the first time it runs.
+                    // A token already in the environment is passed through so a
+                    // machine configured for CI does not have to sign in twice.
+                    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+                        extra_env.insert("GITHUB_TOKEN".into(), token);
+                    }
+                }
                 GEMINI_ID => {
                     extra_env.insert("SURFACE".to_owned(), "zed".to_owned());
                 }
@@ -263,10 +279,63 @@ impl AgentServer for CustomAgentServer {
                     extra_env.insert("GEMINI_API_KEY".into(), api_key);
                 }
             }
+            // A registry agent appears only once the registry has been
+            // fetched, which on a fresh profile has not happened yet. Waiting
+            // for one refresh turns "not registered" from something the user
+            // sees during the first seconds of every new install into something
+            // that means what it says.
+            if is_registry_agent {
+                let missing = store
+                    .update(cx, |store, _| store.get_external_agent(&agent_id).is_none())
+                    .unwrap_or(false);
+                if missing {
+                    // Listening starts before the refresh is asked for: a
+                    // refresh answered from cache can finish before this task
+                    // runs again, and a subscription made afterwards would then
+                    // wait out the whole timeout for an update already missed.
+                    let updated = store.update(cx, |_, cx| {
+                        let (tx, rx) = futures::channel::oneshot::channel();
+                        let mut tx = Some(tx);
+                        let subscription =
+                            cx.subscribe(&cx.entity(), move |_, _, _: &AgentServersUpdated, _| {
+                                if let Some(tx) = tx.take() {
+                                    tx.send(()).ok();
+                                }
+                            });
+                        (rx, subscription)
+                    });
+
+                    // Ask for the registry now. `refresh_if_stale` throttles
+                    // itself, so this costs nothing when a fetch already
+                    // happened, and is the whole fix when one never did.
+                    cx.update(|cx| {
+                        if let Some(registry) = project::AgentRegistryStore::try_global(cx) {
+                            registry.update(cx, |registry, cx| registry.refresh_if_stale(cx));
+                        }
+                    });
+
+                    if let Ok((updated, _subscription)) = updated {
+                        // Bounded, because the registry may be unreachable
+                        // altogether -- behind a proxy, offline, or blocked.
+                        // Then the original error is the right one to show.
+                        let timeout = cx.background_executor().timer(REGISTRY_WAIT);
+                        futures::pin_mut!(updated);
+                        futures::future::select(updated, timeout).await;
+                    }
+                }
+            }
+
             let command = store
                 .update(cx, |store, cx| {
                     let agent = store.get_external_agent(&agent_id).with_context(|| {
-                        format!("Custom agent server `{}` is not registered", agent_id)
+                        if is_registry_agent {
+                            format!(
+                                "`{agent_id}` is still downloading from the agent registry. \
+                                 Give it a moment and try again."
+                            )
+                        } else {
+                            format!("`{agent_id}` is not set up. Check its entry in agent_servers.")
+                        }
                     })?;
                     if let Some(new_version_available_tx) = delegate.new_version_available {
                         agent.set_new_version_available_tx(new_version_available_tx);

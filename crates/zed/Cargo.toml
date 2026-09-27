@@ -1,12 +1,15 @@
 [package]
 description = "The fast, collaborative code editor."
 edition.workspace = true
-name = "zed"
-version = "1.18.0"
+name = "acuto"
+# Own version line, not upstream's. This number reaches the update
+# manifest, the User-Agent and every crash tag, and inheriting 1.18.0 would
+# have all three claim to be a build of Zed.
+version = "0.1.0"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Zed Team <hi@zed.dev>"]
-default-run = "zed"
+default-run = "acuto"
 
 [lints]
 workspace = true
@@ -59,11 +62,11 @@ visual-tests = [
 ]
 
 [[bin]]
-name = "zed"
+name = "acuto"
 path = "src/main.rs"
 
 [[bin]]
-name = "zed_visual_test_runner"
+name = "acuto_visual_test_runner"
 path = "src/visual_test_runner.rs"
 required-features = ["visual-tests"]
 
@@ -132,6 +135,7 @@ gpui_platform = { workspace = true, features = [
     "x11",
 ] }
 gpui_tokio.workspace = true
+ide_control_mcp.workspace = true
 image = { workspace = true, optional = true }
 spin = "0.10.0"
 itertools.workspace = true
@@ -205,6 +209,7 @@ snippets_ui.workspace = true
 svg_preview.workspace = true
 sysinfo.workspace = true
 tab_switcher.workspace = true
+task.workspace = true
 tasks_ui.workspace = true
 telemetry.workspace = true
 telemetry_events.workspace = true
@@ -284,35 +289,35 @@ repl = { workspace = true, features = ["test-support"] }
 
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
-identifier = "dev.zed.Zed-Dev"
+identifier = "dev.acuto.Acuto-Dev"
 name = "Zed Dev"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["acuto"]
 
 [package.metadata.bundle-nightly]
 icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]
-identifier = "dev.zed.Zed-Nightly"
+identifier = "dev.acuto.Acuto-Nightly"
 name = "Zed Nightly"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["acuto"]
 
 [package.metadata.bundle-preview]
 icon = ["resources/app-icon-preview@2x.png", "resources/app-icon-preview.png"]
-identifier = "dev.zed.Zed-Preview"
+identifier = "dev.acuto.Acuto-Preview"
 name = "Zed Preview"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["acuto"]
 
 [package.metadata.bundle-stable]
 icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
-identifier = "dev.zed.Zed"
+identifier = "dev.acuto.Acuto"
 name = "Zed"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["acuto"]
 
 [package.metadata.cargo-shear]
 ignored = ["profiling", "tracing"]

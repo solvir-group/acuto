@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::{path::Path, str};
 
-use gpui::{App, SharedString};
+use gpui::{App, Hsla, SharedString, hsla};
 use theme::{GlobalTheme, IconTheme, ThemeRegistry};
 use util::paths::PathExt;
 
@@ -162,5 +162,112 @@ impl FileIcons {
             Self::default_icon_theme(cx)
                 .and_then(|icon_theme| get_chevron_icon(&icon_theme, expanded))
         })
+    }
+}
+
+/// The colour a file's icon is drawn in, by language family.
+///
+/// Six hues, not twenty. A file tree is read by scanning it, and scanning works
+/// on a small vocabulary of well-separated colours -- one per family of related
+/// things -- rather than on a unique colour per extension that nobody can hold
+/// in their head. Saturation is kept low for the same reason: the tree should
+/// read as filenames with a hint of colour, not as a column of stickers.
+///
+/// `None` means the file takes whatever muted colour the surface uses for
+/// everything else, which is better than inventing a hue for a file type nobody
+/// associates with one.
+pub fn icon_color(path: &Path, cx: &App) -> Option<Hsla> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let family = match extension.as_str() {
+        // Code. One hue for everything you write logic in, because the tree
+        // already tells you which language by the glyph -- the colour is there
+        // to separate code from everything around it.
+        "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" | "rs" | "go" | "py"
+        | "pyi" | "rb" | "erb" | "java" | "kt" | "kts" | "scala" | "swift" | "c" | "h" | "cc"
+        | "cpp" | "hpp" | "cxx" | "cs" | "fs" | "fsx" | "php" | "vue" | "svelte" | "elm"
+        | "lua" | "zig" | "nim" | "dart" | "ex" | "exs" | "erl" | "hs" | "ml" | "clj" | "cljs"
+        | "scm" | "lisp" => Family::Code,
+
+        // Markup and style: the layer you look at, rather than the layer that
+        // runs.
+        "html" | "htm" | "xml" | "svg" | "astro" | "css" | "scss" | "sass" | "less" | "pcss"
+        | "postcss" | "styl" => Family::Markup,
+
+        // Configuration and data. The files you edit to change behaviour
+        // without writing any.
+        "json" | "jsonc" | "json5" | "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "env"
+        | "properties" | "lock" | "sum" | "sql" | "db" | "sqlite" => Family::Config,
+
+        // Anything that runs as a command.
+        "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" => Family::Shell,
+
+        // Prose.
+        "md" | "mdx" | "rst" | "adoc" | "txt" | "pdf" | "doc" | "docx" => Family::Document,
+
+        // Things that are not text at all.
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "ico" | "bmp" | "mp3" | "wav"
+        | "flac" | "ogg" | "mp4" | "mov" | "webm" | "mkv" | "zip" | "tar" | "gz" | "bz2"
+        | "xz" | "7z" | "rar" => Family::Asset,
+
+        _ => {
+            // Extensionless files that everyone recognises anyway: Dockerfile
+            // and Makefile carry as much meaning as any suffix does.
+            let stem = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            match stem.as_str() {
+                "dockerfile" | "containerfile" => Family::Config,
+                "makefile" | "justfile" | "rakefile" => Family::Shell,
+                "license" | "licence" | "copying" => Family::Document,
+                _ => return None,
+            }
+        }
+    };
+
+    // Dark themes need the icons a little brighter than their text and light
+    // themes a little darker, or the colour reads as a smudge either way. The
+    // saturation stays well under half in both: these sit beside text, and a
+    // saturated dot beside a word pulls the eye off the word.
+    let (saturation, lightness) = if GlobalTheme::theme(cx).appearance().is_light() {
+        (0.42, 0.44)
+    } else {
+        (0.40, 0.66)
+    };
+
+    Some(hsla(family.hue(), saturation, lightness, 1.0))
+}
+
+/// The families a file icon can belong to.
+#[derive(Clone, Copy)]
+enum Family {
+    Code,
+    Markup,
+    Config,
+    Shell,
+    Document,
+    Asset,
+}
+
+impl Family {
+    /// Hues chosen to be distinguishable from each other at a glance, and to
+    /// survive the common forms of colour blindness: no red/green pair carries
+    /// a distinction on its own, and the two warm families differ in lightness
+    /// as well as hue.
+    fn hue(self) -> f32 {
+        match self {
+            Family::Code => 0.575,     // blue
+            Family::Markup => 0.078,   // terracotta
+            Family::Config => 0.125,   // ochre
+            Family::Shell => 0.385,    // green
+            Family::Document => 0.60,  // slate blue
+            Family::Asset => 0.79,     // violet
+        }
     }
 }

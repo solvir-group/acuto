@@ -652,13 +652,13 @@ struct SerializedOutlinePanel {
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
+        // Opens as a centre-pane tab: this panel is registered with the
+        // workspace but not docked, so there is no dock focus to toggle.
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<OutlinePanel>(window, cx);
+            workspace.open_panel_as_tab::<OutlinePanel>(window, cx);
         });
         workspace.register_action(|workspace, _: &Toggle, window, cx| {
-            if !workspace.toggle_panel_focus::<OutlinePanel>(window, cx) {
-                workspace.close_panel::<OutlinePanel>(window, cx);
-            }
+            workspace.open_panel_as_tab::<OutlinePanel>(window, cx);
         });
     })
     .detach();

@@ -1560,6 +1560,10 @@ impl ConversationView {
         self.thread_id
     }
 
+    pub(crate) fn agent_server(&self) -> Rc<dyn AgentServer> {
+        self.agent.clone()
+    }
+
     pub fn is_loading(&self) -> bool {
         matches!(self.server_state, ServerState::Loading { .. })
     }
@@ -2091,6 +2095,67 @@ impl ConversationView {
         .detach();
     }
 
+    /// The first sign-in URL in a login command's output, if it has printed one.
+    ///
+    /// Deliberately narrow. Terminal output is full of URLs -- documentation links,
+    /// issue trackers, the "report a bug" line in a crash message -- and opening a
+    /// browser at the wrong one is worse than opening nothing, because the user
+    /// then has a page in front of them that will never complete the login they
+    /// asked for. So a URL has to look like an authorization endpoint: either it is
+    /// on a host these agents actually authenticate against, or its path says what
+    /// it is.
+    fn find_sign_in_url(content: &str) -> Option<String> {
+        const AUTH_HOSTS: [&str; 8] = [
+            "claude.ai",
+            "anthropic.com",
+            "openai.com",
+            "chatgpt.com",
+            "github.com",
+            "githubcopilot.com",
+            "google.com",
+            "googleapis.com",
+        ];
+        const AUTH_PATHS: [&str; 6] = [
+            "/oauth",
+            "/authorize",
+            "/login/device",
+            "/device",
+            "/activate",
+            "/auth",
+        ];
+
+        content.split_whitespace().find_map(|word| {
+            let start = word.find("https://")?;
+            // Trailing punctuation is common: a URL at the end of a sentence, or
+            // wrapped in the box-drawing characters these CLIs like to print.
+            let url = word[start..].trim_end_matches(|c: char| {
+                matches!(
+                    c,
+                    '.' | ',' | ')' | ']' | '}' | '"' | '\'' | '>' | '|' | '│'
+                )
+            });
+            if url.len() <= "https://".len() {
+                return None;
+            }
+
+            let rest = &url["https://".len()..];
+            let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            let path = &rest[host.len()..];
+            let lowered = path.to_ascii_lowercase();
+
+            let host_is_known = AUTH_HOSTS
+                .iter()
+                .any(|known| host == *known || host.ends_with(&format!(".{known}")));
+            let path_says_auth = AUTH_PATHS.iter().any(|marker| lowered.contains(marker));
+
+            // Both, never either alone. Any path on a known host opened docs
+            // and issue links as though they were sign-in pages, and a sign-in
+            // path on an unknown host is exactly what a phishing link looks
+            // like -- and this opens the browser without asking.
+            (host_is_known && path_says_auth).then(|| url.to_string())
+        })
+    }
+
     fn spawn_external_agent_login(
         login: task::SpawnInTerminal,
         workspace: Entity<Workspace>,
@@ -2136,6 +2201,33 @@ impl ConversationView {
                     terminal_panel.spawn_task(&task, window, cx)
                 })?
                 .await?;
+
+            // Runs alongside whichever completion check follows, and stops on
+            // its own once it has opened something. Detached rather than
+            // awaited: sign-in is not finished when the browser opens, it has
+            // barely started.
+            cx.spawn({
+                let terminal = terminal.clone();
+                async move |cx| {
+                    // Two minutes is long enough for a slow CLI to print its
+                    // link and short enough that a login the user abandoned
+                    // does not leave a task polling for the rest of the
+                    // session.
+                    for _ in 0..120 {
+                        cx.background_executor().timer(Duration::from_secs(1)).await;
+                        let Ok(content) =
+                            terminal.update(cx, |terminal, _cx| terminal.get_content())
+                        else {
+                            return;
+                        };
+                        if let Some(url) = Self::find_sign_in_url(&content) {
+                            cx.update(|_window, cx| cx.open_url(&url)).ok();
+                            return;
+                        }
+                    }
+                }
+            })
+            .detach();
 
             let success_patterns = match method.0.as_ref() {
                 "claude-login" | GEMINI_TERMINAL_AUTH_METHOD_ID => vec![
@@ -2238,42 +2330,93 @@ impl ConversationView {
         window: &mut Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        use crate::conversation_view::claude_brand::{AgentBrand, agent_greeting};
+
         let auth_methods = connection.auth_methods();
+        let agent_id = self.agent.agent_id();
 
         let agent_display_name = self
             .agent_server_store
             .read(cx)
-            .agent_display_name(&self.agent.agent_id())
-            .unwrap_or_else(|| self.agent.agent_id().0);
+            .agent_display_name(&agent_id)
+            .unwrap_or_else(|| agent_id.0.clone());
+        let brand = AgentBrand::for_agent_in(agent_id.0.as_ref(), cx);
+        // The first method is the agent's own recommendation, so it is the one
+        // drawn as the button to press: solid ink on a light theme, the way the
+        // send button is.
+        let primary_style = if cx.theme().appearance().is_light() {
+            ButtonStyle::FilledCustom {
+                background: cx.theme().colors().text,
+                foreground: cx.theme().colors().editor_background.opacity(1.),
+            }
+        } else {
+            ButtonStyle::Tinted(TintColor::Accent)
+        };
 
-        let show_fallback_description =
-            auth_methods.len() > 1 && description.is_none() && pending_auth_method.is_none();
+        let heading = if pending_auth_method.is_some() {
+            format!("Signing in to {agent_display_name}…")
+        } else {
+            format!("Sign in to {agent_display_name}")
+        };
 
-        let auth_buttons = || {
-            h_flex().justify_end().flex_wrap().gap_1().children(
-                connection
-                    .auth_methods()
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .map(|(ix, method)| {
-                        let (method_id, name) = (method.id().0.clone(), method.name().to_string());
-                        let agent_telemetry_id = connection.telemetry_id();
+        let body = if pending_auth_method.is_some() {
+            h_flex()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::ArrowCircle)
+                        .size(IconSize::Small)
+                        .color(Color::Muted)
+                        .with_rotate_animation(2),
+                )
+                .child(
+                    Label::new(
+                        "Finish signing in in your browser or terminal, then come back here.",
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .into_any_element()
+        } else {
+            v_flex()
+                .w_full()
+                .gap_3()
+                .map(|this| match description {
+                    Some(description) => this.child(div().text_ui(cx).child(self.render_markdown(
+                        description.clone(),
+                        MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                        cx,
+                    ))),
+                    None => this.child(
+                        Label::new(if auth_methods.len() > 1 {
+                            "Choose how you want to sign in."
+                        } else {
+                            "You need to sign in before you can start a thread."
+                        })
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ),
+                })
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1p5()
+                        .children(auth_methods.iter().enumerate().map(|(ix, method)| {
+                            let (method_id, name) =
+                                (method.id().0.clone(), method.name().to_string());
+                            let agent_telemetry_id = connection.telemetry_id();
 
-                        Button::new(method_id.clone(), name)
-                            .label_size(LabelSize::Small)
-                            .map(|this| {
-                                if ix == 0 {
-                                    this.style(ButtonStyle::Tinted(TintColor::Accent))
+                            Button::new(method_id.clone(), name)
+                                .full_width()
+                                .size(ButtonSize::Large)
+                                .style(if ix == 0 {
+                                    primary_style
                                 } else {
-                                    this.style(ButtonStyle::Outlined)
-                                }
-                            })
-                            .when_some(method.description(), |this, description| {
-                                this.tooltip(Tooltip::text(description.to_string()))
-                            })
-                            .on_click({
-                                cx.listener(move |this, _, window, cx| {
+                                    ButtonStyle::Outlined
+                                })
+                                .when_some(method.description(), |this, description| {
+                                    this.tooltip(Tooltip::text(description.to_string()))
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     telemetry::event!(
                                         "Authenticate Agent Started",
                                         agent = agent_telemetry_id,
@@ -2285,56 +2428,21 @@ impl ConversationView {
                                         window,
                                         cx,
                                     )
-                                })
-                            })
-                    }),
-            )
+                                }))
+                        })),
+                )
+                .into_any_element()
         };
 
-        if pending_auth_method.is_some() {
-            return Callout::new()
-                .icon(IconName::Info)
-                .title(format!("Authenticating to {}…", agent_display_name))
-                .actions_slot(
-                    Icon::new(IconName::ArrowCircle)
-                        .size(IconSize::Small)
-                        .color(Color::Muted)
-                        .with_rotate_animation(2)
-                        .into_any_element(),
-                )
-                .into_any_element();
-        }
-
-        Callout::new()
-            .icon(IconName::Info)
-            .title(format!("Authenticate to {}", agent_display_name))
-            .when(auth_methods.len() == 1, |this| {
-                this.actions_slot(auth_buttons())
-            })
-            .description_slot(
-                v_flex()
-                    .text_ui(cx)
-                    .map(|this| {
-                        if show_fallback_description {
-                            this.child(
-                                Label::new("Choose one of the following authentication options:")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                        } else {
-                            this.children(description.map(|desc| {
-                                self.render_markdown(
-                                    desc.clone(),
-                                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-                                    cx,
-                                )
-                            }))
-                        }
-                    })
-                    .when(auth_methods.len() > 1, |this| {
-                        this.gap_1().child(auth_buttons())
-                    }),
-            )
+        v_flex()
+            .w_full()
+            .max_w(px(360.))
+            .px_4()
+            .gap_4()
+            .items_center()
+            .children(brand.map(|brand| agent_greeting(brand, cx)))
+            .child(Headline::new(heading).size(HeadlineSize::Small))
+            .child(body)
             .into_any_element()
     }
 
@@ -3417,7 +3525,8 @@ impl Render for ConversationView {
             }) => v_flex()
                 .flex_1()
                 .size_full()
-                .justify_end()
+                .items_center()
+                .justify_center()
                 .child(self.render_auth_required_state(
                     connection,
                     description.as_ref(),
@@ -3689,6 +3798,73 @@ pub(crate) mod tests {
     use workspace::{Item, MultiWorkspace};
 
     use crate::agent_panel;
+
+    #[test]
+    fn finds_the_authorization_url_a_login_cli_prints() {
+        let output = "\
+Sign in to Claude Code
+Opening browser to https://claude.ai/oauth/authorize?code=abc123
+Paste the code back here:";
+
+        assert_eq!(
+            ConversationView::find_sign_in_url(output).as_deref(),
+            Some("https://claude.ai/oauth/authorize?code=abc123")
+        );
+    }
+
+    #[test]
+    fn finds_a_device_code_url() {
+        let output = "! First copy your one-time code: ABCD-1234\n\
+                      Press Enter to open https://github.com/login/device in your browser...";
+
+        assert_eq!(
+            ConversationView::find_sign_in_url(output).as_deref(),
+            Some("https://github.com/login/device")
+        );
+    }
+
+    #[test]
+    fn strips_punctuation_the_cli_wrapped_the_url_in() {
+        let output = "Visit (https://auth.openai.com/authorize?x=1).";
+
+        assert_eq!(
+            ConversationView::find_sign_in_url(output).as_deref(),
+            Some("https://auth.openai.com/authorize?x=1")
+        );
+    }
+
+    #[test]
+    fn ignores_urls_that_are_not_sign_in_pages() {
+        // Bare vendor hosts with no path say nothing about authenticating, and
+        // an unrelated host is not ours to open no matter what its path says --
+        // except where the path itself names an authorization endpoint, which
+        // is how self-hosted and enterprise logins appear.
+        assert_eq!(
+            ConversationView::find_sign_in_url("see https://openai.com"),
+            None
+        );
+        assert_eq!(
+            ConversationView::find_sign_in_url("docs at https://example.com/guide"),
+            None
+        );
+        assert_eq!(
+            ConversationView::find_sign_in_url("no url here at all"),
+            None
+        );
+    }
+
+    #[test]
+    fn takes_the_first_url_when_output_holds_several() {
+        // Login output usually ends with a support or docs link. The
+        // authorization URL is printed first, and it is the one that matters.
+        let output = "Go to https://claude.ai/oauth/authorize?a=1 \
+                      then read https://docs.anthropic.com/oauth for help";
+
+        assert_eq!(
+            ConversationView::find_sign_in_url(output).as_deref(),
+            Some("https://claude.ai/oauth/authorize?a=1")
+        );
+    }
     use crate::completion_provider::AgentContextSource;
     use crate::test_support::register_test_sidebar;
     use crate::thread_metadata_store::ThreadMetadataStore;

@@ -18,9 +18,7 @@ use serde::{Deserialize, Serialize};
 use settings::{DefaultOpenBehavior, Settings};
 use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
 use util::ResultExt;
-use zed_actions::{
-    Extensions, OpenKeymap, OpenOnboarding, OpenSettings, assistant::ToggleFocus, command_palette,
-};
+use zed_actions::{OpenOnboarding, OpenSettings, assistant::ToggleFocus};
 
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = welcome)]
@@ -160,20 +158,24 @@ impl SectionEntry {
     }
 }
 
-const CONTENT: (Section<4>, Section<3>) = (
+// Open Project first: it is what almost everyone came here to do, and it was
+// buried second in a list of four. Command palette, keymaps and extensions are
+// gone from this screen -- all three are for people who already know what they
+// want, and those people reach them faster from the palette than from here.
+const CONTENT: (Section<3>, Section<1>) = (
     Section {
         title: "Get Started",
         entries: [
             SectionEntry {
-                icon: IconName::Plus,
-                title: "New File",
-                action: &NewFile,
-                visibility_guard: SectionVisibility::Always,
-            },
-            SectionEntry {
                 icon: IconName::FolderOpen,
                 title: "Open Project",
                 action: &Open::DEFAULT,
+                visibility_guard: SectionVisibility::Always,
+            },
+            SectionEntry {
+                icon: IconName::Plus,
+                title: "New File",
+                action: &NewFile,
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
@@ -182,39 +184,16 @@ const CONTENT: (Section<4>, Section<3>) = (
                 action: &GitClone,
                 visibility_guard: SectionVisibility::Always,
             },
-            SectionEntry {
-                icon: IconName::ListCollapse,
-                title: "Open Command Palette",
-                action: &command_palette::Toggle,
-                visibility_guard: SectionVisibility::Always,
-            },
         ],
     },
     Section {
         title: "Configure",
-        entries: [
-            SectionEntry {
-                icon: IconName::Settings,
-                title: "Open Settings",
-                action: &OpenSettings,
-                visibility_guard: SectionVisibility::Always,
-            },
-            SectionEntry {
-                icon: IconName::Keyboard,
-                title: "Customize Keymaps",
-                action: &OpenKeymap,
-                visibility_guard: SectionVisibility::Always,
-            },
-            SectionEntry {
-                icon: IconName::Blocks,
-                title: "Explore Extensions",
-                action: &Extensions {
-                    category_filter: None,
-                    id: None,
-                },
-                visibility_guard: SectionVisibility::Always,
-            },
-        ],
+        entries: [SectionEntry {
+            icon: IconName::Settings,
+            title: "Open Settings",
+            action: &OpenSettings,
+            visibility_guard: SectionVisibility::Always,
+        }],
     },
 );
 
@@ -330,7 +309,8 @@ impl WelcomePage {
         let focus = self.focus_handle.clone();
         let color = cx.theme().colors();
 
-        let description = "Run multiple threads at once, mix and match any ACP-compatible agent, and keep work conflict-free with worktrees.";
+        let description =
+            "Claude Code, Codex, Copilot or Gemini, on the subscriptions you already have.";
 
         v_flex()
             .w_full()
@@ -351,7 +331,7 @@ impl WelcomePage {
                             .color(Color::Muted)
                             .size(IconSize::Small),
                     )
-                    .child(Label::new("Collaborate with Agents")),
+                    .child(Label::new("Choose Your Agent")),
             )
             .child(
                 Label::new(description)
@@ -360,7 +340,7 @@ impl WelcomePage {
                     .mb_2(),
             )
             .child(
-                Button::new("open-agent", "Open Agent Panel")
+                Button::new("open-agent", "Pick an Agent")
                     .full_width()
                     .tab_index(tab_index as isize)
                     .style(ButtonStyle::Outlined)
@@ -480,10 +460,9 @@ impl Render for WelcomePage {
                             .child(Vector::square(VectorName::ZedLogo, rems_from_px(45_f32)))
                             .child(
                                 v_flex().child(Headline::new(welcome_label)).child(
-                                    Label::new("The editor for what's next")
+                                    Label::new("Agent diffs you can actually read")
                                         .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .italic(),
+                                        .color(Color::Muted),
                                 ),
                             ),
                     )

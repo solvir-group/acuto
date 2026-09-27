@@ -11,6 +11,7 @@ mod completion_provider;
 mod config_options;
 mod context;
 mod context_server_configuration;
+pub mod crew_panel;
 pub(crate) mod conversation_view;
 mod diagnostics;
 pub mod draft_prompt_store;
@@ -407,6 +408,21 @@ pub struct NewExternalAgentThreadInPane {
     pub agent: AgentId,
 }
 
+/// Starts a thread with a named agent and sends it a prompt straight away.
+///
+/// How the team chat hands work to an agent: `@codex fix the login redirect`
+/// on a ticket becomes a Codex thread that already has the ticket and the
+/// request in it. The agent is a registry id; the prompt is sent as written.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct AskAgent {
+    /// Registry id of the agent, such as `claude-acp` or `codex-acp`.
+    pub agent: String,
+    /// The first message of the new thread.
+    pub prompt: String,
+}
+
 /// Creates a new external agent conversation thread.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = agent)]
@@ -614,6 +630,7 @@ pub fn init(
     agent::ThreadStore::init_global(cx);
     prompt_store::init(cx);
     terminal_fix::init(cx);
+    crew_panel::init(cx);
     conversation_view::claude_brand::RemoteControlStatus::init(cx);
 
     cx.set_global(agent_skills::SkillsUpdatedHook(std::rc::Rc::new(|cx| {
@@ -1003,6 +1020,9 @@ mod tests {
             enabled: true,
             button: true,
             default_agent: Default::default(),
+            review_changes: false,
+            panel_agent: None,
+            tab_agent: None,
             restore_threads_sidebar: false,
             terminal_mode: Default::default(),
             dock: DockPosition::Right,

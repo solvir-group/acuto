@@ -211,17 +211,21 @@ fn main() {
     //
     // SAFETY: single-threaded, before any other thread is spawned.
     unsafe {
-        const NVIDIA_KEY: &str =
-            "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";
-        if std::env::var_os("NVIDIA_API_KEY").is_none() {
-            std::env::set_var("NVIDIA_API_KEY", NVIDIA_KEY);
-        }
+        // The key is never compiled in. A literal here ships inside every
+        // binary and is readable with `strings`, and it lands in the git
+        // history the moment it is committed, so it has to be treated as public
+        // from then on. Supply it in the environment, or through the provider
+        // UI, which stores it in the system credential store.
+        //
         // Edit predictions read their key from their own variable rather than
-        // the provider registry, so the same credential has to be published
-        // twice for inline completions to authenticate against the same
-        // endpoint the agent uses.
-        if std::env::var_os("ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY").is_none() {
-            std::env::set_var("ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY", NVIDIA_KEY);
+        // the provider registry, so one credential has to be published twice
+        // for inline completions to authenticate against the endpoint the agent
+        // already uses. Mirrored only in that direction, and only when the
+        // edit-prediction variable is not already set.
+        if let Some(key) = std::env::var_os("NVIDIA_API_KEY")
+            && std::env::var_os("ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY").is_none()
+        {
+            std::env::set_var("ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY", key);
         }
 
         // Semantic codebase search. These live in the environment rather than
@@ -243,8 +247,10 @@ fn main() {
         if std::env::var_os("ACUTO_EMBEDDING_MODEL").is_none() {
             std::env::set_var("ACUTO_EMBEDDING_MODEL", "nvidia/nv-embedqa-e5-v5");
         }
-        if std::env::var_os("ACUTO_EMBEDDING_API_KEY").is_none() {
-            std::env::set_var("ACUTO_EMBEDDING_API_KEY", NVIDIA_KEY);
+        if let Some(key) = std::env::var_os("NVIDIA_API_KEY")
+            && std::env::var_os("ACUTO_EMBEDDING_API_KEY").is_none()
+        {
+            std::env::set_var("ACUTO_EMBEDDING_API_KEY", key);
         }
     }
 
@@ -381,7 +387,7 @@ fn main() {
         .unwrap();
 
     log::info!(
-        "========== starting zed version {}, sha {} ==========",
+        "========== starting Acuto version {}, sha {} ==========",
         app_version,
         app_commit_sha
             .as_ref()
@@ -773,6 +779,9 @@ fn main() {
             app_state.fs.clone(),
             app_state.client.http_client(),
         );
+        // Before the agents, so the endpoint exists by the time the first
+        // external agent session is opened and asks what MCP servers it has.
+        ide_control_mcp::init(cx);
         agent_ui::init(
             app_state.fs.clone(),
             prompt_builder,

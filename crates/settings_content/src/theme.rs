@@ -241,6 +241,11 @@ pub struct ThemeSettingsContent {
     #[schemars(range(min = 0.0, max = 0.9))]
     pub unnecessary_code_fade: Option<CodeFade>,
 
+    /// Which syntax palette to colour code with.
+    ///
+    /// Default: acuto
+    pub token_theme: Option<TokenTheme>,
+
     /// EXPERIMENTAL: Overrides for the current theme.
     ///
     /// These values will override the ones on the current theme specified in `theme`.
@@ -252,6 +257,37 @@ pub struct ThemeSettingsContent {
     /// These values will override the ones on the specified theme
     #[serde(default)]
     pub theme_overrides: HashMap<String, ThemeStyleContent>,
+}
+
+/// Which syntax palette colours code.
+///
+/// Separate from the theme because the two answer different questions: a theme
+/// decides what the window looks like, and this decides what code looks like
+/// inside it. Someone arriving from another editor wants their keywords the
+/// colour they have always been, on whatever background they like.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenTheme {
+    /// Acuto's own palette: violet keywords and tags, gold types, no orange.
+    #[default]
+    Acuto,
+    /// Visual Studio Code's Dark+ and Light+ values, reproduced exactly.
+    VsCode,
+    /// Whatever syntax colours the active theme ships with.
+    Theme,
 }
 
 /// A font size value in pixels, wrapping around `f32` for custom settings UI rendering.
@@ -1367,6 +1403,11 @@ pub enum WindowBackgroundContent {
     Opaque,
     Transparent,
     Blurred,
+    /// The Windows 11 Acrylic material: whatever is behind the window, blurred
+    /// and showing through it.
+    ///
+    /// This is the one that reads as glass. Mica only samples the wallpaper.
+    Acrylic,
     /// The Windows 11 Mica material: the desktop wallpaper, blurred and tinted,
     /// showing through the window.
     ///

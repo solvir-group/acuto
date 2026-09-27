@@ -21,7 +21,7 @@ try {
     if ($env:ACUTO_SHELL_INTEGRATION_LOADED) { return }
     $env:ACUTO_SHELL_INTEGRATION_LOADED = '1'
 
-    if ($env:TERM_PROGRAM -ne 'Acuto') { return }
+    if ($env:ACUTO_TERM -ne 'true') { return }
 
     function global:__Acuto-Osc([string] $Payload) {
         # [char]27 and [char]7 rather than escape sequences: `e is PowerShell

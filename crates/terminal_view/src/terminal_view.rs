@@ -1575,8 +1575,14 @@ impl TerminalView {
 
         // Lines above the viewport are scrolled out; drawing there would paint
         // the suggestion over unrelated scrollback.
-        let row = cursor.line - content.display_offset as i32;
-        if row < 0 || row as usize >= content.screen_lines {
+        //
+        // Through the shared helper rather than by hand: a cursor point is
+        // relative to the scroll position, so the offset has to be *added* to
+        // reach a viewport row. Subtracting it lands on the right line only
+        // while the terminal has no history -- which is exactly why this looked
+        // correct until a session had scrolled.
+        let row = viewport_line_for_point(cursor, content.display_offset)?;
+        if row >= content.screen_lines {
             return None;
         }
 
@@ -1599,6 +1605,15 @@ impl TerminalView {
                     div()
                         .font_family(font_family)
                         .text_size(font_size)
+                        // The grid's own line height, not the default one.
+                        // Text laid out at a taller line height sits its
+                        // baseline further down the box, and against the shell
+                        // text one row up that shows as a few pixels of drop --
+                        // small, but the ghost is supposed to look like the
+                        // continuation of the line it follows, so any drop at
+                        // all reads as broken.
+                        .line_height(bounds.line_height())
+                        .h(bounds.line_height())
                         // Reduced alpha rather than a theme colour: the ghost
                         // has to read as "not yet typed" against whatever
                         // colours the shell is already painting.

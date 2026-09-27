@@ -16,13 +16,15 @@ const FIM_CONTEXT_TOKENS: usize = 512;
 
 /// How much of the file a chat model is shown before the caret.
 ///
-/// Enough to see the enclosing function and how the file is written; not so
-/// much that the request reads as "continue this file".
-const PREFIX_LINES: usize = 60;
+/// Enough to see the whole enclosing function, the file's imports and how it
+/// is written. Accuracy comes from this: a model that can see the names in use
+/// suggests them instead of inventing new ones. Input tokens are cheap and
+/// fast next to output, so this costs little latency.
+const PREFIX_LINES: usize = 150;
 
 /// And after it. Smaller, because what comes next mostly serves to stop the
-/// model from re-writing it.
-const SUFFIX_LINES: usize = 20;
+/// model from re-writing it -- but enough to see the rest of the block.
+const SUFFIX_LINES: usize = 40;
 
 struct FimRequestOutput {
     request_id: String,
@@ -89,6 +91,23 @@ pub fn request_prediction(
     };
 
     let api_key = load_open_ai_compatible_api_key_if_needed(provider, cx);
+    // Each step of a prediction is logged at info, because a prediction that
+    // does not appear is otherwise indistinguishable from one never asked for:
+    // no request, a failed request and a discarded answer all look the same in
+    // the editor, and every one of them was debug-only.
+    // Host only: a custom endpoint's URL can carry a signed query string or
+    // credentials, and this line goes to a log file people paste into issues.
+    let endpoint_host = endpoint_host(&settings.api_url);
+    log::info!(
+        "fim: requesting {} from {} (api key {})",
+        settings.model,
+        endpoint_host,
+        if api_key.is_some() {
+            "present"
+        } else {
+            "MISSING"
+        }
+    );
 
     let result = cx.background_spawn(async move {
         let cursor_offset = cursor_point.to_offset(&snapshot);
@@ -167,7 +186,13 @@ pub fn request_prediction(
             api_key,
             &http_client,
         )
-        .await?;
+        .await
+        .inspect_err(|error| log::warn!("fim: request failed: {error:#}"))?;
+        log::info!(
+            "fim: {} chars back in {:.2}s",
+            response_text.len(),
+            (Instant::now() - request_start).as_secs_f64()
+        );
 
         let response_received_at = Instant::now();
 
@@ -194,7 +219,7 @@ pub fn request_prediction(
                 let cursor_offset = cursor_point.to_offset(&snapshot);
                 let text = snapshot.text();
                 if worsens_syntax(language, &text, cursor_offset, &completion) {
-                    log::debug!("fim: dropped a completion that added syntax errors");
+                    log::info!("fim: dropped a completion that added syntax errors");
                     String::new()
                 } else {
                     completion
@@ -249,6 +274,18 @@ pub fn request_prediction(
 }
 
 /// The last `count` lines of `text`, keeping the trailing partial line.
+/// The host of an endpoint URL, without scheme, credentials, path or query.
+fn endpoint_host(api_url: &str) -> &str {
+    let after_scheme = api_url.split_once("://").map_or(api_url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
+}
+
 fn last_lines(text: &str, count: usize) -> &str {
     let mut start = text.len();
     let mut seen = 0;

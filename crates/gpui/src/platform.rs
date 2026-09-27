@@ -2116,6 +2116,11 @@ pub enum WindowBackgroundAppearance {
     ///
     /// Not always supported.
     Blurred,
+    /// The Acrylic backdrop material, supported on Windows 11.
+    ///
+    /// Blurs whatever is actually behind the window, unlike Mica which only
+    /// samples the desktop wallpaper.
+    AcrylicBackdrop,
     /// The Mica backdrop material, supported on Windows 11.
     MicaBackdrop,
     /// The Mica Alt backdrop material, supported on Windows 11.

@@ -9,9 +9,9 @@ use db::kvp::KeyValueStore;
 
 use gpui::{
     Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
-    px,
+    Focusable, Hsla, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent,
+    ParentElement, Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window,
+    deferred, div, px,
 };
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
@@ -949,13 +949,38 @@ impl Dock {
         cx: &mut Context<Self>,
     ) {
         if Some(panel_ix) != self.active_panel_index {
+            // The size the dock is at right now, before the switch. Each panel
+            // remembers its own, so moving between Terminal, Debugger and
+            // Problems used to resize the dock under the pointer -- three
+            // panels sharing one edge of the window, each snapping it to a
+            // different height. The dock is one surface; whatever height you
+            // last dragged it to is the height you meant for it.
+            // The width actually on screen, not only a dragged one. A panel
+            // nobody has resized carries no size of its own, so reading only
+            // `size_state.size` found nothing and the incoming panel fell back
+            // to its default -- the tree and git have different defaults, so
+            // switching between them moved the dock edge every time.
+            let outgoing_size = self.active_panel_entry().map(|entry| {
+                entry
+                    .size_state
+                    .size
+                    .unwrap_or_else(|| entry.panel.default_size(window, cx))
+            });
+
             if let Some(active_panel) = self.active_panel_entry() {
                 active_panel.panel.set_active(false, window, cx);
             }
 
             self.active_panel_index = Some(panel_ix);
+            if let Some(active_panel) = self.active_panel_entry_mut() {
+                if let Some(size) = outgoing_size {
+                    active_panel.size_state.size = Some(size);
+                }
+            }
             if let Some(active_panel) = self.active_panel_entry() {
-                active_panel.panel.set_active(true, window, cx);
+                let panel = active_panel.panel.clone();
+                panel.set_active(true, window, cx);
+                panel.size_state_changed(window, cx);
             }
 
             cx.notify();
@@ -1267,6 +1292,20 @@ impl Dock {
     }
 }
 
+/// On a see-through theme only the left dock is part of the glass frame; the
+/// right and bottom docks hold content (the agent, the terminal), so they get
+/// the editor's solid card behind them. Panels paint their own
+/// `panel_background` on top, which a glass theme keeps nearly clear, so they
+/// read as white there.
+fn dock_background(position: DockPosition, cx: &App) -> Hsla {
+    let colors = cx.theme().colors();
+    if position == DockPosition::Left || colors.panel_background.a >= 1.0 {
+        colors.panel_background
+    } else {
+        colors.editor_background
+    }
+}
+
 impl Render for Dock {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context();
@@ -1278,7 +1317,12 @@ impl Render for Dock {
         // Driven by the panels actually docked here, so it needs no list of its own
         // and stays correct when panels are moved between docks. Only rendered when
         // there is more than one panel, since a strip with a single tab is noise.
-        let panel_tabs = (self.position == DockPosition::Bottom
+        // Rendered whenever the bottom dock has anything in it, not only when
+        // it has several panels. A single-panel strip does carry something: the
+        // close button at its end, which is otherwise unreachable.
+        // Only when there is a choice to make. A strip with one tab is a label
+        // for a surface whose identity is already obvious, which is noise.
+        let panel_tabs = (matches!(self.position, DockPosition::Bottom | DockPosition::Right)
             && self.panel_entries.len() > 1)
             .then(|| {
                 let active_index = self.active_panel_index;
@@ -1314,6 +1358,71 @@ impl Render for Dock {
                             }))
                     }))
             });
+        // The tree, git and search, in the empty strip above the folder.
+        //
+        // Git and search are not panels docked here -- git opens as a tab and
+        // search is a centre-pane item -- so these dispatch by action name the
+        // way `launchpad` does, rather than walking `panel_entries`. `workspace`
+        // does not depend on the crates that own these actions, and taking
+        // those dependencies for three buttons would pull large subtrees into
+        // its rebuild graph. A renamed action degrades to a logged warning and
+        // an inert button, not a panic.
+        let left_rail = (self.position == DockPosition::Left && !self.panel_entries.is_empty())
+            .then(|| {
+                let button = |id: &'static str,
+                              icon: IconName,
+                              tooltip: &'static str,
+                              action_name: &'static str| {
+                    IconButton::new(id, icon)
+                        // Bigger than the status bar copies these replace: this rail
+                        // is the primary way into the tree, git and search, and it
+                        // has the width to be aimed at.
+                        .icon_size(IconSize::Custom(rems(1.25)))
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(tooltip))
+                        .on_click(
+                            move |_, window, cx| match cx.build_action(action_name, None) {
+                                Ok(action) => window.dispatch_action(action, cx),
+                                Err(error) => {
+                                    log::warn!("left rail: no action {action_name}: {error}")
+                                }
+                            },
+                        )
+                };
+
+                h_flex()
+                    .w_full()
+                    .flex_none()
+                    .justify_center()
+                    .gap_2()
+                    .px_1p5()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(button(
+                        "left-rail-tree",
+                        IconName::FileTree,
+                        "Project",
+                        "project_panel::ToggleFocus",
+                    ))
+                    // Commits, rather than opening the panel that contains a
+                    // commit button. Opening git to press one control is two steps
+                    // for the thing you do every few minutes; the panel is still a
+                    // keystroke away for everything else.
+                    .child(button(
+                        "left-rail-commit",
+                        IconName::GitBranch,
+                        "Commit",
+                        "git::Commit",
+                    ))
+                    .child(button(
+                        "left-rail-search",
+                        IconName::MagnifyingGlass,
+                        "Search",
+                        "search_panel::ToggleFocus",
+                    ))
+            });
+
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
             let create_resize_handle = || {
@@ -1381,33 +1490,28 @@ impl Render for Dock {
                 .track_focus(&self.focus_handle(cx))
                 .focus_follows_mouse(self.focus_follows_mouse, cx)
                 .flex()
-                .bg(cx.theme().colors().panel_background)
+                .bg(dock_background(position, cx))
                 .border_color(cx.theme().colors().border)
                 .overflow_hidden()
-                .map(|this| match self.position().axis() {
-                    // Width and height are always set on the workspace wrapper in
-                    // render_dock, so fill whatever space the wrapper provides.
-                    Axis::Horizontal => this.w_full().h_full().flex_row(),
-                    Axis::Vertical => this.h_full().w_full().flex_col(),
-                })
+                // Width and height are always set on the workspace wrapper in
+                // render_dock, so fill whatever space the wrapper provides.
+                .w_full()
+                .h_full()
+                .flex_col()
                 .map(|this| match self.position() {
                     DockPosition::Left => this.border_r_1(),
                     DockPosition::Right => this.border_l_1(),
                     DockPosition::Bottom => this.border_t_1(),
                 })
+                .children(left_rail)
                 .children(panel_tabs)
                 .child(
-                    div()
-                        .map(|this| match self.position().axis() {
-                            Axis::Horizontal => this.w_full().h_full(),
-                            Axis::Vertical => this.h_full().w_full().min_h_0().flex_1(),
-                        })
-                        .child(
-                            entry
-                                .panel
-                                .to_any()
-                                .cached(StyleRefinement::default().v_flex().size_full()),
-                        ),
+                    div().w_full().h_full().min_h_0().flex_1().child(
+                        entry
+                            .panel
+                            .to_any()
+                            .cached(StyleRefinement::default().v_flex().size_full()),
+                    ),
                 )
                 .when(self.resizable(cx), |this| {
                     this.child(create_resize_handle())

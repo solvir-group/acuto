@@ -12,7 +12,7 @@ use ui::{Button, ButtonLike, Color, Icon, IconName, Label, Tooltip, h_flex, prel
 use util::ResultExt;
 use workspace::{HideStatusItem, StatusItemView, ToolbarItemEvent, Workspace, item::ItemHandle};
 
-use crate::{Deploy, IncludeWarnings, ProjectDiagnosticsEditor};
+use crate::{Deploy, IncludeWarnings, problems_panel::ProblemsPanel};
 
 /// The status bar item that displays diagnostic counts.
 pub struct DiagnosticIndicator {
@@ -33,31 +33,40 @@ impl Render for DiagnosticIndicator {
             return indicator.hidden();
         }
 
-        let diagnostic_indicator = match (self.summary.error_count, self.summary.warning_count) {
-            (0, 0) => h_flex().child(
-                Icon::new(IconName::Check)
-                    .size(IconSize::Small)
-                    .color(Color::Default),
-            ),
-            (error_count, warning_count) => h_flex()
-                .gap_1()
-                .when(error_count > 0, |this| {
-                    this.child(
-                        Icon::new(IconName::XCircle)
-                            .size(IconSize::Small)
-                            .color(Color::Error),
-                    )
-                    .child(Label::new(error_count.to_string()).size(LabelSize::Small))
-                })
-                .when(warning_count > 0, |this| {
-                    this.child(
-                        Icon::new(IconName::Warning)
-                            .size(IconSize::Small)
-                            .color(Color::Warning),
-                    )
-                    .child(Label::new(warning_count.to_string()).size(LabelSize::Small))
-                }),
+        // Both counts, always, the way every other editor's status bar does it.
+        //
+        // Upstream collapses a clean project to a single tick and only grows
+        // the counters once something is wrong. That means the one place you
+        // would look to answer "does this compile?" changes shape depending on
+        // the answer, so a clean project and a project whose diagnostics have
+        // not arrived yet look nothing like each other -- and there is nowhere
+        // stable to glance at. A zero is an answer; a tick is a different
+        // widget.
+        let error_count = self.summary.error_count;
+        let warning_count = self.summary.warning_count;
+
+        let count = |icon: IconName, count: usize, color: Color| {
+            h_flex()
+                .gap_0p5()
+                .child(
+                    Icon::new(icon)
+                        .size(IconSize::Small)
+                        // Muted at zero: the row stays put, but nothing about
+                        // it asks for attention until there is something to
+                        // attend to.
+                        .color(if count == 0 { Color::Muted } else { color }),
+                )
+                .child(
+                    Label::new(count.to_string())
+                        .size(LabelSize::Small)
+                        .color(if count == 0 { Color::Muted } else { color }),
+                )
         };
+
+        let diagnostic_indicator = h_flex()
+            .gap_2()
+            .child(count(IconName::XCircle, error_count, Color::Error))
+            .child(count(IconName::Warning, warning_count, Color::Warning));
 
         let status = if let Some(diagnostic) = &self.current_diagnostic {
             let message = diagnostic
@@ -126,13 +135,12 @@ impl Render for DiagnosticIndicator {
                                     |show_warnings: &mut IncludeWarnings, _| show_warnings.0 = true,
                                 );
                             }
+                            // The dock panel, not a centre-pane tab: a problems
+                            // list belongs beside the terminal, and opening it
+                            // as an editor item costs you the file you were
+                            // reading in order to look at what is wrong with it.
                             workspace.update(cx, |workspace, cx| {
-                                ProjectDiagnosticsEditor::deploy(
-                                    workspace,
-                                    &Default::default(),
-                                    window,
-                                    cx,
-                                )
+                                workspace.toggle_panel_focus::<ProblemsPanel>(window, cx);
                             })
                         }
                     })),

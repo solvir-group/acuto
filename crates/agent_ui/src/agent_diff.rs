@@ -1,5 +1,5 @@
 use crate::{Keep, KeepAll, OpenAgentDiff, Reject, RejectAll};
-use acp_thread::{AcpThread, AcpThreadEvent};
+use acp_thread::{AcpThread, AcpThreadEvent, AgentThreadEntry};
 use action_log::{ActionLogTelemetry, LastRejectUndo};
 use agent_settings::AgentSettings;
 use anyhow::Result;
@@ -31,8 +31,8 @@ use std::{
 use ui::{CommonAnimationExt, Divider, IconButtonShape, KeyBinding, Tooltip, prelude::*};
 use util::{ResultExt, truncate_and_trailoff};
 use workspace::{
-    Item, ItemHandle, ItemNavHistory, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
-    Workspace,
+    Item, ItemHandle, ItemNavHistory, SplitDirection, ToolbarItemEvent, ToolbarItemLocation,
+    ToolbarItemView, Workspace,
     item::{ItemEvent, SaveOptions, TabContentParams, TabTooltipContent},
     searchable::SearchableItemHandle,
 };
@@ -363,20 +363,27 @@ fn keep_edits_in_ranges(
     update_editor_selection(editor, buffer_snapshot, &diff_hunks_in_ranges, window, cx);
 
     let multibuffer = editor.buffer().clone();
+
+    // Grouped per buffer and answered in one call, the way rejecting already
+    // is. Accepting hunk by hunk folded each one into the base as it went, so
+    // every hunk after the first measured against a base that had already
+    // moved and came back with nothing to accept.
+    let mut ranges_by_buffer: HashMap<Entity<language::Buffer>, Vec<_>> = HashMap::default();
     for hunk in &diff_hunks_in_ranges {
-        let buffer = multibuffer.read(cx).buffer(hunk.buffer_id);
-        if let Some(buffer) = buffer {
-            let action_log = thread.read(cx).action_log().clone();
-            let telemetry = ActionLogTelemetry::from(thread.read(cx));
-            action_log.update(cx, |action_log, cx| {
-                action_log.keep_edits_in_range(
-                    buffer,
-                    hunk.buffer_range.clone(),
-                    Some(telemetry),
-                    cx,
-                )
-            });
+        if let Some(buffer) = multibuffer.read(cx).buffer(hunk.buffer_id) {
+            ranges_by_buffer
+                .entry(buffer)
+                .or_default()
+                .push(hunk.buffer_range.clone());
         }
+    }
+
+    let action_log = thread.read(cx).action_log().clone();
+    let telemetry = ActionLogTelemetry::from(thread.read(cx));
+    for (buffer, ranges) in ranges_by_buffer {
+        action_log.update(cx, |action_log, cx| {
+            action_log.keep_edits_in_ranges(buffer, ranges, Some(telemetry.clone()), cx)
+        });
     }
 }
 
@@ -1576,9 +1583,12 @@ impl AgentDiff {
                 // make of what it wrote, rather than leaving the user to find
                 // out by reading every line of it.
                 let action_log = thread.read(cx).action_log().clone();
-                let report =
-                    crate::change_report::report(action_log, workspace.clone(), cx);
+                let report = crate::change_report::report(action_log, workspace.clone(), cx);
                 self.change_reports.insert(workspace.clone(), report);
+
+                if agent_settings::AgentSettings::get_global(cx).review_changes {
+                    open_review_panel(&thread, workspace, window, cx);
+                }
             }
             AcpThreadEvent::Error | AcpThreadEvent::LoadError(_) | AcpThreadEvent::Refusal => {
                 self.update_reviewing_editors(workspace, window, cx);
@@ -1973,15 +1983,277 @@ mod tests {
     use super::*;
     use crate::Keep;
     use acp_thread::AgentConnection as _;
+    use agent_client_protocol::schema::v1 as acp;
     use agent_settings::AgentSettings;
     use editor::EditorSettings;
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
-    use project::{FakeFs, Project};
+    use project::{FakeFs, Fs as _, Project};
     use serde_json::json;
     use settings::{DiffViewStyle, SettingsStore};
     use std::{path::Path, rc::Rc};
     use util::path;
     use workspace::{MultiWorkspace, PathList};
+
+    /// The end of an agent turn opens the review panel beside the code, with
+    /// the agent's change in it as hunks -- driven through the real trigger,
+    /// the thread's `Stopped` event, not by calling the opener directly.
+    ///
+    /// The edit is made the way Claude Code makes it: written to disk, then
+    /// reaching an already-open buffer as a reload. That is the path that used
+    /// to leave review with nothing to show.
+    #[gpui::test]
+    async fn test_turn_end_opens_review_panel(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            prompt_store::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+            workspace::register_project_item::<Editor>(cx);
+        });
+
+        // Read from the shipped defaults, not overridden: review has to be on
+        // out of the box or none of this happens for a new user.
+        cx.update(|cx| {
+            assert!(
+                AgentSettings::get_global(cx).review_changes,
+                "review_changes should default to on"
+            );
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({ "file.txt": "one\ntwo\nthree\n" }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let connection = Rc::new(acp_thread::StubAgentConnection::new());
+        let thread = cx
+            .update(|_, cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+        cx.update(|window, cx| {
+            AgentDiff::set_active_thread(&workspace.downgrade(), thread.clone(), window, cx)
+        });
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/test/file.txt"), cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        // The agent's write: claimed when announced, then landing on disk
+        // and reloading the open buffer.
+        cx.update(|_, cx| {
+            action_log.update(cx, |log, cx| {
+                log.agent_will_write(buffer.clone(), cx)
+            });
+        });
+        fs.insert_file(path!("/test/file.txt"), b"one\nTWO\nthree\n".to_vec())
+            .await;
+        let reload = buffer.update(cx, |buffer, cx| buffer.reload(cx));
+        cx.run_until_parked();
+        reload.await.ok();
+        cx.run_until_parked();
+
+        thread.update(cx, |_, cx| {
+            cx.emit(AcpThreadEvent::Stopped(acp::StopReason::EndTurn))
+        });
+        cx.run_until_parked();
+
+        let (panels, panes) = workspace.read_with(cx, |workspace, cx| {
+            (
+                workspace.items_of_type::<AgentDiffPane>(cx).collect::<Vec<_>>(),
+                workspace.panes().len(),
+            )
+        });
+        assert_eq!(panels.len(), 1, "the end of the turn should open the review panel");
+        assert_eq!(panes, 2, "the panel opens in a split beside the code, not over it");
+
+        let hunks = panels[0].read_with(cx, |panel, cx| {
+            panel.multibuffer.read(cx).snapshot(cx).diff_hunks().count()
+        });
+        assert_eq!(hunks, 1, "the panel should show the agent's change as a hunk to review");
+
+        // A second turn reuses the panel rather than stacking another.
+        thread.update(cx, |_, cx| {
+            cx.emit(AcpThreadEvent::Stopped(acp::StopReason::EndTurn))
+        });
+        cx.run_until_parked();
+        let (panels, panes) = workspace.read_with(cx, |workspace, cx| {
+            (
+                workspace.items_of_type::<AgentDiffPane>(cx).count(),
+                workspace.panes().len(),
+            )
+        });
+        assert_eq!(panels, 1, "a later turn should reuse the open panel");
+        assert_eq!(panes, 2, "and not split the window again");
+    }
+
+    /// Keep and Reject from the review panel, pressed the way the buttons press
+    /// them, in the side-by-side view that is the default.
+    ///
+    /// Keeping one hunk must leave the others waiting; rejecting one must put
+    /// back exactly what the agent replaced, in the buffer and on disk, and
+    /// leave everything else alone.
+    #[gpui::test]
+    async fn test_review_panel_keep_and_reject(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            prompt_store::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+            workspace::register_project_item::<Editor>(cx);
+        });
+
+        let before = "a\nb\nc\nd\ne\nf\ng\n";
+        let after = "A\nb\nc\nd\ne\nf\nG\n";
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({ ".git": {}, "file.txt": before }))
+            .await;
+        fs.set_head_for_repo(
+            path!("/test/.git").as_ref(),
+            &[("file.txt", before.into())],
+            "0000000",
+        );
+        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let connection = Rc::new(acp_thread::StubAgentConnection::new());
+        let thread = cx
+            .update(|_, cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+        cx.update(|window, cx| {
+            AgentDiff::set_active_thread(&workspace.downgrade(), thread.clone(), window, cx)
+        });
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/test/file.txt"), cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            action_log.update(cx, |log, cx| {
+                log.agent_will_write(buffer.clone(), cx)
+            });
+        });
+        fs.insert_file(path!("/test/file.txt"), after.as_bytes().to_vec())
+            .await;
+        let reload = buffer.update(cx, |buffer, cx| buffer.reload(cx));
+        cx.run_until_parked();
+        reload.await.ok();
+        cx.run_until_parked();
+
+        thread.update(cx, |_, cx| {
+            cx.emit(AcpThreadEvent::Stopped(acp::StopReason::EndTurn))
+        });
+        cx.run_until_parked();
+
+        let panel = workspace
+            .read_with(cx, |workspace, cx| workspace.items_of_type::<AgentDiffPane>(cx).next())
+            .expect("the review panel should be open");
+        let editor = panel.read_with(cx, |panel, cx| panel.editor.read(cx).rhs_editor().clone());
+
+        let unreviewed_rows = |cx: &mut VisualTestContext| {
+            action_log.read_with(cx, |log, cx| {
+                log.changed_buffers(cx)
+                    .flat_map(|(buffer, diff)| {
+                        let snapshot = buffer.read(cx).snapshot();
+                        diff.read(cx)
+                            .snapshot(cx)
+                            .hunks(&snapshot)
+                            .map(|hunk| hunk.range.start.row)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let hunk_starts = |cx: &mut VisualTestContext| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                editor
+                    .diff_hunks_in_ranges(&[editor::Anchor::Min..editor::Anchor::Max], &snapshot)
+                    .map(|hunk| hunk.multi_buffer_range.start)
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(unreviewed_rows(cx), vec![0, 6], "two hunks to review");
+        assert_eq!(hunk_starts(cx).len(), 2, "both hunks shown in the panel");
+
+        // Keep the first, the way its Keep button does.
+        let first = hunk_starts(cx)[0];
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            keep_edits_in_ranges(editor, &snapshot, &thread, vec![first..first], window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            unreviewed_rows(cx),
+            vec![6],
+            "keeping one hunk must leave the other waiting for review"
+        );
+        assert_eq!(hunk_starts(cx).len(), 1, "and still in the panel");
+        assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), after);
+
+        // Reject the one left, the way its Reject button does.
+        let remaining = hunk_starts(cx)[0];
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            reject_edits_in_ranges(
+                editor,
+                &snapshot,
+                &thread,
+                vec![remaining..remaining],
+                workspace.downgrade(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let expected = "A\nb\nc\nd\ne\nf\ng\n";
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            expected,
+            "rejecting must put back what the agent replaced"
+        );
+        assert_eq!(
+            fs.load(Path::new(path!("/test/file.txt"))).await.unwrap(),
+            expected,
+            "and write it to disk"
+        );
+        assert_eq!(unreviewed_rows(cx), Vec::<u32>::new(), "nothing left to review");
+    }
 
     #[gpui::test]
     async fn test_multibuffer_agent_diff(cx: &mut TestAppContext) {
@@ -2465,4 +2737,94 @@ mod tests {
         });
         cx.run_until_parked();
     }
+}
+
+/// Opens the review panel for the turn that just finished: every file the
+/// agent changed, as one diff, with keep and reject on each hunk.
+///
+/// In a split beside the code rather than over it, because reviewing is a
+/// back-and-forth between the change and what surrounds it. A second turn
+/// reuses the panel already open for this thread instead of stacking another.
+///
+/// Nothing here decides *what* changed. The panel reads the action log, which
+/// `AcpThread` fills as each edit arrives; this only puts it on screen.
+fn open_review_panel(
+    thread: &Entity<AcpThread>,
+    workspace: &WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let entries = thread.read(cx).entries();
+    let turn_start = entries
+        .iter()
+        .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+        .map_or(0, |ix| ix + 1);
+    let turn_diffs: usize = entries
+        .get(turn_start..)
+        .map_or(0, |entries| entries.iter().map(|entry| entry.diffs().count()).sum());
+    let action_log = thread.read(cx).action_log().read(cx);
+    let unreviewed = action_log.changed_buffers(cx).count();
+    let agent_edited = action_log.agent_edited_this_turn();
+
+    // This feature has silently done nothing several times, each time for a
+    // different reason a level further down. The log says which level.
+    log::info!(
+        "review panel: {turn_diffs} diff(s) this turn, {unreviewed} file(s) unreviewed, \
+         agent edited: {agent_edited}"
+    );
+    for (buffer, diff) in action_log.changed_buffers(cx) {
+        let snapshot = buffer.read(cx).snapshot();
+        let hunks = diff
+            .read(cx)
+            .snapshot(cx)
+            .hunks(&snapshot)
+            .map(|hunk| format!("{}-{}", hunk.range.start.row + 1, hunk.range.end.row))
+            .collect::<Vec<_>>();
+        log::info!(
+            "review panel: {} has {} hunk(s) over {} lines: {}",
+            buffer
+                .read(cx)
+                .file()
+                .map(|file| file.full_path(cx).to_string_lossy().into_owned())
+                .unwrap_or_else(|| "an unsaved buffer".into()),
+            hunks.len(),
+            snapshot.max_point().row + 1,
+            hunks.join(", ")
+        );
+    }
+
+    // Opened on either signal. The count of unreviewed files can briefly lag
+    // the agent's last edit while its buffer reloads, and a turn that edited
+    // something should never end without the panel over a race like that --
+    // the panel fills itself as the log catches up.
+    if turn_diffs == 0 && unreviewed == 0 && !agent_edited {
+        return;
+    }
+
+    let thread = thread.clone();
+    workspace
+        .update(cx, |workspace, cx| {
+            let existing = workspace
+                .items_of_type::<AgentDiffPane>(cx)
+                .find(|panel| panel.read(cx).thread == thread);
+            if let Some(existing) = existing {
+                workspace.activate_item(&existing, true, false, window, cx);
+                return;
+            }
+
+            let review_pane = workspace
+                .find_pane_in_direction(SplitDirection::Right, cx)
+                .unwrap_or_else(|| {
+                    workspace.split_pane(
+                        workspace.active_pane().clone(),
+                        SplitDirection::Right,
+                        window,
+                        cx,
+                    )
+                });
+            let weak_workspace = workspace.weak_handle();
+            let panel = cx.new(|cx| AgentDiffPane::new(thread, weak_workspace, window, cx));
+            workspace.add_item(review_pane, Box::new(panel), None, true, true, window, cx);
+        })
+        .log_err();
 }

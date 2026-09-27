@@ -7,7 +7,9 @@
 
 mod schema;
 mod settings;
+mod token_theme;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use ::settings::{IntoGpui, Settings, SettingsStore};
@@ -77,6 +79,7 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
     if load_user_themes {
         let registry = ThemeRegistry::global(cx);
         load_bundled_themes(&registry);
+        load_bundled_icon_themes(&registry);
     }
 
     let theme = configured_theme(cx);
@@ -212,6 +215,40 @@ pub fn reload_icon_theme(cx: &mut App) {
     let icon_theme = configured_icon_theme(cx);
     GlobalTheme::update_icon_theme(cx, icon_theme);
     cx.refresh_windows();
+}
+
+/// Loads the icon themes bundled with the editor into the registry.
+///
+/// The same shape as the colour themes above: a directory of JSON in the
+/// assets, each file describing one family. Until this existed an icon theme
+/// could only arrive through an extension, so a set shipped with the editor had
+/// nowhere to declare itself.
+///
+/// Icon paths inside these files are already written relative to the assets
+/// root, so they resolve against an empty prefix rather than an extension's
+/// working directory.
+pub fn load_bundled_icon_themes(registry: &ThemeRegistry) {
+    let Some(paths) = registry.assets().list("icon_themes/").log_err() else {
+        return;
+    };
+
+    for path in paths.into_iter().filter(|path| path.ends_with(".json")) {
+        let Some(contents) = registry.assets().load(&path).log_err().flatten() else {
+            continue;
+        };
+
+        let Some(family) = serde_json::from_slice(&contents)
+            .with_context(|| format!("failed to parse icon theme at path \"{path}\""))
+            .log_err()
+        else {
+            continue;
+        };
+
+        registry
+            .load_icon_theme(family, Path::new(""))
+            .with_context(|| format!("failed to load icon theme at path \"{path}\""))
+            .log_err();
+    }
 }
 
 /// Loads the themes bundled with the Zed binary into the registry.

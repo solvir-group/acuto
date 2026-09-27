@@ -115,7 +115,7 @@ impl EditPredictionProvider {
             EditPredictionProvider::Mercury => Some("Mercury"),
             EditPredictionProvider::None => None,
             EditPredictionProvider::Ollama => Some("Ollama"),
-            EditPredictionProvider::OpenAiCompatibleApi => Some("OpenAI-Compatible API"),
+            EditPredictionProvider::OpenAiCompatibleApi => Some("Acuto AI"),
         }
     }
 }

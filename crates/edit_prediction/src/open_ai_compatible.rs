@@ -200,8 +200,10 @@ const COMPLETION_SYSTEM_PROMPT: &str = concat!(
      restating the task.\n",
     "2. Never repeat text that already appears immediately before or after the \
      caret. Your output is inserted between them verbatim.\n",
-    "3. Complete the current expression, statement or block and stop. Do not \
-     write the rest of the file.\n",
+    "3. Write what the user is clearly in the middle of writing: finish the \
+     current line, and when the intent is plain, the rest of the block or \
+     function body -- several lines is normal. Stop at the end of that block. \
+     Do not write the rest of the file.\n",
     "4. Use only identifiers that appear in the file or in the project excerpts \
      you were given. If you need something that does not exist, stop instead of \
      inventing a name.\n",
@@ -209,9 +211,16 @@ const COMPLETION_SYSTEM_PROMPT: &str = concat!(
      character, its quote style, and whether it uses semicolons.\n",
     "6. Continue the current line before starting a new one. If the caret sits \
      mid-line, your first character continues that line.\n",
-    "7. If you cannot complete confidently, reply with nothing at all. An empty \
-     reply is correct and costs the user nothing; a wrong one costs them a \
-     read and an undo.",
+    "7. Always offer your best completion, including the next line or lines \
+     after a finished statement when the code makes the next step clear. Reply \
+     with nothing only when no code could sensibly go at the caret.\n",
+    "8. Line breaks are part of the answer. When the caret is at the end of a \
+     line and your code belongs on the next line, start your reply with a \
+     newline. Put every statement on its own line, exactly as the file lays \
+     out its code, and give every line after the first its full indentation.\n",
+    "9. The result must be valid code once inserted: close every bracket, \
+     quote, string and tag you open, unless the text after the caret already \
+     closes it.",
 );
 
 /// A worked example, in the exact shape a real request arrives in.
@@ -236,19 +245,6 @@ const SHOWN_MID_LINE: &str = concat!(
 /// Note what is *not* here: no `sum += `, which is already before the caret,
 /// and no `}` or `return sum;`, which are already after it.
 const SHOWN_MID_LINE_REPLY: &str = "ce * item.quantity;";
-
-/// And the case where the honest answer is nothing.
-///
-/// A model with no example of declining will always find something to say. The
-/// caret here sits after a finished statement with no way to know what comes
-/// next, which is the situation that produces invented identifiers.
-const SHOWN_NOTHING_TO_SAY: &str = concat!(
-    "Language: JavaScript\n",
-    "File being edited: cart.js\n\n",
-    "const cart = loadCart();\n",
-    "<|caret|>",
-    "\n",
-);
 
 /// Asks a chat model to fill in at the caret.
 ///
@@ -323,8 +319,8 @@ async fn send_anthropic_messages_request(
         http_request_builder = http_request_builder.header("x-api-key", api_key.as_ref());
     }
 
-    let http_request = http_request_builder
-        .body(http_client::AsyncBody::from(serde_json::to_string(&body)?))?;
+    let http_request =
+        http_request_builder.body(http_client::AsyncBody::from(serde_json::to_string(&body)?))?;
 
     let mut response = http_client.send(http_request).await?;
     let status = response.status();
@@ -350,9 +346,7 @@ async fn send_anthropic_messages_request(
         .map(|blocks| {
             blocks
                 .iter()
-                .filter(|block| {
-                    block.get("type").and_then(|kind| kind.as_str()) == Some("text")
-                })
+                .filter(|block| block.get("type").and_then(|kind| kind.as_str()) == Some("text"))
                 .filter_map(|block| block.get("text").and_then(|text| text.as_str()))
                 .collect::<String>()
         })
@@ -365,6 +359,7 @@ async fn send_anthropic_messages_request(
         .to_string();
 
     let completion = clean_chat_completion(&text);
+    let completion = fit_to_caret_line(completion, caret.prefix, caret.suffix);
     let completion = trim_overlap_with_buffer(completion, caret.prefix, caret.suffix);
     let completion = stop_at_repeated_line(completion, caret.suffix);
     let completion = cap_lines(completion);
@@ -372,6 +367,37 @@ async fn send_anthropic_messages_request(
     log_exchange(&user_message, &text, &completion);
 
     Ok((completion, request_id))
+}
+
+/// Posts one chat-completion body and returns the status with the whole reply.
+async fn post_chat_completion(
+    settings: &OpenAiCompatibleEditPredictionSettings,
+    api_key: &Option<Arc<str>>,
+    body: &serde_json::Value,
+    http_client: &Arc<dyn http_client::HttpClient>,
+) -> Result<(http_client::StatusCode, String)> {
+    let mut http_request_builder = http_client::Request::builder()
+        .method(http_client::Method::POST)
+        .uri(settings.api_url.as_ref())
+        .header("Content-Type", "application/json");
+
+    if let Some(api_key) = api_key {
+        http_request_builder =
+            http_request_builder.header("Authorization", format!("Bearer {}", api_key));
+    }
+
+    let http_request =
+        http_request_builder.body(http_client::AsyncBody::from(serde_json::to_string(body)?))?;
+
+    let mut response = http_client.send(http_request).await?;
+    let status = response.status();
+
+    let mut response_body = String::new();
+    response
+        .body_mut()
+        .read_to_string(&mut response_body)
+        .await?;
+    Ok((status, response_body))
 }
 
 async fn send_chat_completion_request(
@@ -383,7 +409,7 @@ async fn send_chat_completion_request(
 ) -> Result<(String, String)> {
     let user_message = caret_user_message(&caret);
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": settings.model,
         "max_tokens": max_tokens,
         "temperature": 0.0,
@@ -392,37 +418,51 @@ async fn send_chat_completion_request(
         // a vendor extension that servers which do not recognise it ignore;
         // drop it if a server rejects unknown request fields outright.
         "chat_template_kwargs": { "enable_thinking": false },
+        // The switch that actually works. GLM on NVIDIA ignores the flag above
+        // and reasons anyway -- a few hundred characters before the answer --
+        // so a completion's token budget ran out mid-reasoning and every reply
+        // came back empty after four to eleven seconds. "low" skips the
+        // reasoning entirely: the same request answers in about a second.
+        "reasoning_effort": "low",
         "messages": [
             { "role": "system", "content": COMPLETION_SYSTEM_PROMPT },
             { "role": "user", "content": SHOWN_MID_LINE },
             { "role": "assistant", "content": SHOWN_MID_LINE_REPLY },
-            { "role": "user", "content": SHOWN_NOTHING_TO_SAY },
-            { "role": "assistant", "content": "" },
+            // No worked example of declining. It taught the model that a
+            // finished line is a place to say nothing -- which is exactly where
+            // someone wants the next line suggested -- and most predictions
+            // came back empty.
             { "role": "user", "content": user_message },
         ],
     });
 
-    let mut http_request_builder = http_client::Request::builder()
-        .method(http_client::Method::POST)
-        .uri(settings.api_url.as_ref())
-        .header("Content-Type", "application/json");
-
-    if let Some(api_key) = api_key {
-        http_request_builder =
-            http_request_builder.header("Authorization", format!("Bearer {}", api_key));
+    let rejects_reasoning_effort =
+        servers_rejecting_reasoning_effort(|servers| servers.contains(&*settings.api_url));
+    if rejects_reasoning_effort && let Some(fields) = body.as_object_mut() {
+        fields.remove("reasoning_effort");
     }
 
-    let http_request = http_request_builder
-        .body(http_client::AsyncBody::from(serde_json::to_string(&body)?))?;
+    let (mut status, mut response_body) =
+        post_chat_completion(settings, &api_key, &body, http_client).await?;
 
-    let mut response = http_client.send(http_request).await?;
-    let status = response.status();
-
-    let mut response_body = String::new();
-    response
-        .body_mut()
-        .read_to_string(&mut response_body)
-        .await?;
+    // Some servers reject the field outright rather than ignoring it -- OpenAI
+    // does for models that do not reason. Those get the request again without
+    // it, and are remembered, so the switch costs them one round trip once
+    // rather than on every keystroke.
+    if !rejects_reasoning_effort
+        && status == http_client::StatusCode::BAD_REQUEST
+        && response_body.contains("reasoning_effort")
+    {
+        log::info!("fim: server rejects reasoning_effort; retrying without it");
+        servers_rejecting_reasoning_effort(|servers| {
+            servers.insert(settings.api_url.to_string());
+        });
+        if let Some(fields) = body.as_object_mut() {
+            fields.remove("reasoning_effort");
+        }
+        (status, response_body) =
+            post_chat_completion(settings, &api_key, &body, http_client).await?;
+    }
 
     if !status.is_success() {
         anyhow::bail!(
@@ -450,6 +490,7 @@ async fn send_chat_completion_request(
         .to_string();
 
     let completion = clean_chat_completion(text);
+    let completion = fit_to_caret_line(completion, caret.prefix, caret.suffix);
     let completion = trim_overlap_with_buffer(completion, caret.prefix, caret.suffix);
     let completion = stop_at_repeated_line(completion, caret.suffix);
     let completion = cap_lines(completion);
@@ -457,6 +498,21 @@ async fn send_chat_completion_request(
     log_exchange(&user_message, text, &completion);
 
     Ok((completion, request_id))
+}
+
+/// Endpoints that answered a request carrying `reasoning_effort` with an error
+/// about it, for the rest of the session.
+fn servers_rejecting_reasoning_effort<R>(
+    f: impl FnOnce(&mut std::collections::HashSet<String>) -> R,
+) -> R {
+    static SERVERS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    // A poisoned lock only means another prediction panicked mid-insert; the
+    // set is still a set, so it is used as it stands.
+    let mut servers = SERVERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(servers.get_or_insert_with(Default::default))
 }
 
 /// Where the wire log goes, if anywhere.
@@ -528,12 +584,18 @@ fn stop_at_repeated_line(completion: String, suffix: &str) -> String {
     }
 
     let mut kept = String::new();
-    for (index, line) in completion.split_inclusive('\n').enumerate() {
+    let mut past_first_line = false;
+    for line in completion.split_inclusive('\n') {
         let trimmed = line.trim();
-        // The first line continues what the caret is on, so it is judged by the
-        // overlap trim rather than here.
-        if index > 0 && trimmed.len() >= MIN_MEANINGFUL && ahead.contains(&trimmed) {
+        // The first line of code continues what the caret is on, so it is
+        // judged by the overlap trim rather than here. Counted from the first
+        // line with something on it: a completion for the next line begins
+        // with a bare newline, and that is not the line being continued.
+        if past_first_line && trimmed.len() >= MIN_MEANINGFUL && ahead.contains(&trimmed) {
             break;
+        }
+        if !trimmed.is_empty() {
+            past_first_line = true;
         }
         kept.push_str(line);
     }
@@ -548,9 +610,12 @@ fn stop_at_repeated_line(completion: String, suffix: &str) -> String {
 /// suggestion, it is a worse interaction -- and a chat model handed a file will
 /// happily produce twenty.
 fn cap_lines(completion: String) -> String {
-    /// Two lines after the one the caret is on. Enough for a closing brace or
-    /// a return, not enough to write a function nobody asked for.
-    const MAX_LINES: usize = 3;
+    /// Enough for a whole block -- a function body, a loop with its contents,
+    /// a component's markup -- rather than finishing one line at a time. The
+    /// prompt already tells the model to stop at the end of the block, and
+    /// `stop_at_repeated_line` cuts it off if it starts re-typing what is
+    /// below the caret, so this is a ceiling, not the usual length.
+    const MAX_LINES: usize = 40;
 
     let mut kept = String::new();
     for (index, line) in completion.split_inclusive('\n').enumerate() {
@@ -631,6 +696,23 @@ fn window_start(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
+/// Drops leading line breaks unless the caret ends a line of code.
+///
+/// In the middle of a line the completion has to continue it: a newline first
+/// would split the line and push the rest of it down. On a blank line the
+/// caret is already where the code goes, and a newline would leave the blank
+/// line behind. Only after the last character of a line of code does a
+/// leading newline mean what it says -- this belongs on the next line.
+fn fit_to_caret_line(completion: String, prefix: &str, suffix: &str) -> String {
+    let before_caret = prefix.rsplit('\n').next().unwrap_or_default();
+    let after_caret = suffix.split('\n').next().unwrap_or_default();
+    let ends_a_line_of_code = !before_caret.trim().is_empty() && after_caret.trim().is_empty();
+    if ends_a_line_of_code {
+        return completion;
+    }
+    completion.trim_start_matches(['\n', '\r']).to_string()
+}
+
 /// Strips the shapes a chat model reaches for even when told not to.
 ///
 /// A model that ignores "no markdown" wraps the answer in a fence. Fenced
@@ -638,10 +720,12 @@ fn window_start(text: &str, max: usize) -> &str {
 /// detectable in general and is left alone, since guessing wrong would silently
 /// discard a real completion.
 fn clean_chat_completion(response: &str) -> String {
-    let trimmed = response.trim_start_matches(['\n', '\r']);
-
-    let Some(after_open) = trimmed.trim_start().strip_prefix("```") else {
-        return trimmed.to_string();
+    // A leading newline is kept: it is how a completion that belongs on the
+    // next line says so. Stripping it glued that line onto the caret's own,
+    // `{` followed by the body on the same line. `fit_to_caret_line` removes
+    // it in the one case it is wrong.
+    let Some(after_open) = response.trim_start().strip_prefix("```") else {
+        return response.to_string();
     };
 
     // The opening fence may carry a language tag, which runs to the end of that
@@ -672,6 +756,33 @@ mod tests {
             "https://integrate.api.nvidia.com/v1/completions"
         ));
         assert!(!is_chat_endpoint("http://localhost:11434/api/generate"));
+    }
+
+    #[test]
+    fn a_completion_for_the_next_line_keeps_its_line_break() {
+        let completion = clean_chat_completion("\n    total += 1;");
+        assert_eq!(
+            fit_to_caret_line(completion, "    let mut total = 0;", "\n}\n"),
+            "\n    total += 1;"
+        );
+    }
+
+    #[test]
+    fn a_completion_in_the_middle_of_a_line_continues_it() {
+        let completion = clean_chat_completion("\nitem.price");
+        assert_eq!(
+            fit_to_caret_line(completion, "    sum(", ");\n}\n"),
+            "item.price"
+        );
+    }
+
+    #[test]
+    fn a_completion_on_a_blank_line_does_not_leave_it_behind() {
+        let completion = clean_chat_completion("\n    total += 1;");
+        assert_eq!(
+            fit_to_caret_line(completion, "{\n    ", "\n}\n"),
+            "    total += 1;"
+        );
     }
 
     #[test]
@@ -708,7 +819,13 @@ mod tests {
 
     #[test]
     fn a_completion_is_capped_and_loses_its_trailing_newline() {
-        assert_eq!(cap_lines("one\ntwo\nthree\nfour\n".into()), "one\ntwo\nthree");
+        // A whole block survives: predictions write function bodies, not one
+        // line at a time.
+        let block = "one\ntwo\nthree\nfour\n";
+        assert_eq!(cap_lines(block.into()), "one\ntwo\nthree\nfour");
+        // A runaway reply is still stopped at the ceiling.
+        let runaway: String = (0..100).map(|line| format!("line {line}\n")).collect();
+        assert_eq!(cap_lines(runaway).lines().count(), 40);
         assert_eq!(cap_lines("only\n".into()), "only");
         assert_eq!(cap_lines("a + b".into()), "a + b");
         assert_eq!(cap_lines(String::new()), "");
@@ -727,7 +844,10 @@ mod tests {
             "a + b;"
         );
         // Wholly duplicated: everything it offered is already there.
-        assert_eq!(trim_overlap_with_buffer(");".into(), "    foo(bar", ");"), "");
+        assert_eq!(
+            trim_overlap_with_buffer(");".into(), "    foo(bar", ");"),
+            ""
+        );
         // Nothing in common survives untouched.
         assert_eq!(
             trim_overlap_with_buffer("a + b".into(), "    return ", "\n"),
@@ -742,11 +862,7 @@ mod tests {
         // The duplicated part spans a newline, which a line-at-a-time
         // comparison would miss entirely.
         assert_eq!(
-            trim_overlap_with_buffer(
-                "value;\n    }\n}".into(),
-                "        return ",
-                "\n    }\n}"
-            ),
+            trim_overlap_with_buffer("value;\n    }\n}".into(), "        return ", "\n    }\n}"),
             "value;"
         );
     }
@@ -763,7 +879,13 @@ mod tests {
     }
 
     #[test]
-    fn leading_newlines_are_dropped_but_indentation_is_kept() {
-        assert_eq!(clean_chat_completion("\n\n    indented"), "    indented");
+    fn leading_newlines_are_dropped_on_a_blank_line_but_indentation_is_kept() {
+        // Cleaning leaves the newlines alone; where the caret is decides.
+        let completion = clean_chat_completion("\n\n    indented");
+        assert_eq!(completion, "\n\n    indented");
+        assert_eq!(
+            fit_to_caret_line(completion, "fn main() {\n    ", "\n}\n"),
+            "    indented"
+        );
     }
 }

@@ -305,7 +305,7 @@ pub struct ProjectSearchView {
     pub(crate) workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     pub(crate) entity: Entity<ProjectSearch>,
-    query_editor: Entity<Editor>,
+    pub(crate) query_editor: Entity<Editor>,
     replacement_editor: Entity<Editor>,
     results_editor: Entity<Editor>,
     pub(crate) search_options: SearchOptions,
@@ -1407,7 +1407,7 @@ impl ProjectSearchView {
         });
     }
 
-    fn prompt_to_save_if_dirty_then_search(
+    pub(crate) fn prompt_to_save_if_dirty_then_search(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,

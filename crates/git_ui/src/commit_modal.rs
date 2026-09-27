@@ -112,8 +112,34 @@ pub enum ForceMode {
 
 impl CommitModal {
     pub fn register(workspace: &mut Workspace) {
+        // Commit without the modal. The panel already has a message box; a
+        // second, larger one appearing over the editor to type the same message
+        // into was the thing in the way. With a message written, this commits;
+        // without one, it takes you to the box so you can write it.
         workspace.register_action(|workspace, _: &Commit, window, cx| {
-            CommitModal::toggle(workspace, Some(ForceMode::Commit), window, cx);
+            let Some(git_panel) = workspace.panel::<GitPanel>(cx) else {
+                return;
+            };
+            let has_message = !git_panel
+                .read(cx)
+                .commit_editor
+                .read(cx)
+                .text(cx)
+                .trim()
+                .is_empty();
+            if has_message {
+                git_panel.update(cx, |git_panel, cx| {
+                    if git_panel.amend_pending() {
+                        git_panel.set_amend_pending(false, cx);
+                    }
+                    let options = git_panel.commit_options();
+                    git_panel.commit_changes(options, window, cx);
+                });
+            } else {
+                workspace.open_panel::<GitPanel>(window, cx);
+                let focus = git_panel.read(cx).commit_editor.focus_handle(cx);
+                window.focus(&focus, cx);
+            }
         });
         workspace.register_action(|workspace, _: &Amend, window, cx| {
             CommitModal::toggle(workspace, Some(ForceMode::Amend), window, cx);

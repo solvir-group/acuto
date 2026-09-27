@@ -203,12 +203,17 @@ impl ApplicationMenu {
                         Self::build_menu_from_items(entry.clone(), window, cx).into()
                     })
                     .trigger(
+                        // Dimmer than body text. These are always present and
+                        // rarely used, so at full contrast they competed with
+                        // the file you are actually looking at; hover and the
+                        // open state still bring them up to full strength.
                         Button::new(
                             SharedString::from(format!("{}-menu-trigger", menu_name)),
                             menu_name,
                         )
                         .style(ButtonStyle::Subtle)
                         .label_size(LabelSize::Small)
+                        .color(Color::Muted)
                         .tab_index(0isize),
                     )
                     .with_handle(current_handle.clone()),

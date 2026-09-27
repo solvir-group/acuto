@@ -21,6 +21,8 @@ use crate::item::Item;
 /// large subtree into this crate's rebuild graph. A wrong id degrades to a
 /// logged warning from `build_action`, not a panic.
 pub(crate) const CLAUDE_AGENT_ID: &str = "claude-acp";
+pub(crate) const CODEX_AGENT_ID: &str = "codex-acp";
+pub(crate) const COPILOT_AGENT_ID: &str = "github-copilot-cli";
 
 pub struct Launchpad {
     focus_handle: FocusHandle,
@@ -115,6 +117,20 @@ impl Render for Launchpad {
                         IconName::AiClaude,
                         "agent::NewExternalAgentThreadInPane",
                         Some(serde_json::json!({ "agent": CLAUDE_AGENT_ID })),
+                    ))
+                    .child(Self::entry_with(
+                        "launchpad-codex",
+                        "Codex",
+                        IconName::AiOpenAi,
+                        "agent::NewExternalAgentThreadInPane",
+                        Some(serde_json::json!({ "agent": CODEX_AGENT_ID })),
+                    ))
+                    .child(Self::entry_with(
+                        "launchpad-copilot",
+                        "GitHub Copilot",
+                        IconName::Copilot,
+                        "agent::NewExternalAgentThreadInPane",
+                        Some(serde_json::json!({ "agent": COPILOT_AGENT_ID })),
                     ))
                     .child(Self::entry(
                         "launchpad-git",

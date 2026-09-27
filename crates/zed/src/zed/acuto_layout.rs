@@ -18,6 +18,7 @@ use git_ui::git_panel::GitPanel;
 use gpui::{DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, WeakEntity};
 use outline_panel::OutlinePanel;
 use project_panel::ProjectPanel;
+use search::search_panel::SearchPanel;
 use serde::{Deserialize, Serialize};
 use terminal_view::terminal_panel::TerminalPanel;
 use ui::prelude::*;
@@ -47,6 +48,7 @@ enum PanelKind {
     Agent,
     Terminal,
     Problems,
+    Search,
 }
 
 impl PanelKind {
@@ -60,6 +62,7 @@ impl PanelKind {
             "AgentPanel" => Some(Self::Agent),
             "TerminalPanel" => Some(Self::Terminal),
             "ProblemsPanel" => Some(Self::Problems),
+            "SearchPanel" => Some(Self::Search),
             _ => None,
         }
     }
@@ -72,6 +75,7 @@ impl PanelKind {
             Self::Agent => workspace.open_panel::<AgentPanel>(window, cx),
             Self::Terminal => workspace.open_panel::<TerminalPanel>(window, cx),
             Self::Problems => workspace.open_panel::<ProblemsPanel>(window, cx),
+            Self::Search => workspace.open_panel::<SearchPanel>(window, cx),
         }
     }
 }
@@ -79,9 +83,22 @@ impl PanelKind {
 /// Which panel, if any, each edge shows.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
 struct DockLayout {
+    #[serde(default, deserialize_with = "panel_kind_or_none")]
     left: Option<PanelKind>,
+    #[serde(default, deserialize_with = "panel_kind_or_none")]
     right: Option<PanelKind>,
+    #[serde(default, deserialize_with = "panel_kind_or_none")]
     bottom: Option<PanelKind>,
+}
+
+/// Reads a panel kind, treating one this build does not recognise as an empty
+/// edge rather than as a broken record.
+fn panel_kind_or_none<'de, D>(deserializer: D) -> Result<Option<PanelKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 impl DockLayout {
@@ -293,12 +310,33 @@ fn split_into_grid(
 }
 
 fn read_saved_layouts() -> Vec<Layout> {
-    GlobalKeyValueStore::global()
+    let Some(json) = GlobalKeyValueStore::global()
         .read_kvp(SAVED_LAYOUTS_KEY)
         .log_err()
         .flatten()
-        .and_then(|json| serde_json::from_str::<Vec<Layout>>(&json).log_err())
-        .unwrap_or_default()
+    else {
+        return Vec::new();
+    };
+
+    // Parsed one preset at a time. Parsing the list as a whole meant a single
+    // unreadable entry discarded every saved layout, with nothing said about
+    // it -- which is what "my presets did not save" looks like from outside.
+    let Some(values) = serde_json::from_str::<Vec<serde_json::Value>>(&json).log_err() else {
+        return Vec::new();
+    };
+
+    let total = values.len();
+    let layouts: Vec<Layout> = values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<Layout>(value).log_err())
+        .collect();
+    if layouts.len() != total {
+        log::warn!(
+            "layout presets: kept {} of {total}; the rest could not be read",
+            layouts.len()
+        );
+    }
+    layouts
 }
 
 fn write_saved_layouts(layouts: Vec<Layout>, cx: &mut App) {

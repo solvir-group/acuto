@@ -91,6 +91,8 @@ pub struct ThemeSettings {
     pub theme_overrides: HashMap<String, settings::ThemeStyleContent>,
     /// The current icon theme selection.
     pub icon_theme: IconThemeSelection,
+    /// Which syntax palette colours code.
+    pub token_theme: settings::TokenTheme,
     /// The density of the UI.
     /// Note: This setting is still experimental. See [this tracking issue](
     pub ui_density: UiDensity,
@@ -505,6 +507,17 @@ impl ThemeSettings {
 
     /// Applies the theme overrides, if there are any, to the current theme.
     pub fn apply_theme_overrides(&self, mut arc_theme: Arc<Theme>) -> Arc<Theme> {
+        // First, so that a user's own syntax overrides still win over the
+        // palette they picked. Choosing "VS Code" and then correcting one
+        // capture by hand should correct that capture, not be discarded.
+        let token_overrides =
+            crate::token_theme::overrides(self.token_theme, arc_theme.appearance.is_light());
+        if !token_overrides.is_empty() {
+            let mut theme = (*arc_theme).clone();
+            theme.styles.syntax = theme::SyntaxTheme::merge(theme.styles.syntax, token_overrides);
+            arc_theme = Arc::new(theme);
+        }
+
         if let Some(experimental_theme_overrides) = &self.experimental_theme_overrides {
             let mut theme = (*arc_theme).clone();
             ThemeSettings::modify_theme(&mut theme, experimental_theme_overrides);
@@ -701,6 +714,23 @@ fn font_fallbacks_from_settings(
     })
 }
 
+/// Acuto's own names for the fonts it ships with.
+///
+/// A font family name is how the operating system finds the file, so these
+/// cannot simply be renamed in settings -- "Acuto Mono" is not installed on
+/// anyone's machine. The alias is resolved here instead: the user writes the
+/// Acuto name, the platform is asked for the real one.
+///
+/// Anything not in this table passes through untouched, so a user naming an
+/// actual installed font is unaffected.
+fn resolve_font_alias(family: SharedString) -> SharedString {
+    match family.as_ref() {
+        "Acuto Mono" => "Berkeley Mono Trial".into(),
+        "Acuto Sans" => "Inter".into(),
+        _ => family,
+    }
+}
+
 impl settings::Settings for ThemeSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let content = &content.theme;
@@ -709,20 +739,16 @@ impl settings::Settings for ThemeSettings {
         Self {
             ui_font_size: clamp_font_size(content.ui_font_size.unwrap().into_gpui()),
             ui_font: Font {
-                family: content.ui_font_family.as_ref().unwrap().0.clone().into(),
+                family: resolve_font_alias(content.ui_font_family.as_ref().unwrap().0.clone().into()),
                 features: content.ui_font_features.clone().unwrap().into_gpui(),
                 fallbacks: font_fallbacks_from_settings(content.ui_font_fallbacks.clone()),
                 weight: content.ui_font_weight.unwrap().into_gpui(),
                 style: Default::default(),
             },
             buffer_font: Font {
-                family: content
-                    .buffer_font_family
-                    .as_ref()
-                    .unwrap()
-                    .0
-                    .clone()
-                    .into(),
+                family: resolve_font_alias(
+                    content.buffer_font_family.as_ref().unwrap().0.clone().into(),
+                ),
                 features: content.buffer_font_features.clone().unwrap().into_gpui(),
                 fallbacks: font_fallbacks_from_settings(content.buffer_font_fallbacks.clone()),
                 weight: content.buffer_font_weight.unwrap().into_gpui(),
@@ -735,22 +761,22 @@ impl settings::Settings for ThemeSettings {
             agent_ui_font_family: content
                 .agent_ui_font_family
                 .as_ref()
-                .map(|font| font.0.clone().into()),
+                .map(|font| resolve_font_alias(font.0.clone().into())),
             agent_ui_font_size: content.agent_ui_font_size.map(|s| s.into_gpui()),
             agent_buffer_font_family: content
                 .agent_buffer_font_family
                 .as_ref()
-                .map(|font| font.0.clone().into()),
+                .map(|font| resolve_font_alias(font.0.clone().into())),
             agent_buffer_font_size: content.agent_buffer_font_size.map(|s| s.into_gpui()),
             git_commit_buffer_font_size: content.git_commit_buffer_font_size.map(|s| s.into_gpui()),
             markdown_preview_font_family: content
                 .markdown_preview_font_family
                 .as_ref()
-                .map(|f| f.0.clone().into()),
+                .map(|f| resolve_font_alias(f.0.clone().into())),
             markdown_preview_code_font_family: content
                 .markdown_preview_code_font_family
                 .as_ref()
-                .map(|f| f.0.clone().into()),
+                .map(|f| resolve_font_alias(f.0.clone().into())),
             markdown_preview_font_size: content.markdown_preview_font_size.map(|s| s.into_gpui()),
             markdown_preview_theme: content
                 .markdown_preview_theme
@@ -760,6 +786,7 @@ impl settings::Settings for ThemeSettings {
             experimental_theme_overrides: content.experimental_theme_overrides.clone(),
             theme_overrides: content.theme_overrides.clone(),
             icon_theme: icon_theme_selection,
+            token_theme: content.token_theme.unwrap_or_default(),
             ui_density: ui_density_from_settings(content.ui_density.unwrap_or_default()),
             unnecessary_code_fade: content.unnecessary_code_fade.unwrap().0.clamp(0.0, 0.9),
         }

@@ -103,6 +103,11 @@ impl SessionCapabilities {
                 PromptContextType::Fetch,
                 PromptContextType::Skill,
                 PromptContextType::BranchDiff,
+                // A ticket arrives as text, so it needs embedded context and
+                // nothing else. Not tied to the thread store: external agents
+                // have no thread store, and they are the ones tickets are
+                // handed to.
+                PromptContextType::Ticket,
             ]);
         }
         supported
@@ -147,6 +152,22 @@ struct MessageEditorCompletionDelegate {
     has_thread_store: bool,
     message_editor: WeakEntity<MessageEditor>,
     local_commands: SharedLocalCommands,
+    agent_id: AgentId,
+}
+
+/// Whether an agent takes `/` commands at all.
+///
+/// Claude Code and Copilot both have their own slash vocabulary that users
+/// arrive already knowing, and both accept skills. Codex has neither -- it takes
+/// prose -- so offering it a menu on `/` advertises a feature it does not have
+/// and puts text in the prompt that the model has no idea what to do with.
+///
+/// Listed by exclusion rather than inclusion so a newly added agent gets the
+/// menu by default: the failure mode of showing commands to an agent that
+/// ignores them is milder than silently withholding them from one that uses
+/// them.
+fn agent_takes_slash_commands(agent_id: &AgentId) -> bool {
+    agent_id.0.as_ref() != agent_servers::CODEX_ID
 }
 
 impl PromptCompletionProviderDelegate for MessageEditorCompletionDelegate {
@@ -161,14 +182,23 @@ impl PromptCompletionProviderDelegate for MessageEditorCompletionDelegate {
     }
 
     fn available_commands(&self, _cx: &App) -> Vec<AvailableCommand> {
+        if !agent_takes_slash_commands(&self.agent_id) {
+            return Vec::new();
+        }
         self.session_capabilities.read().completion_commands()
     }
 
     fn available_skills(&self, _cx: &App) -> Vec<AvailableSkill> {
+        if !agent_takes_slash_commands(&self.agent_id) {
+            return Vec::new();
+        }
         self.session_capabilities.read().completion_skills()
     }
 
     fn available_local_commands(&self, _cx: &App) -> Vec<PromptLocalCommand> {
+        if !agent_takes_slash_commands(&self.agent_id) {
+            return Vec::new();
+        }
         self.local_commands.read().clone()
     }
 
@@ -512,6 +542,7 @@ impl MessageEditor {
                 has_thread_store: thread_store.is_some(),
                 message_editor: cx.weak_entity(),
                 local_commands: local_commands.clone(),
+                agent_id: agent_id.clone(),
             },
             editor.downgrade(),
             mention_set.clone(),
@@ -2019,11 +2050,21 @@ impl Render for MessageEditor {
 
                 let text_style = TextStyle {
                     color: cx.theme().colors().text,
-                    font_family: settings.agent_buffer_font_family().clone(),
-                    font_fallbacks: settings.buffer_font.fallbacks.clone(),
-                    font_features: settings.buffer_font.features.clone(),
+                    // The UI font, at the agent panel's own text size.
+                    //
+                    // The family and the size come from different settings on
+                    // purpose. `agent_ui_font_size` is unset by default and
+                    // falls back to the window's UI size, which is a third
+                    // larger than this panel is built for -- taking it made the
+                    // composer tower over the replies above it and, at four
+                    // minimum lines, grow the whole box by a quarter.
+                    // `agent_buffer_font_size` is what "the size of user
+                    // messages in the agent panel" has always meant.
+                    font_family: settings.agent_ui_font_family().clone(),
+                    font_fallbacks: settings.ui_font.fallbacks.clone(),
+                    font_features: settings.ui_font.features.clone(),
                     font_size: settings.agent_buffer_font_size(cx).into(),
-                    font_weight: settings.buffer_font.weight,
+                    font_weight: settings.ui_font.weight,
                     line_height: relative(settings.buffer_line_height.value()),
                     ..Default::default()
                 };

@@ -43,15 +43,13 @@ use notifications::status_toast::StatusToast;
 use settings::{update_settings_file, update_settings_file_with_completion};
 use ui::{
     ButtonLike, CalloutBorderPosition, Checkbox, DotSpinner, ShimmerLabel, SpinnerLabel,
-    SpinnerVariant,
-    SplitButton,
-    SplitButtonStyle, Tab, ToggleState,
+    SpinnerVariant, SplitButton, SplitButtonStyle, Tab, ToggleState,
 };
 use util::markdown::{source_position_from_fragment, split_local_url_fragment};
 use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 
 use super::claude_brand::{
-    RemoteControlStatus, UsageLimit, claude_clay, claude_greeting,
+    AgentBrand, RemoteControlStatus, UsageLimit, UsageLimitKind, agent_greeting,
     mode_skips_permission_prompts, parse_usage_limit, relaxed_permissions_warning,
     remote_control_indicator, thinking_word, usage_limit_reset_label,
 };
@@ -225,10 +223,12 @@ impl GeneratingSpinner {
 const COMPOSER_MAX_WIDTH: f32 = 440.;
 
 impl Render for GeneratingSpinner {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let label = SpinnerLabel::with_variant(self.variant).size(LabelSize::Small);
         match self.variant {
-            SpinnerVariant::Claude => label.color(Color::Custom(claude_clay())),
+            SpinnerVariant::Claude => label.color(Color::Custom(
+                crate::conversation_view::claude_brand::claude_clay_in(cx),
+            )),
             _ => label,
         }
     }
@@ -1106,8 +1106,20 @@ impl ThreadView {
                 });
             });
 
+        // A prompt handed over from elsewhere -- an @agent mention in team chat
+        // -- is sent on arrival only when the agent will still ask before it
+        // acts. In a mode that skips those prompts the text, which a teammate
+        // wrote, would drive the agent unseen, so it waits in the composer for
+        // the user to read and send.
         if should_auto_submit {
-            this.send(window, cx);
+            if this.permissions_are_relaxed(cx) {
+                log::info!(
+                    "agent hand-off left in the composer: the agent is in a mode that skips \
+                     permission prompts"
+                );
+            } else {
+                this.send(window, cx);
+            }
         }
         this
     }
@@ -1281,6 +1293,33 @@ impl ThreadView {
     ///
     /// Drives appearance only. Every behavioural difference between agents
     /// comes from the capabilities the agent reports, not from its name.
+    /// The brand of whichever agent answers in this thread.
+    fn brand(&self, cx: &App) -> Option<AgentBrand> {
+        AgentBrand::for_agent_in(self.agent_id.as_ref(), cx)
+    }
+
+    /// Whether this thread's agent can have its edits held for review.
+    ///
+    /// True for the agents that write through this client's file-writing
+    /// capability, which is what makes holding an edit back possible at all.
+    /// Copilot's CLI writes to disk itself, so a toggle would claim a guarantee
+    /// that cannot be delivered.
+    fn supports_review_mode(&self) -> bool {
+        // Branded agents are exactly the external ones this client writes for,
+        // so the brand table already answers the question -- minus Copilot,
+        // whose CLI does its own writing.
+        AgentBrand::for_agent(self.agent_id.as_ref()).is_some()
+            && self.agent_id.as_ref() != agent_servers::COPILOT_ID
+    }
+
+    fn toggle_review_changes(&mut self, cx: &mut Context<Self>) {
+        let reviewing = AgentSettings::get_global(cx).review_changes;
+        let fs = self.thread.read(cx).project().read(cx).fs().clone();
+        settings::update_settings_file(fs, cx, move |settings, _| {
+            settings.agent.get_or_insert_default().review_changes = Some(!reviewing);
+        });
+    }
+
     fn is_claude(&self) -> bool {
         self.agent_id.as_ref() == agent_servers::CLAUDE_AGENT_ID
     }
@@ -4390,13 +4429,7 @@ impl ThreadView {
             return div().into_any_element();
         }
 
-        let focus_handle = self.message_editor.focus_handle(cx);
         let editor_expanded = self.editor_expanded;
-        let (expand_icon, expand_tooltip) = if editor_expanded {
-            (IconName::Minimize, "Minimize Message Editor")
-        } else {
-            (IconName::Maximize, "Expand Message Editor")
-        };
 
         let has_messages = self.list_state.item_count() > 0;
         // Previously `!has_messages || editor_expanded`. On an empty thread the
@@ -4428,8 +4461,8 @@ impl ThreadView {
                     this.flex_1()
                         .size_full()
                         .items_center()
-                        .when(self.is_claude(), |this| {
-                            this.flex_col().gap_2().child(claude_greeting(cx))
+                        .when_some(self.brand(cx), |this, brand| {
+                            this.flex_col().gap_2().child(agent_greeting(brand, cx))
                         })
                 }
             })
@@ -4451,14 +4484,32 @@ impl ThreadView {
                     // so the send button, model selector and context controls sit
                     // inside the input instead of floating beneath it.
                     .border_1()
-                    // Plain. A permanently tinted input is decoration, and the
-                    // permission warning it used to carry now sits beside the
-                    // control that sets it.
-                    .border_color(cx.theme().colors().border)
-                    .rounded_md()
-                    // Not editor_background: the composer should read as a raised
-                    // surface on the panel, not a black hole punched into it.
-                    .bg(cx.theme().colors().element_background)
+                    // The agent's own colour, well down in strength. At full
+                    // saturation a tinted input reads as a warning; at a third
+                    // it reads as whose box this is, which is the thing worth
+                    // knowing before you press enter with several agents open.
+                    .map(|this| {
+                        if cx.theme().appearance().is_light() {
+                            // White with a hairline you only just see and no
+                            // shadow: enough to show where the box is, nothing
+                            // more. Taken from the theme's border so it can be
+                            // tuned without a rebuild. The radius is the send
+                            // disc's plus the box's padding, so the two curves
+                            // run parallel in the corner.
+                            this.rounded(px(18.))
+                                .border_color(cx.theme().colors().border)
+                                .bg(cx.theme().colors().editor_background)
+                        } else {
+                            // Not editor_background: the composer should read as a
+                            // raised surface on the panel, not a black hole punched
+                            // into it.
+                            let this = this.rounded_lg().bg(cx.theme().colors().element_background);
+                            match self.brand(cx) {
+                                Some(brand) => this.border_color(brand.accent.opacity(0.35)),
+                                None => this.border_color(cx.theme().colors().border),
+                            }
+                        }
+                    })
                     // Tight padding: the composer should not take more vertical
                     // space than the text it holds plus its controls.
                     .p_1p5()
@@ -4484,38 +4535,6 @@ impl ThreadView {
                                 }
                             })
                             .child(self.message_editor.clone())
-                            .when(has_messages, |this| {
-                                this.child(
-                                    h_flex()
-                                        .absolute()
-                                        .top_0()
-                                        .right_0()
-                                        .opacity(0.5)
-                                        .hover(|s| s.opacity(1.0))
-                                        .child(
-                                            IconButton::new("toggle-height", expand_icon)
-                                                .icon_size(IconSize::Small)
-                                                .icon_color(Color::Muted)
-                                                .tooltip({
-                                                    move |_window, cx| {
-                                                        Tooltip::for_action_in(
-                                                            expand_tooltip,
-                                                            &ExpandMessageEditor,
-                                                            &focus_handle,
-                                                            cx,
-                                                        )
-                                                    }
-                                                })
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.expand_message_editor(
-                                                        &ExpandMessageEditor,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                })),
-                                        ),
-                                )
-                            }),
                     )
                     .child({
                         // An external agent enforces its own permissions and
@@ -4525,9 +4544,6 @@ impl ThreadView {
                         // own config selector already shows. Five extra buttons
                         // is what pushed this row onto a second and third line.
                         let is_native = self.agent_id.as_ref() == agent::ZED_AGENT_ID.as_ref();
-                        let has_slash_commands =
-                            self.session_capabilities.read().has_slash_completions();
-
                         h_flex()
                             .w_full()
                             .min_w_0()
@@ -4543,9 +4559,6 @@ impl ThreadView {
                                     .min_w_0()
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
-                                    .when(has_slash_commands, |this| {
-                                        this.child(self.render_slash_command_button(cx))
-                                    })
                                     // How full the context window is, as a ring.
                                     // It was written and then never placed, so
                                     // the one number that decides whether a long
@@ -4581,6 +4594,33 @@ impl ThreadView {
                                         None => this
                                             .children(self.mode_selector.clone())
                                             .children(self.model_selector.clone()),
+                                    })
+                                    .when(self.supports_review_mode(), |this| {
+                                        let reviewing =
+                                            AgentSettings::get_global(cx).review_changes;
+                                        this.child(
+                                            IconButton::new("toggle-review-changes", IconName::Diff)
+                                                .icon_size(IconSize::Small)
+                                                .toggle_state(reviewing)
+                                                .icon_color(if reviewing {
+                                                    Color::Accent
+                                                } else {
+                                                    Color::Muted
+                                                })
+                                                .tooltip(move |_window, cx| {
+                                                    Tooltip::simple(
+                                                        if reviewing {
+                                                            "Review Changes: on \u{2014} edits open as diffs to accept"
+                                                        } else {
+                                                            "Review Changes: off \u{2014} edits apply as the agent makes them"
+                                                        },
+                                                        cx,
+                                                    )
+                                                })
+                                                .on_click(cx.listener(|this, _, _window, cx| {
+                                                    this.toggle_review_changes(cx);
+                                                })),
+                                        )
                                     })
                                     .child(self.render_send_button(cx)),
                             )
@@ -5298,9 +5338,11 @@ impl ThreadView {
             .icon_color(color)
             .tooltip(Tooltip::text(tooltip))
             .on_click(cx.listener(move |this, _, _window, cx| {
-                let Some(project) = this.workspace.upgrade().map(|workspace| {
-                    workspace.read(cx).project().clone()
-                }) else {
+                let Some(project) = this
+                    .workspace
+                    .upgrade()
+                    .map(|workspace| workspace.read(cx).project().clone())
+                else {
                     return;
                 };
                 let fs = project.read(cx).fs().clone();
@@ -5617,26 +5659,41 @@ impl ThreadView {
             let send_icon = if is_generating {
                 IconName::QueueMessage
             } else {
-                IconName::Send
+                // An arrow up rather than a paper plane: the message goes up
+                // into the thread above the box you typed it in.
+                IconName::ArrowUp
             };
-            let is_claude = self.is_claude();
-            IconButton::new("send-message", send_icon)
-                .style(ButtonStyle::Filled)
-                .map(|this| {
-                    if is_editor_empty && !is_generating {
-                        this.disabled(true).icon_color(Color::Muted)
-                    } else if is_claude {
-                        // Brand in the glyph, not in the box. A filled orange
-                        // button is the single most conspicuous thing in an
-                        // otherwise monochrome editor, and it made the panel
-                        // read as an advert for the agent rather than a control
-                        // for it. The tinted icon still says whose thread this
-                        // is, at a fraction of the volume.
-                        this.icon_color(Color::Custom(claude_clay()))
-                    } else {
-                        this.icon_color(Color::Accent)
-                    }
-                })
+            let brand = self.brand(cx);
+            let colors = cx.theme().colors();
+            let is_disabled = is_editor_empty && !is_generating;
+            // A disc rather than the theme's square button: a round send
+            // control is what every chat box has taught people to look for.
+            // On a light theme it is solid ink with a white arrow; on a dark
+            // one it keeps the agent's colour at two intensities, so the glyph
+            // and its fill are one hue rather than two colour systems.
+            let (background, foreground) = if is_disabled {
+                (colors.element_background, colors.icon_muted)
+            } else if cx.theme().appearance().is_light() {
+                (colors.text, gpui::white())
+            } else if let Some(brand) = brand {
+                (brand.accent.opacity(0.18), brand.accent)
+            } else {
+                (colors.text_accent.opacity(0.18), colors.text_accent)
+            };
+            div()
+                .id("send-message")
+                .flex_none()
+                .size(px(26.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(background)
+                .child(
+                    Icon::new(send_icon)
+                        .size(IconSize::Small)
+                        .color(Color::Custom(foreground)),
+                )
                 .tooltip(move |_window, cx| {
                     if is_editor_empty && !is_generating {
                         Tooltip::for_action("Type to Send", &Chat, cx)
@@ -5673,9 +5730,13 @@ impl ThreadView {
                         Tooltip::for_action("Send Message", &Chat, cx)
                     }
                 })
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.send(window, cx);
-                }))
+                .when(!is_disabled, |this| {
+                    this.cursor_pointer()
+                        .hover(|style| style.opacity(0.85))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.send(window, cx);
+                        }))
+                })
                 .into_any_element()
         }
     }
@@ -6414,26 +6475,25 @@ impl ThreadView {
                             .child(
                                 div()
                                     .py_1p5()
-                                    .px_2()
-                                    // No bubble. A user message reads as plain text
-                                    // in the transcript; the box and background only
-                                    // appear while editing, where they communicate an
-                                    // active input rather than decorating every turn.
-                                    .when(is_editable && editing, |this| {
-                                        this.rounded_md()
-                                            .border_1()
-                                            .bg(cx.theme().colors().element_background)
-                                    })
+                                    .px_2p5()
+                                    // A soft fill tells your turns apart from the
+                                    // agent's. It used to be a drop shadow on a box
+                                    // with no background, which on an opaque window
+                                    // drew a grey smudge around the text.
+                                    .rounded_lg()
+                                    .border_1()
+                                    .bg(cx.theme().colors().element_background)
+                                    .border_color(cx.theme().colors().border_transparent)
                                     .when(is_indented, |this| {
                                         this.py_1().px_2().when(opaque_window, |this| {
                                             this.shadow_sm()
                                         })
                                     })
-                                    .border_color(cx.theme().colors().border)
                                     .map(|this| {
+                                        let border = cx.theme().colors().border;
                                         if !is_editable {
                                             if is_subagent {
-                                                return this.border_dashed();
+                                                return this.border_color(border).border_dashed();
                                             }
                                             return this;
                                         }
@@ -6441,12 +6501,9 @@ impl ThreadView {
                                             return this.border_color(focus_border);
                                         }
                                         if editing && !editor_focus {
-                                            return this.border_dashed()
+                                            return this.border_color(border).border_dashed()
                                         }
-                                        this.when(opaque_window, |this| this.shadow_md())
-                                            .hover(|s| {
-                                                s.border_color(focus_border.opacity(0.8))
-                                            })
+                                        this.hover(|s| s.border_color(focus_border.opacity(0.8)))
                                     })
                                     .text_xs()
                                     .child(editor.clone().into_any_element())
@@ -7539,26 +7596,6 @@ impl ThreadView {
         }
     }
 
-    /// Types `/` into the composer and focuses it.
-    ///
-    /// Slash commands are already discoverable by typing the character, which
-    /// is invisible to anyone who has not been told. A button costs one glyph
-    /// of space and turns a secret into an affordance.
-    fn render_slash_command_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        IconButton::new("insert-slash-command", IconName::Slash)
-            .icon_size(IconSize::Small)
-            .icon_color(Color::Muted)
-            .tooltip(Tooltip::text("Commands"))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.message_editor.update(cx, |editor, cx| {
-                    editor.insert_text("/", window, cx);
-                });
-                this.message_editor
-                    .focus_handle(cx)
-                    .focus(window, cx);
-            }))
-    }
-
     fn render_generating(&self, confirmation: bool, cx: &App) -> impl IntoElement {
         let show_stats = AgentSettings::get_global(cx).show_turn_stats;
         let elapsed_label = show_stats
@@ -7597,60 +7634,56 @@ impl ThreadView {
             .gap_2()
             .map(|this| {
                 if confirmation {
-                    this.child(
-                        h_flex()
-                            .w_2()
-                            .justify_center()
-                            .child(GeneratingSpinnerElement::new(SpinnerVariant::Sand)),
-                    )
-                    .child(
-                        div().min_w(rems(8.)).child(
-                            LoadingLabel::new("Awaiting Confirmation")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
-                    )
+                    // Nothing here while a tool call waits on you. The
+                    // permission card in the list says so where the decision
+                    // actually is, and the floating header repeats it when that
+                    // card has scrolled away -- a third spinner on this row was
+                    // the duplicate, and it is the one with no button on it.
+                    //
+                    // Decided without asking the list: this runs inside the
+                    // list's own layout pass, where querying it panics.
+                    this
                 } else if is_blocked_on_terminal_command {
                     this
-                } else if self.is_claude() {
-                    // Claude thinks with its own mascot and its own vocabulary.
-                    // Someone who has used Claude Code in a terminal recognises
-                    // this without reading anything, which is the whole point of
-                    // it being different from the house spinner.
+                } else {
+                    // The agent's own loader and its own word. Claude keeps its
+                    // vocabulary -- "pondering", "noodling" -- because anyone
+                    // who has used it in a terminal recognises that before they
+                    // recognise anything else; the others say their own name,
+                    // which is the thing worth knowing when three panels are
+                    // open.
+                    let brand = self.brand(cx);
                     let elapsed = self
                         .turn_fields
                         .turn_started_at
                         .map(|started_at| started_at.elapsed().as_secs())
                         .unwrap_or_default();
+                    let word = if self.is_claude() {
+                        thinking_word(elapsed).to_string()
+                    } else {
+                        brand
+                            .map(|brand| brand.name.to_string())
+                            .unwrap_or_default()
+                    };
 
-                    this.child(
-                        h_flex()
-                            .w_4()
-                            .justify_center()
-                            .child(GeneratingSpinnerElement::new(SpinnerVariant::Claude)),
-                    )
-                    .child(
-                        // The word itself is plain text, not brand colour. The
-                        // clay is already carried by the mascot beside it, and
-                        // saying it twice made the pair read as a warning rather
-                        // than as something working.
-                        ShimmerLabel::new(
-                            "claude-thinking-word",
-                            thinking_word(elapsed),
-                            cx.theme().colors().text,
+                    this.child(h_flex().w_4().justify_center().child(match brand {
+                        Some(brand) => brand.loader("generating-dots"),
+                        None => DotSpinner::new("generating-dots"),
+                    }))
+                    .when(!word.is_empty(), |this| {
+                        this.child(
+                            // The word is plain text, not brand colour. The
+                            // accent is already carried by the loader beside
+                            // it, and saying it twice made the pair read as a
+                            // warning rather than as something working.
+                            ShimmerLabel::new(
+                                "agent-working-word",
+                                word.clone(),
+                                cx.theme().colors().text,
+                            )
+                            .size(LabelSize::Small),
                         )
-                        .size(LabelSize::Small),
-                    )
-                } else {
-                    this.child(
-                        h_flex()
-                            .w_4()
-                            .justify_center()
-                            // A braille spinner is a font glyph, so it is fixed
-                            // at the six dots a braille cell has. This is drawn
-                            // from elements, so it is a three by three grid.
-                            .child(DotSpinner::new("generating-dots")),
-                    )
+                    })
                 }
             })
             .when_some(elapsed_label, |this, elapsed| {
@@ -11324,7 +11357,13 @@ impl ThreadView {
         let callout = match self.thread_error.as_ref()? {
             ThreadError::Other { message, .. } => {
                 let message = message.clone();
-                match parse_usage_limit(&message) {
+                // Only Claude's errors are read as its usage limits; another
+                // agent's "rate limit" would otherwise get Claude's wording.
+                match self
+                    .is_claude()
+                    .then(|| parse_usage_limit(&message))
+                    .flatten()
+                {
                     Some(limit) => self.render_usage_limit_callout(&limit, cx),
                     None => self.render_any_thread_error(message, window, cx),
                 }
@@ -11446,21 +11485,38 @@ impl ThreadView {
     /// broken here and there is nothing to fix, so the callout says when the
     /// limit lifts and stops.
     fn render_usage_limit_callout(&self, limit: &UsageLimit, cx: &mut Context<Self>) -> Callout {
-        let mut description = String::from(
-            "Claude's usage limit for this window has been reached, so it cannot answer \
-             until the window rolls over. The thread is saved and picks up where it left off.",
-        );
+        let mut description = String::from(limit.kind.description());
         if let Some(reset) = usage_limit_reset_label(limit) {
             description.push(' ');
             description.push_str(&reset);
         }
 
+        // Waiting is the right move for a five-hour window and the wrong one for
+        // a weekly cap, so the way out is offered only where it is actually the
+        // better option.
+        let offer_another_agent =
+            matches!(limit.kind, UsageLimitKind::Weekly | UsageLimitKind::Model);
+
         Callout::new()
             .severity(Severity::Warning)
             .icon(IconName::CountdownTimer)
-            .title("Claude Usage Limit Reached")
+            .title(limit.kind.title())
             .description(description.clone())
-            .actions_slot(self.create_copy_button(description))
+            .actions_slot(
+                h_flex()
+                    .gap_1()
+                    .when(offer_another_agent, |this| {
+                        this.child(
+                            Button::new("switch-agent", "Use Another Agent")
+                                .label_size(LabelSize::Small)
+                                .on_click(|_, window, cx| {
+                                    window
+                                        .dispatch_action(Box::new(crate::ToggleNewThreadMenu), cx);
+                                }),
+                        )
+                    })
+                    .child(self.create_copy_button(description)),
+            )
             .dismiss_action(self.dismiss_error_button(cx))
     }
 
@@ -12885,6 +12941,10 @@ pub(crate) fn open_link(
                 open_abs_path_at_point(workspace, abs_path, None, window, cx);
             }
             MentionUri::PastedImage { .. } => {}
+            // The ticket lives in the team tab, so a click goes there.
+            MentionUri::Ticket { .. } => {
+                window.dispatch_action(Box::new(team_notes::ToggleFocus), cx);
+            }
             MentionUri::Directory { abs_path } => {
                 let project = workspace.project();
                 let Some(entry_id) = project.update(cx, |project, cx| {
@@ -13331,7 +13391,10 @@ fn render_shimmer_text(
     /// How many characters wide the bright band is.
     const BAND: f32 = 3.0;
 
-    let characters: Vec<String> = text.chars().map(|character| character.to_string()).collect();
+    let characters: Vec<String> = text
+        .chars()
+        .map(|character| character.to_string())
+        .collect();
     let count = characters.len().max(1) as f32;
 
     h_flex()

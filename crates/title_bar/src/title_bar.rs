@@ -961,17 +961,12 @@ impl TitleBar {
             }
         }
 
+        // No panel toggle here: the rail above the file tree opens git, and a
+        // third way to reach the same panel was clutter. Commit and push stay,
+        // because they act rather than open.
         h_flex()
             .gap_0p5()
             .pl_2()
-            .child(
-                IconButton::new("top-bar-git-panel", IconName::Github)
-                    .icon_size(IconSize::XSmall)
-                    .icon_color(Color::Muted)
-                    .disabled(!has_repository)
-                    .tooltip(Tooltip::text("Git Panel"))
-                    .on_click(dispatch("git_panel::ToggleFocus")),
-            )
             .child(
                 IconButton::new("top-bar-git-commit", IconName::GitBranch)
                     .icon_size(IconSize::XSmall)
@@ -1100,17 +1095,6 @@ impl TitleBar {
                     }),
             )
             .child(
-                IconButton::new("title-bar-git", IconName::GitBranch)
-                    .tooltip(Tooltip::text("Git Panel"))
-                    .icon_size(IconSize::Small)
-                    .on_click(move |_, window, cx| {
-                        if let Some(action) = cx.build_action("git_panel::ToggleFocus", None).log_err()
-                        {
-                            window.dispatch_action(action, cx);
-                        }
-                    }),
-            )
-            .child(
                 IconButton::new("title-bar-terminal", IconName::Terminal)
                     .tooltip(Tooltip::text("Terminal"))
                     .icon_size(IconSize::Small)
@@ -1132,12 +1116,20 @@ impl TitleBar {
     fn render_title_bar_trailing_tools(&self) -> impl IntoElement {
         h_flex()
             .gap_0p5()
+            // No agent button here. The agent panel already has one in the
+            // status bar's dock strip, which is where every other panel in the
+            // window is toggled from -- two controls for one panel, at opposite
+            // corners, is a thing to hunt for rather than a shortcut.
+            // Team messages and tickets, on the right with the other things
+            // that are about the project rather than the file. They open as
+            // a tab, so they have no dock button; this is the way in.
             .child(
-                IconButton::new("title-bar-agent", IconName::Chat)
-                    .tooltip(Tooltip::text("Toggle Agent Sidebar"))
+                IconButton::new("title-bar-team", IconName::ListTodo)
+                    .tooltip(Tooltip::text("Team \u{2014} messages and tickets"))
                     .icon_size(IconSize::Small)
                     .on_click(move |_, window, cx| {
-                        if let Some(action) = cx.build_action("agent::ToggleFocus", None).log_err()
+                        if let Some(action) =
+                            cx.build_action("team_notes::ToggleFocus", None).log_err()
                         {
                             window.dispatch_action(action, cx);
                         }

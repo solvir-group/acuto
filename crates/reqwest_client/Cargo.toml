@@ -28,3 +28,7 @@ gpui_util.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 http_client_tls.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true
+rustls-platform-verifier.workspace = true

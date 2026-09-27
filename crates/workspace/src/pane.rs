@@ -3112,7 +3112,16 @@ impl Pane {
                     } else {
                         None
                     })
-                    .child(label)
+                    // A hard limit on how wide a title may make its tab, so one
+                    // long name cannot push the others off the strip. The tab's
+                    // tooltip still shows the whole title.
+                    .child(
+                        div()
+                            .min_w_0()
+                            .max_w(px(160.))
+                            .overflow_hidden()
+                            .child(label),
+                    )
                     .map(|this| match tab_tooltip_content {
                         Some(TabTooltipContent::Text(text)) => {
                             if capability.editable() {
@@ -4491,6 +4500,21 @@ fn default_render_tab_bar_buttons(
                                 "New Center Terminal",
                                 NewCenterTerminal::default().boxed_clone(),
                             )
+                            .separator()
+                            // Closes the pane by closing everything in it: an
+                            // empty pane is removed by the workspace, so there
+                            // is no separate "close pane" to dispatch. Pinned
+                            // tabs are left alone -- pinning is the user saying
+                            // "not this one", and a menu item should not
+                            // override that.
+                            .action(
+                                "Close Pane",
+                                CloseAllItems {
+                                    save_intent: None,
+                                    close_pinned: false,
+                                }
+                                .boxed_clone(),
+                            )
                     }))
                 }),
         )
@@ -4744,6 +4768,12 @@ impl Render for Pane {
                     .relative()
                     .group("")
                     .overflow_hidden()
+                    // On a see-through theme only the window frame is glass.
+                    // Whatever a tab holds -- a panel opened as a tab, the
+                    // launchpad -- sits on the same white card as the editor.
+                    .when(cx.theme().colors().background.a < 1.0, |div| {
+                        div.bg(cx.theme().colors().editor_background)
+                    })
                     .on_drag_move::<DraggedTab>(cx.listener(Self::handle_drag_move))
                     .on_drag_move::<DraggedSelection>(cx.listener(Self::handle_drag_move))
                     .when(accepts_external_paths, |div| {

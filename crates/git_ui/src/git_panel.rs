@@ -90,7 +90,7 @@ use theme_settings::ThemeSettings;
 use time::OffsetDateTime;
 use ui::{
     ButtonLike, Checkbox, Chip, ContextMenu, ContextMenuEntry, Divider, DocumentationSide,
-    ElevationIndex, IndentGuideColors, KeyBinding, PopoverMenu, PopoverMenuHandle,
+    ElevationIndex, FileIcon, IndentGuideColors, KeyBinding, PopoverMenu, PopoverMenuHandle,
     ProjectEmptyState, ScrollAxes, Scrollbars, SplitButton, Tab, TintColor, Tooltip, WithScrollbar,
     prelude::*,
 };
@@ -1162,6 +1162,25 @@ pub(crate) fn commit_message_editor(
     let placeholder = placeholder.unwrap_or("Enter commit message".into());
     commit_editor.set_placeholder_text(&placeholder, window, cx);
     commit_editor
+}
+
+/// The single letter a source-control list marks a file with.
+///
+/// The same vocabulary git itself uses in `git status --short`, which is also
+/// what every other editor's source-control panel shows: whatever someone has
+/// learned elsewhere transfers here without being relearned.
+fn status_letter(status: FileStatus) -> &'static str {
+    if status.is_conflicted() {
+        "U"
+    } else if status.is_created() {
+        "A"
+    } else if status.is_deleted() {
+        "D"
+    } else if status.is_modified() {
+        "M"
+    } else {
+        ""
+    }
 }
 
 impl GitPanel {
@@ -5858,18 +5877,13 @@ impl GitPanel {
     }
 
     pub fn commit_button_title(&self) -> &'static str {
+        // Plain verbs. "Commit Tracked" named an implementation detail --
+        // which files get included when nothing is staged -- on the one button
+        // everyone presses; what it commits is already listed right above it.
         if self.amend_pending {
-            if self.has_staged_changes() {
-                "Amend"
-            } else if self.has_tracked_changes() {
-                "Amend Tracked"
-            } else {
-                "Amend"
-            }
-        } else if self.has_staged_changes() {
-            "Commit"
+            "Amend"
         } else {
-            "Commit Tracked"
+            "Commit"
         }
     }
 
@@ -5991,98 +6005,16 @@ impl GitPanel {
         )
     }
 
-    /// A proportional bar over the working tree: staged, modified, new,
-    /// conflicted.
+    /// The working tree in one line: how many files are in each state.
     ///
-    /// The list already says what changed, one row at a time. What it does not
-    /// say is the shape of the change -- whether this is three staged files or
-    /// forty untracked ones -- and that is the thing you want before deciding
-    /// whether to commit, and the thing you currently have to count rows to
-    /// learn. A bar answers it without reading.
+    /// The list says what changed, a row at a time. It does not say the shape
+    /// of the change -- three staged files or forty untracked ones -- and that
+    /// is what you want before deciding whether to commit.
     ///
-    /// Hidden when there is nothing to summarise: an empty bar is furniture.
-    fn render_change_summary(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
-        self.active_repository.as_ref()?;
-
-        let staged = self.total_staged_count();
-        let conflicted = self.conflicted_count.saturating_sub(self.conflicted_staged_count);
-        let modified = self
-            .tracked_count
-            .saturating_sub(self.tracked_staged_count);
-        let new = self.new_count.saturating_sub(self.new_staged_count);
-
-        let total = staged + conflicted + modified + new;
-        if total == 0 {
-            return None;
-        }
-
-        let status = cx.theme().status();
-        let colors = cx.theme().colors();
-
-        // Order matters: the segments read left to right in the order the work
-        // moves -- conflicted, then untracked, then modified, then staged.
-        let segments = [
-            (conflicted, status.conflict, "conflicted"),
-            (new, colors.text_muted, "new"),
-            (modified, status.modified, "modified"),
-            (staged, status.created, "staged"),
-        ];
-
-        let bar = h_flex()
-            .w_full()
-            .h(px(3.))
-            .rounded_full()
-            .overflow_hidden()
-            .bg(colors.element_background)
-            .children(segments.iter().filter(|(count, _, _)| *count > 0).map(
-                |(count, color, key)| {
-                    div()
-                        .id(*key)
-                        .h_full()
-                        // `flex_basis` in percent rather than a fixed width, so
-                        // the bar keeps its proportions as the panel resizes.
-                        .flex_basis(relative(*count as f32 / total as f32))
-                        .bg(*color)
-                },
-            ));
-
-        let counts = h_flex()
-            .w_full()
-            .gap_2()
-            .flex_wrap()
-            .children(
-                segments
-                    .iter()
-                    .filter(|(count, _, _)| *count > 0)
-                    .map(|(count, color, key)| {
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .size(px(6.))
-                                    .rounded_full()
-                                    .bg(*color),
-                            )
-                            .child(
-                                Label::new(format!("{count} {key}"))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                    }),
-            );
-
-        Some(
-            v_flex()
-                .w_full()
-                .flex_none()
-                .px_2()
-                .pb_1p5()
-                .gap_1p5()
-                .child(bar)
-                .child(counts),
-        )
-    }
-
+    /// Chips rather than the proportional bar this replaced: a thin bar above a
+    /// legend was two pieces of furniture explaining one number each, and read
+    /// as a stray progress indicator. A chip is the colour, the count and the
+    /// word in the space the legend alone was taking.
     fn render_changes_header(
         &self,
         _window: &mut Window,
@@ -6097,13 +6029,14 @@ impl GitPanel {
         let diff_stat_total = self.diff_stat_total;
 
         Some(
+            // A thin action strip, not a row the height of a tab. With the
+            // message box above it this sits between the two things the panel
+            // is for, so every pixel it takes is a pixel of file list.
             h_flex()
-                .min_h(Tab::container_height(cx))
                 .w_full()
-                .pl_1()
-                .pr_2()
+                .px_1()
+                .py_0p5()
                 .flex_none()
-                .flex_wrap()
                 .gap_1()
                 .justify_between()
                 .child(
@@ -6118,7 +6051,7 @@ impl GitPanel {
                                 )
                                 .child(
                                     Label::new("View Diff")
-                                        .size(LabelSize::Small)
+                                        .size(LabelSize::XSmall)
                                         .color(Color::Muted),
                                 )
                                 .when(
@@ -6188,7 +6121,6 @@ impl GitPanel {
         let panel_editor_style =
             git_commit_editor_style(settings.git_commit_buffer_font_size(cx), cx);
         let enable_coauthors = self.render_co_authors(cx);
-        let editor_focus_handle = self.commit_editor.focus_handle(cx);
         let branch = active_repository.read(cx).branch.clone();
         let head_commit = active_repository.read(cx).head_commit.clone();
 
@@ -6221,25 +6153,9 @@ impl GitPanel {
             .p_1p5()
             .opacity(0.6)
             .hover(|s| s.opacity(1.0))
-            .child(
-                IconButton::new("expand-commit-editor", IconName::MaximizeAlt)
-                    .icon_size(IconSize::Small)
-                    .tooltip({
-                        move |_window, cx| {
-                            Tooltip::for_action_in(
-                                "Open Commit Modal",
-                                &git::ExpandCommitEditor,
-                                &editor_focus_handle,
-                                cx,
-                            )
-                        }
-                    })
-                    .on_click(cx.listener({
-                        move |_, _, window, cx| {
-                            window.dispatch_action(git::ExpandCommitEditor.boxed_clone(), cx)
-                        }
-                    })),
-            )
+            // No "open commit modal" button: the message is written here, and a
+            // larger box popping up over the editor to write the same message
+            // was a detour. Growing this box in place is still one button below.
             .child({
                 let (icon, label) = if self.commit_editor_expanded {
                     (IconName::Minimize, "Collapse Commit Editor")
@@ -6300,7 +6216,6 @@ impl GitPanel {
             .child(
                 panel_editor_container(window, cx)
                     .id("commit-editor-container")
-                    .w_full()
                     .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
                     // Same frame as the agent composer: a full border and a
                     // rounded corner, inset from the panel edges, rather than a
@@ -6598,10 +6513,16 @@ impl GitPanel {
                 .flex_1()
                 .justify_center()
                 .hover(|s| s.bg(cx.theme().colors().element_hover))
-                .border_b_1()
-                .when(!active, |s| {
-                    s.bg(cx.theme().colors().editor_background.opacity(0.6))
-                        .border_color(cx.theme().colors().border.opacity(0.6))
+                // The active tab is the one with the mark under it. Previously
+                // the inactive tab carried the background and the border, so
+                // the tab you were not on was the one that looked selected.
+                .border_b_2()
+                .map(|this| {
+                    if active {
+                        this.border_color(cx.theme().colors().text_accent)
+                    } else {
+                        this.border_color(gpui::transparent_black())
+                    }
                 })
                 .child(Label::new(label.clone()).when(!active, |this| this.color(Color::Muted)))
                 .when(show_changes && self.changes_count > 0, |this| {
@@ -7040,15 +6961,35 @@ impl GitPanel {
                                             .flex_none()
                                     };
 
+                                    // A card per commit rather than a line per
+                                    // commit. History is the one part of a git
+                                    // panel that is read rather than acted on --
+                                    // subject, author, when, what it touched --
+                                    // and a flat list of rows makes four facts
+                                    // about one commit look like four unrelated
+                                    // lines. Giving each its own surface groups
+                                    // them, and the gap between cards does the
+                                    // separating that a divider used to.
                                     v_flex()
                                         .id(("commit-history-item", index))
                                         .cursor_pointer()
                                         .w_full()
-                                        .py_1()
+                                        .mx_1p5()
+                                        .my_0p5()
+                                        .py_1p5()
                                         .px_2()
-                                        .gap_0p5()
+                                        .gap_1()
+                                        .rounded_md()
+                                        .bg(cx.theme().colors().element_background)
                                         .border_1()
-                                        .border_color(gpui::transparent_black())
+                                        .border_color(cx.theme().colors().border_variant)
+                                        // Unpushed work gets a coloured edge: it
+                                        // is the one state in this list that
+                                        // means "you still have something to do".
+                                        .when(is_unpushed, |this| {
+                                            this.border_l_2()
+                                                .border_color(cx.theme().status().modified)
+                                        })
                                         .when(
                                             is_focused && is_panel_focused && show_focus_border,
                                             |this| {
@@ -7626,14 +7567,13 @@ impl GitPanel {
             .group(group_name)
             .h(self.list_item_height())
             .w_full()
-            .pl_2p5()
+            .pl(px(6.))
             .pr_1()
             .gap_2()
             .justify_between()
             .cursor_pointer()
+            .rounded_sm()
             .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-            .border_1()
-            .border_r_2()
             .child(
                 h_flex()
                     .gap_1()
@@ -7647,9 +7587,9 @@ impl GitPanel {
                         .color(Color::Muted),
                     )
                     .child(
-                        Label::new(header.title())
+                        Label::new(header.title().to_uppercase())
                             .color(Color::Muted)
-                            .size(LabelSize::Small),
+                            .size(LabelSize::XSmall),
                     )
                     // How many files are under this heading. "Changes" alone is
                     // a label; "Changes 12" is information, and it is the number
@@ -8008,18 +7948,24 @@ impl GitPanel {
             .flex_1()
             .gap_1()
             .when(settings.file_icons, |this| {
+                // Drawn through `FileIcon` rather than `Icon::from_path`, so a
+                // colour icon theme looks the same here as in the project panel
+                // and the tab strip. `Icon` always takes the monochrome path,
+                // which flattens a vscode-icons mark into a solid silhouette --
+                // leaving the git panel the one list in the app showing a
+                // different set of icons from every other.
+                //
+                // The tint still matters for monochrome themes, where it is the
+                // same language colour the project panel uses: a changes list is
+                // read by scanning it, and colour is what tells you whether what
+                // you are after is on screen before you have read a filename.
+                let icon_color = file_icons::icon_color(entry.repo_path.as_std_path(), cx)
+                    .unwrap_or_else(|| Color::Muted.color(cx));
+                let colored = theme::GlobalTheme::icon_theme(cx).colored;
                 this.child(
-                    file_icon
-                        .map(|file_icon| {
-                            Icon::from_path(file_icon)
-                                .size(IconSize::Small)
-                                .color(Color::Muted)
-                        })
-                        .unwrap_or_else(|| {
-                            Icon::new(IconName::File)
-                                .size(IconSize::Small)
-                                .color(Color::Muted)
-                        }),
+                    FileIcon::new(file_icon, colored)
+                        .size(IconSize::Small)
+                        .color(icon_color),
                 )
             })
             .when(status_style != StatusStyle::LabelColor, |el| {
@@ -8047,22 +7993,62 @@ impl GitPanel {
 
         let id_for_diff_stat = id.clone();
 
+        // A left stripe in the status's own colour, rather than a right
+        // border in no colour at all. The stripe is where every changes list
+        // puts it, and colouring it by status makes a glance down the left edge
+        // of the panel a summary of what kind of change each row is.
+        let stripe_color = if has_conflict {
+            Some(cx.theme().status().conflict)
+        } else if is_created {
+            Some(cx.theme().status().created)
+        } else if is_deleted {
+            Some(cx.theme().status().deleted)
+        } else if is_modified {
+            Some(cx.theme().status().modified)
+        } else {
+            None
+        };
+
         h_flex()
             .id(id)
             .h(self.list_item_height())
             .w_full()
-            .pl_2p5()
             .pr_1()
             .gap_1p5()
-            .border_1()
-            .border_r_2()
+            .rounded_sm()
             .when(selected && self.focus_handle.is_focused(window), |el| {
-                el.border_color(cx.theme().colors().panel_focused_border)
+                el.border_1()
+                    .border_color(cx.theme().colors().panel_focused_border)
             })
             .bg(base_bg)
             .hover(|s| s.bg(hover_bg))
             .active(|s| s.bg(active_bg))
-            .child(name_row)
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(2.))
+                    .h_full()
+                    .when_some(stripe_color, |this, color| {
+                        // Dimmed until the row is the one you are on. At full
+                        // strength on every row the stripes read as a barcode
+                        // down the edge of the panel.
+                        this.bg(color.opacity(if selected { 1.0 } else { 0.5 }))
+                    }),
+            )
+            .child(div().flex_1().min_w_0().pl_1().child(name_row))
+            .child(
+                Label::new(status_letter(status))
+                    .size(LabelSize::Small)
+                    .color(if has_conflict {
+                        Color::VersionControlConflict
+                    } else if is_created {
+                        Color::VersionControlAdded
+                    } else if is_deleted {
+                        Color::VersionControlDeleted
+                    } else {
+                        Color::VersionControlModified
+                    }),
+            )
             .when(GitPanelSettings::get_global(cx).diff_stats, |el| {
                 el.when_some(entry.diff_stat, move |this, stat| {
                     let id = format!("diff-stat-{}", id_for_diff_stat);
@@ -8256,14 +8242,14 @@ impl GitPanel {
             .h(self.list_item_height())
             .min_w_0()
             .w_full()
-            .pl_2p5()
+            .pl(px(6.))
             .pr_1()
             .gap_1p5()
             .justify_between()
-            .border_1()
-            .border_r_2()
+            .rounded_sm()
             .when(selected && self.focus_handle.is_focused(window), |el| {
-                el.border_color(cx.theme().colors().panel_focused_border)
+                el.border_1()
+                    .border_color(cx.theme().colors().panel_focused_border)
             })
             .bg(base_bg)
             .hover(|s| s.bg(hover_bg))
@@ -8703,10 +8689,12 @@ impl Render for GitPanel {
                     })
                     .map(|this| match self.active_tab {
                         GitPanelTab::Changes => this
+                            // The message box first. It is what the panel is
+                            // for, and putting it under the file list meant the
+                            // one control used on every visit moved further
+                            // down the longer the list of changes got.
+                            .children(self.render_footer(window, cx))
                             .children(self.render_changes_header(window, cx))
-                            .when(!self.commit_editor_expanded, |this| {
-                                this.children(self.render_change_summary(cx))
-                            })
                             .when(!self.commit_editor_expanded, |this| {
                                 this.map(|this| {
                                     if let Some(repo) = self.active_repository.clone()
@@ -8723,7 +8711,6 @@ impl Render for GitPanel {
                                     }
                                 })
                             })
-                            .children(self.render_footer(window, cx))
                             .when(self.amend_pending, |this| {
                                 this.child(self.render_pending_amend(cx))
                             })
@@ -8859,7 +8846,16 @@ impl PanelHeader for GitPanel {}
 
 pub fn panel_editor_container(_window: &mut Window, cx: &mut App) -> Div {
     v_flex()
-        .size_full()
+        // Width only. `size_full` also pinned the height to the panel's, which
+        // was invisible while this sat at the bottom of the column -- the list
+        // above had already taken its share, so "all remaining space" and "all
+        // space" looked the same. Moved above the list, it claimed the lot and
+        // the file list rendered at zero height, which reads as the panel not
+        // opening at all. The expanded case adds `flex_1` where it wants the
+        // room.
+        // No `w_full`: callers inset this box with a margin, and a width of
+        // 100% is measured before that margin is added, which pushed the right
+        // edge out under the panel border.
         // `element_background`, matching the agent composer: an input should
         // read as a raised surface sitting on the panel, not as a hole punched
         // through it. `editor_background` is the colour of the void behind a
@@ -8871,15 +8867,22 @@ pub(crate) fn git_commit_editor_style(font_size: gpui::Pixels, cx: &App) -> Edit
     let settings = ThemeSettings::get_global(cx);
 
     EditorStyle {
-        background: cx.theme().colors().editor_background,
+        // Transparent, so the container behind it supplies the colour. Painting
+        // `editor_background` here put the colour of a buffer's void inside a
+        // frame drawn in `element_background`, which read as a dark rectangle
+        // sitting in a lighter box rather than as one input.
+        background: gpui::transparent_black(),
         local_player: cx.theme().players().local(),
+        // The UI font, not the buffer font. A commit message is prose about
+        // code, not code: setting it in the monospace face made the box read as
+        // another editor pane rather than as something you write in.
         text: TextStyle {
             color: cx.theme().colors().text,
-            font_family: settings.buffer_font.family.clone(),
-            font_fallbacks: settings.buffer_font.fallbacks.clone(),
-            font_features: settings.buffer_font.features.clone(),
+            font_family: settings.ui_font.family.clone(),
+            font_fallbacks: settings.ui_font.fallbacks.clone(),
+            font_features: settings.ui_font.features.clone(),
             font_size: AbsoluteLength::from(font_size),
-            font_weight: settings.buffer_font.weight,
+            font_weight: settings.ui_font.weight,
             line_height: (font_size * settings.buffer_line_height.value()).into(),
             ..Default::default()
         },

@@ -20,6 +20,9 @@ pub struct IconThemeFamily {
 /// An icon theme.
 #[derive(Debug, PartialEq)]
 pub struct IconTheme {
+    /// Whether this theme's icons carry their own colour, and so must be drawn
+    /// rather than tinted. See [`IconThemeContent::colored`].
+    pub colored: bool,
     /// The unique ID for the icon theme.
     pub id: String,
     /// The name of the icon theme.
@@ -421,16 +424,29 @@ fn icon_keys_by_association(
 }
 
 /// The name of the default icon theme.
-pub const DEFAULT_ICON_THEME_NAME: &str = "Zed (Default)";
+pub const DEFAULT_ICON_THEME_NAME: &str = "Acuto";
 
-static DEFAULT_ICON_THEME: LazyLock<Arc<IconTheme>> = LazyLock::new(|| {
-    Arc::new(IconTheme {
-        id: "zed".into(),
-        name: DEFAULT_ICON_THEME_NAME.into(),
+/// The name of the icon theme that draws directories as disclosure arrows.
+pub const MINIMAL_ICON_THEME_NAME: &str = "Acuto Minimal";
+
+/// Builds a bundled icon theme.
+///
+/// Every bundled theme shares the file glyphs and differs only in how a
+/// directory is drawn, so adding another is a matter of naming two SVGs.
+fn bundled_icon_theme(
+    id: &'static str,
+    name: &'static str,
+    collapsed_directory: &'static str,
+    expanded_directory: &'static str,
+) -> IconTheme {
+    IconTheme {
+        colored: false,
+        id: id.into(),
+        name: name.into(),
         appearance: Appearance::Dark,
         directory_icons: DirectoryIcons {
-            collapsed: Some("icons/file_icons/folder.svg".into()),
-            expanded: Some("icons/file_icons/folder_open.svg".into()),
+            collapsed: Some(collapsed_directory.into()),
+            expanded: Some(expanded_directory.into()),
         },
         named_directory_icons: HashMap::default(),
         chevron_icons: ChevronIcons {
@@ -447,8 +463,34 @@ static DEFAULT_ICON_THEME: LazyLock<Arc<IconTheme>> = LazyLock::new(|| {
                 },
             )
         })),
-    })
+    }
+}
+
+static DEFAULT_ICON_THEME: LazyLock<Arc<IconTheme>> = LazyLock::new(|| {
+    Arc::new(bundled_icon_theme(
+        "acuto",
+        DEFAULT_ICON_THEME_NAME,
+        "icons/file_icons/folder.svg",
+        "icons/file_icons/folder_open.svg",
+    ))
 });
+
+static MINIMAL_ICON_THEME: LazyLock<Arc<IconTheme>> = LazyLock::new(|| {
+    // No folder glyphs at all. The chevron beside them already says open or
+    // closed, so the folder icon is the same information drawn twice, and
+    // dropping it puts every directory name a column further left.
+    Arc::new(bundled_icon_theme(
+        "acuto-minimal",
+        MINIMAL_ICON_THEME_NAME,
+        "icons/file_icons/chevron_right.svg",
+        "icons/file_icons/chevron_down.svg",
+    ))
+});
+
+/// Returns the icon themes that ship with the editor.
+pub fn bundled_icon_themes() -> [Arc<IconTheme>; 2] {
+    [DEFAULT_ICON_THEME.clone(), MINIMAL_ICON_THEME.clone()]
+}
 
 /// Returns the default icon theme.
 pub fn default_icon_theme() -> Arc<IconTheme> {

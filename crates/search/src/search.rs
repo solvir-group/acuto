@@ -19,11 +19,13 @@ use crate::project_search::ProjectSearchBar;
 
 pub mod buffer_search;
 pub mod project_search;
+pub mod search_panel;
 pub(crate) mod search_bar;
 pub mod search_status_button;
 pub mod text_finder;
 
 pub fn init(cx: &mut App) {
+    search_panel::init(cx);
     menu::init();
     buffer_search::init(cx);
     project_search::init(cx);

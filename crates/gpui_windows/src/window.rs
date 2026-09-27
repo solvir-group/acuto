@@ -885,6 +885,11 @@ impl PlatformWindow for WindowsWindow {
         // others follow the set_window_composition_attribute approach
         match background_appearance {
             WindowBackgroundAppearance::Opaque => {
+                // DWMSBT_NONE, and retract the frame: switching from a glass
+                // theme back to an opaque one otherwise leaves the window
+                // extended and the edges translucent.
+                dwm_set_window_composition_attribute(hwnd, 1);
+                dwm_extend_frame(hwnd, false);
                 set_window_composition_attribute(hwnd, None, 0);
             }
             WindowBackgroundAppearance::Transparent => {
@@ -892,6 +897,15 @@ impl PlatformWindow for WindowsWindow {
             }
             WindowBackgroundAppearance::Blurred => {
                 set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+            }
+            WindowBackgroundAppearance::AcrylicBackdrop => {
+                // DWMSBT_TRANSIENTWINDOW => Acrylic.
+                //
+                // Deliberately not the ACCENT_ENABLE_ACRYLICBLURBEHIND path
+                // that `Blurred` uses: that is the Windows 10 private API, and
+                // on Windows 11 22H2+ it is deprecated and paints the window
+                // solid black rather than translucent.
+                dwm_set_window_composition_attribute(hwnd, 3);
             }
             WindowBackgroundAppearance::MicaBackdrop => {
                 // DWMSBT_MAINWINDOW => MicaBase
@@ -1539,6 +1553,43 @@ fn retrieve_window_placement(
     Ok(placement)
 }
 
+/// Extends the DWM frame across the whole window, or pulls it back.
+///
+/// A system backdrop is painted by DWM into the *frame*, and shows through the
+/// client area only where the frame has been extended into it. Zed draws its
+/// own title bar and has no visible frame, so without this the backdrop is
+/// composited into a region of zero height and nothing appears -- which is why
+/// Mica and Acrylic both looked like they did nothing at all.
+///
+/// A margin of -1 is the documented "extend into the entire client area".
+fn dwm_extend_frame(hwnd: HWND, extend: bool) {
+    // Extended up from the bottom edge rather than as a -1 "sheet of glass".
+    // The sheet includes the top caption row, and DWM draws the system
+    // minimise, maximise and close buttons in any extended caption -- on top of
+    // the window's own, so a custom title bar showed two sets. A bottom margin
+    // taller than any window still puts the backdrop behind the whole client
+    // area while leaving the caption row unextended.
+    const TALLER_THAN_ANY_WINDOW: i32 = 16_384;
+    let margins = if extend {
+        MARGINS {
+            cxLeftWidth: 0,
+            cxRightWidth: 0,
+            cyTopHeight: 0,
+            cyBottomHeight: TALLER_THAN_ANY_WINDOW,
+        }
+    } else {
+        MARGINS {
+            cxLeftWidth: 0,
+            cxRightWidth: 0,
+            cyTopHeight: 0,
+            cyBottomHeight: 0,
+        }
+    };
+
+    unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) }
+        .log_err();
+}
+
 fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
     let mut version = unsafe { std::mem::zeroed() };
     let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
@@ -1561,6 +1612,10 @@ fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
             return;
         }
     }
+
+    // The attribute alone is not enough: without the frame extended there is
+    // nowhere for DWM to composite the material.
+    dwm_extend_frame(hwnd, backdrop_type != 0);
 }
 
 fn set_window_composition_attribute(hwnd: HWND, color: Option<Color>, state: u32) {

@@ -27,6 +27,8 @@ use futures::{AsyncReadExt as _, AsyncWriteExt as _, StreamExt as _};
 use gpui::{Anchor, Task};
 use ui::prelude::*;
 use ui::{ContextMenu, Tooltip, right_click_menu};
+use task::{RevealStrategy, SpawnInTerminal};
+use terminal_view::terminal_panel::TerminalPanel;
 use util::ResultExt as _;
 use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
@@ -134,6 +136,18 @@ impl ChangeLog {
         self.styles_only.store(all_styles, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
+
+    /// Records that something changed without knowing what.
+    ///
+    /// Used when the filesystem disagrees with the watcher. A full reload
+    /// rather than a stylesheet swap, because the whole point of arriving here
+    /// is that the changed paths are unknown -- and swapping stylesheets when
+    /// the change was actually a script leaves the old script running against
+    /// new markup, which is worse than the reload it was avoiding.
+    fn record_unknown(&self) {
+        self.styles_only.store(false, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone)]
@@ -175,11 +189,69 @@ impl LiveServerButton {
         Some(worktree.read(cx).abs_path())
     }
 
-    fn toggle(&mut self, cx: &mut Context<Self>) {
+    fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.state {
             ServerState::Running { .. } => self.stop(cx),
-            ServerState::Stopped | ServerState::Failed(_) => self.start(cx),
+            ServerState::Stopped | ServerState::Failed(_) => self.start(window, cx),
         }
+    }
+
+    /// Starts the project's own dev server in the terminal.
+    ///
+    /// Deliberately not supervised or proxied by this button. A dev server is a
+    /// long-running process with output worth reading -- compile errors, the URL
+    /// it chose, the port it fell back to -- and hiding it behind a status dot
+    /// would throw all of that away. The terminal already linkifies the URL it
+    /// prints, which is both more accurate than guessing a port and correct when
+    /// the usual one was taken.
+    fn start_dev_server(
+        &mut self,
+        script: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let command = format!("npm run {script}");
+        let label = format!("Dev server ({script})");
+        let task = SpawnInTerminal {
+            id: task::TaskId("acuto-dev-server".into()),
+            full_label: label.clone(),
+            label: label.clone(),
+            command: Some(command.clone()),
+            args: Vec::new(),
+            command_label: command,
+            cwd: None,
+            env: Default::default(),
+            use_new_terminal: true,
+            allow_concurrent_runs: false,
+            reveal: RevealStrategy::Always,
+            reveal_target: zed_actions::RevealTarget::Dock,
+            hide: task::HideStrategy::Never,
+            shell: task::Shell::System,
+            show_summary: true,
+            show_command: true,
+            show_rerun: true,
+            save: task::SaveStrategy::None,
+        };
+
+        workspace.update(cx, |workspace, cx| {
+            let Some(panel) = workspace.panel::<TerminalPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                panel
+                    .add_terminal_task(task, RevealStrategy::Always, window, cx)
+                    .detach_and_log_err(cx);
+            });
+        });
+
+        // Not `Running`: nothing is being served from here, so claiming a port
+        // and offering to stop it would both be lies.
+        self.state = ServerState::Stopped;
+        cx.notify();
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -189,12 +261,17 @@ impl LiveServerButton {
         cx.notify();
     }
 
-    fn start(&mut self, cx: &mut Context<Self>) {
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.document_root(cx) else {
             self.state = ServerState::Failed("Open a folder first".into());
             cx.notify();
             return;
         };
+
+        if let Some(script) = dev_server_script(&root) {
+            self.start_dev_server(script, window, cx);
+            return;
+        }
 
         let Some(fs) = self
             .workspace
@@ -323,8 +400,8 @@ impl Render for LiveServerButton {
                     .tooltip(Tooltip::text(tooltip.clone()))
                     .on_click({
                         let entity = entity.clone();
-                        move |_, _, cx| {
-                            entity.update(cx, |this, cx| this.toggle(cx));
+                        move |_, window, cx| {
+                            entity.update(cx, |this, cx| this.toggle(window, cx));
                         }
                     })
             })
@@ -334,8 +411,8 @@ impl Render for LiveServerButton {
                     menu.header("Live Server")
                         .entry(if running { "Stop" } else { "Start" }, None, {
                             let entity = entity.clone();
-                            move |_, cx| {
-                                entity.update(cx, |this, cx| this.toggle(cx));
+                            move |window, cx| {
+                                entity.update(cx, |this, cx| this.toggle(window, cx));
                             }
                         })
                         .when(running, |menu| {
@@ -393,7 +470,7 @@ async fn serve_connection(
             .find_map(|pair| pair.strip_prefix("since="))
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
-        await_change(since, &changes).await
+        await_change(since, &changes, &root).await
     } else {
         serve_path(path, &root).await
     };
@@ -438,14 +515,36 @@ async fn read_request_target(stream: &mut smol::net::TcpStream) -> Option<String
 }
 
 /// Holds a reload poll open until something changes, or until it times out.
-async fn await_change(since: u64, changes: &ChangeLog) -> Vec<u8> {
+async fn await_change(since: u64, changes: &ChangeLog, root: &Path) -> Vec<u8> {
     /// How often the poll re-checks. Small enough to feel immediate, large
     /// enough that an idle page costs nothing measurable.
     const TICK: Duration = Duration::from_millis(100);
 
+    /// How often the poll checks the filesystem itself rather than only the
+    /// watcher's counter.
+    ///
+    /// Ten times less often than the tick: walking the tree is far more
+    /// expensive than reading an atomic, and this is a safety net for events
+    /// the watcher dropped, not the mechanism anyone should be relying on.
+    const VERIFY_EVERY: u32 = 10;
+
     let deadline = std::time::Instant::now() + RELOAD_POLL_TIMEOUT;
+    let baseline = fingerprint(root).await;
+    let mut ticks: u32 = 0;
+
     loop {
-        let current = changes.generation.load(Ordering::SeqCst);
+        let mut current = changes.generation.load(Ordering::SeqCst);
+
+        // The watcher missed it. Bump the counter so every other client polling
+        // this server agrees a change happened, rather than each discovering it
+        // separately and reporting a different generation.
+        if current == since && ticks > 0 && ticks % VERIFY_EVERY == 0 {
+            if fingerprint(root).await != baseline {
+                changes.record_unknown();
+                current = changes.generation.load(Ordering::SeqCst);
+            }
+        }
+
         if current != since || std::time::Instant::now() >= deadline {
             let styles_only = changes.styles_only.load(Ordering::SeqCst);
             return http_response(
@@ -455,8 +554,67 @@ async fn await_change(since: u64, changes: &ChangeLog) -> Vec<u8> {
                     .into_bytes(),
             );
         }
+
+        ticks = ticks.saturating_add(1);
         smol::Timer::after(TICK).await;
     }
+}
+
+/// A cheap summary of the served tree: how many files it holds and the latest
+/// modification time among them.
+///
+/// Deliberately not a hash of the contents. This runs several times a second
+/// while a page is open, and reading every file to answer "did anything change"
+/// would make the live server the most expensive thing in the process. Count
+/// plus newest mtime catches edits, creations and deletions, which is every
+/// change that should reload a page.
+///
+/// Directories that never belong to a served site are skipped, because walking
+/// `node_modules` on every poll costs more than the whole rest of the feature.
+async fn fingerprint(root: &Path) -> (u64, u64) {
+    const SKIP: [&str; 5] = ["node_modules", ".git", "target", "dist", ".next"];
+    /// Depth beyond which a tree is assumed not to be a static site worth
+    /// watching, so a poll can never walk an unbounded hierarchy.
+    const MAX_DEPTH: usize = 8;
+
+    let mut count = 0u64;
+    let mut newest = 0u64;
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+
+    while let Some((directory, depth)) = stack.pop() {
+        let Ok(mut entries) = smol::fs::read_dir(&directory).await else {
+            continue;
+        };
+        while let Some(Ok(entry)) = smol::stream::StreamExt::next(&mut entries).await {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') && name != ".well-known" {
+                continue;
+            }
+            if SKIP.contains(&name.as_ref()) {
+                continue;
+            }
+
+            let Ok(metadata) = entry.metadata().await else {
+                continue;
+            };
+            if metadata.is_dir() {
+                if depth < MAX_DEPTH {
+                    stack.push((entry.path(), depth + 1));
+                }
+                continue;
+            }
+
+            count += 1;
+            if let Ok(modified) = metadata.modified()
+                && let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH)
+            {
+                newest = newest.max(since_epoch.as_millis() as u64);
+            }
+        }
+    }
+
+    (count, newest)
 }
 
 async fn serve_path(request_path: &str, root: &Path) -> Vec<u8> {
@@ -687,4 +845,28 @@ mod tests {
         let injected = String::from_utf8(inject_reload_script(fragment)).unwrap();
         assert!(injected.contains("acuto-live-reload"));
     }
+}
+
+/// The npm script that serves this project, when it is not a directory of files.
+///
+/// Read from `package.json` rather than inferred from a framework directory,
+/// because the script is what the user would run and what they will recognise.
+///
+/// A project with an `index.html` at its root is treated as static even when it
+/// has a dev script: that is a hand-written site with tooling attached, and
+/// serving it directly is what the button is for.
+fn dev_server_script(root: &Path) -> Option<String> {
+    if root.join("index.html").exists() {
+        return None;
+    }
+
+    let manifest = std::fs::read_to_string(root.join("package.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).ok()?;
+    let scripts = manifest.get("scripts")?.as_object()?;
+
+    // In the order a project is most likely to name it.
+    ["dev", "start", "serve"]
+        .into_iter()
+        .find(|name| scripts.contains_key(*name))
+        .map(str::to_string)
 }

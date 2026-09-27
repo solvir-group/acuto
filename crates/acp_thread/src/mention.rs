@@ -74,6 +74,15 @@ pub enum MentionUri {
         source: String,
         skill_file_path: PathBuf,
     },
+    /// A team ticket, carried into the prompt with everything said on it.
+    ///
+    /// Only the id and title travel in the link. The body is read from the
+    /// repository when the prompt is sent, so an agent handed a ticket sees its
+    /// current status and every reply, not a copy frozen when it was mentioned.
+    Ticket {
+        id: String,
+        title: String,
+    },
 }
 
 impl MentionUri {
@@ -147,7 +156,14 @@ impl MentionUri {
                 }
             }
             "zed" => {
-                if let Some(thread_id) = path.strip_prefix("/agent/thread/") {
+                if let Some(ticket_id) = path.strip_prefix("/agent/ticket/") {
+                    let title =
+                        single_query_param(&url, "title")?.unwrap_or_else(|| ticket_id.to_string());
+                    Ok(Self::Ticket {
+                        id: ticket_id.to_string(),
+                        title,
+                    })
+                } else if let Some(thread_id) = path.strip_prefix("/agent/thread/") {
                     let name = single_query_param(&url, "name")?.context("Missing thread name")?;
                     Ok(Self::Thread {
                         id: acp::SessionId::new(thread_id),
@@ -323,6 +339,7 @@ impl MentionUri {
             } => Some(skill_file_path),
             MentionUri::PastedImage { .. }
             | MentionUri::Thread { .. }
+            | MentionUri::Ticket { .. }
             | MentionUri::Rule { .. }
             | MentionUri::Diagnostics { .. }
             | MentionUri::Fetch { .. }
@@ -342,6 +359,7 @@ impl MentionUri {
             MentionUri::PastedImage { name } => name.clone(),
             MentionUri::Symbol { name, .. } => name.clone(),
             MentionUri::Thread { name, .. } => name.clone(),
+            MentionUri::Ticket { title, .. } => title.clone(),
             MentionUri::Rule { name, .. } => name.clone(),
             MentionUri::Diagnostics { .. } => "Diagnostics".to_string(),
             MentionUri::TerminalSelection { line_count } => {
@@ -443,6 +461,7 @@ impl MentionUri {
                 .unwrap_or_else(|| IconName::Folder.path().into()),
             MentionUri::Symbol { .. } => IconName::Code.path().into(),
             MentionUri::Thread { .. } => IconName::Thread.path().into(),
+            MentionUri::Ticket { .. } => IconName::ListTodo.path().into(),
             MentionUri::Rule { .. } => IconName::Reader.path().into(),
             MentionUri::Diagnostics { .. } => IconName::Warning.path().into(),
             MentionUri::TerminalSelection { .. } => IconName::Terminal.path().into(),
@@ -524,6 +543,12 @@ impl MentionUri {
                 let mut url = Url::parse("zed:///").unwrap();
                 url.set_path(&format!("/agent/thread/{id}"));
                 url.query_pairs_mut().append_pair("name", name);
+                url
+            }
+            MentionUri::Ticket { id, title } => {
+                let mut url = Url::parse("zed:///").unwrap();
+                url.set_path(&format!("/agent/ticket/{id}"));
+                url.query_pairs_mut().append_pair("title", title);
                 url
             }
             MentionUri::Rule { id, name } => {

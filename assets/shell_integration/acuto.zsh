@@ -22,7 +22,7 @@ ACUTO_SHELL_INTEGRATION_LOADED=1
 # Only meaningful when the terminal is actually Acuto. A user copying this into
 # another terminal gets a no-op rather than stray escape sequences painted on
 # their screen.
-if [[ "${TERM_PROGRAM:-}" != "Acuto" ]]; then
+if [[ "${ACUTO_TERM:-}" != "true" ]]; then
   return 0
 fi
 

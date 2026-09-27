@@ -106,7 +106,9 @@ struct ContactContextMenu {
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<CollabPanel>(window, cx);
+            // Opens as a centre-pane tab: this panel is registered with the
+            // workspace but not docked, so there is no dock focus to toggle.
+            workspace.open_panel_as_tab::<CollabPanel>(window, cx);
             if let Some(collab_panel) = workspace.panel::<CollabPanel>(cx) {
                 collab_panel.update(cx, |panel, cx| {
                     panel.filter_editor.update(cx, |editor, cx| {
@@ -118,9 +120,7 @@ pub fn init(cx: &mut App) {
             }
         });
         workspace.register_action(|workspace, _: &Toggle, window, cx| {
-            if !workspace.toggle_panel_focus::<CollabPanel>(window, cx) {
-                workspace.close_panel::<CollabPanel>(window, cx);
-            }
+            workspace.open_panel_as_tab::<CollabPanel>(window, cx);
         });
         workspace.register_action(|_, _: &OpenChannelNotes, window, cx| {
             let channel_id = ActiveCall::global(cx)
@@ -1459,7 +1459,7 @@ impl CollabPanel {
                             })
                             .detach_and_prompt_err("Failed to grant write access", window, cx, |e, _, _| {
                                 match e.error_code() {
-                                    ErrorCode::NeedsCla => Some("This user has not yet signed the CLA at https://zed.dev/cla.".into()),
+                                    ErrorCode::NeedsCla => Some("This user has not yet signed the contributor licence agreement.".into()),
                                     _ => None,
                                 }
                             })

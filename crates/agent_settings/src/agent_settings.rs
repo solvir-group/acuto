@@ -236,6 +236,12 @@ pub struct AgentSettings {
     pub expand_terminal_card: bool,
     pub terminal_mode: AgentTerminalMode,
     pub default_agent: DefaultAgent,
+    /// Whether an agent's edits are held for review before being settled.
+    pub review_changes: bool,
+    /// The agent the side panel opens, falling back to `default_agent`.
+    pub panel_agent: Option<DefaultAgent>,
+    /// The agent a centre-pane tab opens, falling back to `default_agent`.
+    pub tab_agent: Option<DefaultAgent>,
     pub restore_threads_sidebar: bool,
     pub terminal_init_command: Option<String>,
     pub thinking_display: ThinkingBlockDisplay,
@@ -279,7 +285,16 @@ impl AgentSettings {
     }
 
     pub fn set_message_editor_max_lines(&self) -> usize {
-        self.message_editor_min_lines * 2
+        /// How tall the composer may grow before it starts scrolling.
+        ///
+        /// Independent of the minimum. Deriving it as a multiple tied the two
+        /// together the wrong way round: a composer that starts small -- which
+        /// is what you want, since most prompts are a sentence -- also capped
+        /// how much of a long prompt you could see, so shrinking the resting
+        /// size made writing a paragraph worse.
+        const MAX: usize = 12;
+
+        self.message_editor_min_lines.max(MAX)
     }
 
     pub fn favorite_model_ids(&self) -> HashSet<SharedString> {
@@ -813,6 +828,9 @@ impl Settings for AgentSettings {
             expand_terminal_card: agent.expand_terminal_card.unwrap(),
             terminal_mode: agent.terminal_mode.unwrap(),
             default_agent: agent.default_agent.unwrap(),
+            review_changes: agent.review_changes.unwrap_or(false),
+            panel_agent: agent.panel_agent,
+            tab_agent: agent.tab_agent,
             restore_threads_sidebar: agent.restore_threads_sidebar.unwrap(),
             terminal_init_command: agent
                 .terminal_init_command

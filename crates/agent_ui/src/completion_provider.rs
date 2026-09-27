@@ -163,6 +163,7 @@ pub(crate) enum PromptContextType {
     Skill,
     Diagnostics,
     BranchDiff,
+    Ticket,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +248,7 @@ impl TryFrom<&str> for PromptContextType {
             "skill" => Ok(Self::Skill),
             "diagnostics" => Ok(Self::Diagnostics),
             "diff" => Ok(Self::BranchDiff),
+            "ticket" => Ok(Self::Ticket),
             _ => Err(format!("Invalid context picker mode: {}", value)),
         }
     }
@@ -262,6 +264,7 @@ impl PromptContextType {
             Self::Skill => "skill",
             Self::Diagnostics => "diagnostics",
             Self::BranchDiff => "branch diff",
+            Self::Ticket => "ticket",
         }
     }
 
@@ -274,6 +277,7 @@ impl PromptContextType {
             Self::Skill => "Skills",
             Self::Diagnostics => "Diagnostics",
             Self::BranchDiff => "Branch Diff",
+            Self::Ticket => "Tickets",
         }
     }
 
@@ -286,6 +290,7 @@ impl PromptContextType {
             Self::Skill => IconName::Sparkle,
             Self::Diagnostics => IconName::Warning,
             Self::BranchDiff => IconName::GitBranch,
+            Self::Ticket => IconName::ListTodo,
         }
     }
 }
@@ -299,6 +304,16 @@ pub(crate) enum Match {
     Skill(AvailableSkill),
     Entry(EntryMatch),
     BranchDiff(BranchDiffMatch),
+    Ticket(TicketMatch),
+}
+
+/// An open ticket from the repository's team notes.
+#[derive(Debug, Clone)]
+pub struct TicketMatch {
+    pub id: SharedString,
+    pub title: SharedString,
+    pub status: SharedString,
+    pub assignee: Option<SharedString>,
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +332,7 @@ impl Match {
             Match::Skill(_) => 1.,
             Match::Fetch(_) => 1.,
             Match::BranchDiff(_) => 1.,
+            Match::Ticket(_) => 1.,
         }
     }
 }
@@ -579,6 +595,56 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             icon_color: None,
             confirm: Some(confirm_completion_callback(
                 title,
+                source_range.start,
+                new_text_len - 1,
+                uri,
+                source,
+                editor,
+                mention_set,
+                workspace,
+            )),
+            group: None,
+        }
+    }
+
+    fn completion_for_ticket(
+        ticket: TicketMatch,
+        source_range: Range<Anchor>,
+        source: Arc<T>,
+        editor: WeakEntity<Editor>,
+        mention_set: WeakEntity<MentionSet>,
+        workspace: Entity<Workspace>,
+        cx: &mut App,
+    ) -> Completion {
+        let uri = MentionUri::Ticket {
+            id: ticket.id.to_string(),
+            title: ticket.title.to_string(),
+        };
+        let new_text = format!("{} ", uri.as_link());
+        let new_text_len = new_text.len();
+        let detail: SharedString = match &ticket.assignee {
+            Some(assignee) => format!("{} \u{00b7} @{assignee}", ticket.status).into(),
+            None => ticket.status.clone(),
+        };
+        let title: Arc<str> = ticket.title.as_ref().into();
+        let detail_highlight_id = cx
+            .theme()
+            .syntax()
+            .highlight_id("comment")
+            .map(HighlightId::new);
+        Completion {
+            replace_range: source_range.clone(),
+            new_text,
+            label: build_slash_item_label(&title, Some(&detail), detail_highlight_id),
+            documentation: None,
+            insert_text_mode: None,
+            source: project::CompletionSource::Custom,
+            match_start: None,
+            snippet_deduplication_key: None,
+            icon_path: Some(uri.icon_path(cx)),
+            icon_color: None,
+            confirm: Some(confirm_completion_callback(
+                ticket.title.clone(),
                 source_range.start,
                 new_text_len - 1,
                 uri,
@@ -1173,6 +1239,13 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                 })
             }
 
+            Some(PromptContextType::Ticket) => {
+                let search = search_tickets(query, &workspace, cx);
+                cx.background_spawn(async move {
+                    search.await.into_iter().map(Match::Ticket).collect()
+                })
+            }
+
             Some(PromptContextType::Diagnostics) => Task::ready(Vec::new()),
 
             Some(PromptContextType::BranchDiff) => Task::ready(Vec::new()),
@@ -1386,6 +1459,9 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
 
         if self.source.supports_context(PromptContextType::Thread, cx) {
             entries.push(PromptContextEntry::Mode(PromptContextType::Thread));
+        }
+        if self.source.supports_context(PromptContextType::Ticket, cx) {
+            entries.push(PromptContextEntry::Mode(PromptContextType::Ticket));
         }
 
         let has_active_selection = workspace.update(cx, |workspace, cx| {
@@ -1849,6 +1925,15 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                                             cx,
                                         ))
                                     }
+                                    Match::Ticket(ticket) => Some(Self::completion_for_ticket(
+                                        ticket,
+                                        source_range.clone(),
+                                        source.clone(),
+                                        editor.clone(),
+                                        mention_set.clone(),
+                                        workspace.clone(),
+                                        cx,
+                                    )),
                                     Match::Skill(skill) => Some(Self::completion_for_skill(
                                         skill,
                                         source_range.clone(),
@@ -3449,4 +3534,56 @@ mod tests {
             assert!(source.read_selection(workspace, false, cx).is_none());
         });
     }
+}
+
+
+/// Open tickets in the repository's team notes whose title or id contains the
+/// query, newest first.
+///
+/// Read from the notes file rather than from the team panel, so a ticket can be
+/// handed to an agent without the panel having been opened this session.
+fn search_tickets(
+    query: String,
+    workspace: &Entity<Workspace>,
+    cx: &mut App,
+) -> Task<Vec<TicketMatch>> {
+    let project = workspace.read(cx).project().read(cx);
+    let fs = project.fs().clone();
+    let roots: Vec<std::path::PathBuf> = project
+        .visible_worktrees(cx)
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+        .collect();
+    let query = query.to_lowercase();
+
+    cx.background_spawn(async move {
+        let mut tickets = Vec::new();
+        for root in roots {
+            let Ok(contents) = fs.load(&team_notes::notes_file(&root)).await else {
+                continue;
+            };
+            tickets.extend(
+                team_notes::parse(&contents)
+                    .into_iter()
+                    .filter(|record| {
+                        record.kind == team_notes::Kind::Ticket && !record.is_closed()
+                    })
+                    .filter(|record| {
+                        query.is_empty()
+                            || record.headline().to_lowercase().contains(&query)
+                            || record.id.to_lowercase().contains(&query)
+                    }),
+            );
+        }
+        // Ids sort by creation time, so reversing puts the newest work first.
+        tickets.sort_by(|a, b| b.id.cmp(&a.id));
+        tickets
+            .into_iter()
+            .map(|record| TicketMatch {
+                id: record.id.clone().into(),
+                title: record.headline().to_string().into(),
+                status: record.status.label().into(),
+                assignee: record.assignee.clone().map(Into::into),
+            })
+            .collect()
+    })
 }

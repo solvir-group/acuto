@@ -3120,6 +3120,7 @@ impl AcpThread {
         let update = update.into();
         let languages = self.project.read(cx).languages().clone();
         let path_style = self.project.read(cx).path_style(cx);
+        let tool_call_id = update.id().clone();
 
         let ix = match self.index_for_tool_call(update.id()) {
             Some(ix) => ix,
@@ -3180,6 +3181,11 @@ impl AcpThread {
                     .push(ToolCallContent::Terminal(update.terminal));
             }
         }
+
+        // Here as well as in `upsert_tool_call_inner`: a call's status and
+        // content arrive by either route, and the completion that triggers the
+        // reload usually comes as an update.
+        self.claim_agent_files(&tool_call_id, cx);
 
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
 
@@ -3253,8 +3259,150 @@ impl AcpThread {
             self.push_entry(AgentThreadEntry::ToolCall(call), cx);
         };
 
+        self.claim_agent_files(&id, cx);
         self.resolve_locations(id, cx);
         Ok(())
+    }
+
+    /// Claims the files a tool call reads or writes, so that edits an agent
+    /// makes to disk with its own tools reach review.
+    ///
+    /// What agents report about an edit is not a usable record of it: Claude
+    /// Code sends the replaced snippet, or nothing at all for a whole-file
+    /// write, never the file as it stood. So the file itself is the record,
+    /// taken here when the tool call is announced -- which is before the tool
+    /// runs -- and on reads, which an agent makes before it edits. Every
+    /// update to the call claims again; claiming is idempotent.
+    ///
+    /// Once the call has finished, the buffer is reloaded here rather than
+    /// left to the file watcher, whose timing is not something to build on.
+    /// The action log records that reload as the agent's edit.
+    fn claim_agent_files(&mut self, id: &acp::ToolCallId, cx: &mut Context<Self>) {
+        let Some(entry) = self
+            .index_for_tool_call(id)
+            .and_then(|ix| self.entries.get(ix))
+        else {
+            return;
+        };
+        let AgentThreadEntry::ToolCall(call) = entry else {
+            return;
+        };
+
+        let has_diff = call
+            .content
+            .iter()
+            .any(|content| matches!(content, ToolCallContent::Diff(_)));
+        let writes = has_diff
+            || matches!(
+                call.kind,
+                acp::ToolKind::Edit | acp::ToolKind::Delete | acp::ToolKind::Move
+            );
+        let reads = matches!(call.kind, acp::ToolKind::Read);
+        if !writes && !reads {
+            return;
+        }
+
+        // Reopening a thread replays its tool calls. Claiming a file then
+        // tracks it against the text it has *now*, which already contains every
+        // edit those calls made, so the agent's next real edit is measured from
+        // a base that hides it: the file changes on disk and review reports
+        // nothing to answer. History is not an edit in progress.
+        if !self.action_log.read(cx).agent_turn_active() {
+            return;
+        }
+        let finished = matches!(
+            call.status,
+            ToolCallStatus::Completed | ToolCallStatus::Failed
+        );
+
+        let mut paths: Vec<PathBuf> = call
+            .locations
+            .iter()
+            .map(|location| location.path.clone())
+            .collect();
+        for content in &call.content {
+            if let ToolCallContent::Diff(diff) = content
+                && let Some(path) = diff.read(cx).file_path(cx)
+            {
+                paths.push(PathBuf::from(path));
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() {
+            return;
+        }
+
+        let project = self.project.clone();
+        let action_log = self.action_log.clone();
+        cx.spawn(async move |_this, cx| {
+            for path in paths {
+                let open = project.update(cx, |project, cx| {
+                    let path = project.find_project_path(&path, cx)?;
+                    Some(project.open_buffer(path, cx))
+                });
+                let Some(open) = open else {
+                    log::warn!("agent diff: {path:?} is outside the project, not reviewed");
+                    continue;
+                };
+                let Some(buffer) = open.await.log_err() else {
+                    continue;
+                };
+
+                action_log.update(cx, |action_log, cx| {
+                    if writes {
+                        action_log.agent_will_write(buffer.clone(), cx);
+                    } else {
+                        action_log.agent_read(buffer.clone(), cx);
+                    }
+                });
+
+                // A buffer with unsaved edits is left alone: reloading it would
+                // throw them away.
+                if writes && finished {
+                    let reload = buffer.update(cx, |buffer, cx| {
+                        (!buffer.is_dirty()).then(|| buffer.reload(cx))
+                    });
+                    if let Some(reload) = reload {
+                        reload.await.ok();
+                    }
+                    log::info!("agent diff: {path:?} written by the agent");
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Reloads every file the agent has touched that the user has not edited,
+    /// so writes still in flight from disk are in the buffers.
+    fn settle_agent_files(&self, cx: &mut Context<Self>) -> Task<()> {
+        /// How long the end of a turn waits for files to catch up with the
+        /// disk. Long enough for any local write; short enough that a slow or
+        /// unreachable filesystem cannot leave the thread spinning forever.
+        const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let buffers = self.action_log.read(cx).tracked_buffers();
+        let reloads = buffers
+            .into_iter()
+            .filter_map(|buffer| {
+                buffer.update(cx, |buffer, cx| {
+                    (!buffer.is_dirty()).then(|| buffer.reload(cx))
+                })
+            })
+            .collect::<Vec<_>>();
+        let timeout = cx.background_executor().timer(SETTLE_TIMEOUT);
+        cx.background_spawn(async move {
+            let reloads = futures::future::join_all(reloads);
+            futures::pin_mut!(reloads);
+            if let futures::future::Either::Right(_) =
+                futures::future::select(reloads, timeout).await
+            {
+                log::warn!(
+                    "agent review: files were still reloading {}s after the turn ended",
+                    SETTLE_TIMEOUT.as_secs()
+                );
+            }
+        })
     }
 
     fn index_for_tool_call(&self, id: &acp::ToolCallId) -> Option<usize> {
@@ -3653,6 +3801,14 @@ impl AcpThread {
         push_user_message: bool,
         cx: &mut Context<Self>,
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
+        // Every open file as it stands now, before the agent can touch any of
+        // them. Review measures the agent's changes against this, so it does
+        // not matter whether a write reaches the disk before or after the
+        // agent announces it.
+        let open_buffers = self.project.read(cx).opened_buffers(cx);
+        self.action_log.update(cx, |action_log, cx| {
+            action_log.begin_agent_turn(open_buffers, cx)
+        });
         let block = ContentBlock::new_combined(
             message.clone(),
             self.project.read(cx).languages().clone(),
@@ -3720,6 +3876,12 @@ impl AcpThread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
+        // A retried turn edits files like any other, so it needs the same
+        // starting snapshot; without it its edits never reach review.
+        let open_buffers = self.project.read(cx).opened_buffers(cx);
+        self.action_log.update(cx, |action_log, cx| {
+            action_log.begin_agent_turn(open_buffers, cx)
+        });
         self.run_turn(cx, async move |this, cx| {
             this.update(cx, |this, cx| {
                 this.connection
@@ -3756,6 +3918,15 @@ impl AcpThread {
         cx.spawn(async move |this, cx| {
             let response = rx.await;
 
+            // Before the turn is declared over, bring every file the agent
+            // touched up to date with the disk, while a change arriving that
+            // way still counts as the agent's. Left to the file watcher, the
+            // last write of a turn -- a shell command's especially, which names
+            // no file -- could land after the turn ended and be taken for the
+            // user's.
+            this.update(cx, |this, cx| this.settle_agent_files(cx))?
+                .await;
+
             this.update(cx, |this, cx| this.update_last_checkpoint(cx))?
                 .await?;
 
@@ -3777,6 +3948,8 @@ impl AcpThread {
                 // state even when the send_task is cancelled before tx.send().
                 if is_same_turn {
                     this.running_turn.take();
+                    this.action_log
+                        .update(cx, |action_log, _cx| action_log.end_agent_turn());
                 }
 
                 let Ok(response) = response else {
@@ -4776,6 +4949,7 @@ mod tests {
     use rand::{distr, prelude::*};
     use serde_json::json;
     use settings::SettingsStore;
+    use std::cell::Cell;
     use std::{
         any::Any,
         cell::RefCell,
@@ -6875,6 +7049,720 @@ mod tests {
             .unwrap();
 
         assert!(cx.read(|cx| !thread.read(cx).has_pending_edit_tool_calls()));
+    }
+
+    /// How the agent under test reports its tool calls. Each mirrors a path in
+    /// Claude Code's ACP adapter, which is what these tests stand in for.
+    #[derive(Clone, Copy)]
+    enum AgentTool {
+        /// `Edit`: announced with the replaced snippet as `old_text` and the
+        /// replacement as `new_text`.
+        Edit,
+        /// `Write`: announced with `old_text: None` and the whole new file,
+        /// whether or not the file already existed.
+        Write,
+        /// `Edit`, but the write reaches the disk -- and the open buffer --
+        /// before the announcement reaches the editor.
+        EditRacing,
+        /// An edit made through a shell command, which names no file at all.
+        Shell,
+    }
+
+    /// Plays one or more agent turns that edit `/test/file.txt` exactly the way
+    /// Claude Code's adapter reports them, and returns the thread, the file's
+    /// buffer and the filesystem.
+    ///
+    /// Per tool call, in the adapter's order: the call is announced while the
+    /// tool is only being prepared, carrying a snippet diff; the tool then
+    /// writes the file; then an update completes the call, carrying per-hunk
+    /// snippets. Nothing the agent sends is a whole file as it stood, so
+    /// review has to work without that.
+    ///
+    /// `initial` of `None` means the file does not exist before the agent
+    /// writes it. Each entry of `turns` is one user message's worth of tool
+    /// calls, given as the file's contents after each call.
+    async fn agent_turns(
+        initial: Option<&str>,
+        turns: &[&[&str]],
+        tool: AgentTool,
+        open_before: bool,
+        read_first: bool,
+        with_git: bool,
+        cx: &mut TestAppContext,
+    ) -> (Entity<AcpThread>, Entity<Buffer>, Arc<FakeFs>) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        let mut tree = serde_json::Map::new();
+        if with_git {
+            tree.insert(".git".into(), json!({}));
+        }
+        if let Some(initial) = initial {
+            tree.insert("file.txt".into(), json!(initial));
+        } else {
+            tree.insert("other.txt".into(), json!(""));
+        }
+        fs.insert_tree(path!("/test"), serde_json::Value::Object(tree))
+            .await;
+        if with_git && let Some(initial) = initial {
+            fs.set_head_for_repo(
+                path!("/test/.git").as_ref(),
+                &[("file.txt", initial.into())],
+                "0000000",
+            );
+        }
+        cx.run_until_parked();
+        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+
+        let _open_buffer = if open_before && initial.is_some() {
+            let buffer = project
+                .update(cx, |project, cx| {
+                    project.open_local_buffer(path!("/test/file.txt"), cx)
+                })
+                .await
+                .unwrap();
+            cx.run_until_parked();
+            Some(buffer)
+        } else {
+            None
+        };
+
+        let turns: Vec<Vec<String>> = turns
+            .iter()
+            .map(|turn| turn.iter().map(|text| text.to_string()).collect())
+            .collect();
+        let edits_per_turn: Vec<usize> = turns.iter().map(Vec::len).collect();
+        let turn_index = Rc::new(Cell::new(0usize));
+        let (proceed_tx, proceed_rx) = mpsc::unbounded::<()>();
+        let proceed = Rc::new(RefCell::new(Some(proceed_rx)));
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let fs = fs.clone();
+            let turn_index = turn_index.clone();
+            let proceed = proceed.clone();
+            move |_, thread, mut cx| {
+                let fs = fs.clone();
+                let proceed = proceed.clone();
+                let turn = turns.get(turn_index.get()).cloned().unwrap_or_default();
+                let turn_number = turn_index.get();
+                turn_index.set(turn_number + 1);
+                async move {
+                    let file = PathBuf::from(path!("/test/file.txt"));
+                    if read_first && turn_number == 0 {
+                        thread
+                            .update(&mut cx, |thread, cx| {
+                                thread.handle_session_update(
+                                    acp::SessionUpdate::ToolCall(
+                                        acp::ToolCall::new("read", "Read file.txt")
+                                            .kind(acp::ToolKind::Read)
+                                            .status(acp::ToolCallStatus::Completed)
+                                            .locations(vec![acp::ToolCallLocation::new(
+                                                file.clone(),
+                                            )]),
+                                    ),
+                                    cx,
+                                )
+                            })
+                            .unwrap()
+                            .unwrap();
+                    }
+                    for (index, new_text) in turn.into_iter().enumerate() {
+                        let id = format!("turn{turn_number}-edit{index}");
+                        if matches!(tool, AgentTool::EditRacing) {
+                            fs.insert_file(&file, new_text.as_bytes().to_vec()).await;
+                            let mut proceed_rx = proceed.borrow_mut().take().unwrap();
+                            proceed_rx.next().await;
+                            proceed.replace(Some(proceed_rx));
+                        }
+                        if matches!(tool, AgentTool::Shell) {
+                            thread
+                                .update(&mut cx, |thread, cx| {
+                                    thread.handle_session_update(
+                                        acp::SessionUpdate::ToolCall(
+                                            acp::ToolCall::new(id.clone(), "Run sed")
+                                                .kind(acp::ToolKind::Execute)
+                                                .status(acp::ToolCallStatus::InProgress),
+                                        ),
+                                        cx,
+                                    )
+                                })
+                                .unwrap()
+                                .unwrap();
+                            let mut proceed_rx = proceed.borrow_mut().take().unwrap();
+                            proceed_rx.next().await;
+                            proceed.replace(Some(proceed_rx));
+                            fs.insert_file(&file, new_text.as_bytes().to_vec()).await;
+                            thread
+                                .update(&mut cx, |thread, cx| {
+                                    thread.handle_session_update(
+                                        acp::SessionUpdate::ToolCallUpdate(
+                                            acp::ToolCallUpdate::new(
+                                                id,
+                                                acp::ToolCallUpdateFields::new()
+                                                    .status(acp::ToolCallStatus::Completed),
+                                            ),
+                                        ),
+                                        cx,
+                                    )
+                                })
+                                .unwrap()
+                                .unwrap();
+                            continue;
+                        }
+                        let announced = match tool {
+                            AgentTool::Edit => {
+                                acp::Diff::new(file.clone(), "NEW SNIPPET").old_text("OLD SNIPPET")
+                            }
+                            AgentTool::Write => acp::Diff::new(file.clone(), new_text.clone()),
+                            AgentTool::EditRacing | AgentTool::Shell => {
+                                acp::Diff::new(file.clone(), "NEW SNIPPET").old_text("OLD SNIPPET")
+                            }
+                        };
+                        thread
+                            .update(&mut cx, |thread, cx| {
+                                thread.handle_session_update(
+                                    acp::SessionUpdate::ToolCall(
+                                        acp::ToolCall::new(id.clone(), "Edit file.txt")
+                                            .kind(acp::ToolKind::Edit)
+                                            .status(acp::ToolCallStatus::Pending)
+                                            .content(vec![acp::ToolCallContent::Diff(announced)])
+                                            .locations(vec![acp::ToolCallLocation::new(
+                                                file.clone(),
+                                            )]),
+                                    ),
+                                    cx,
+                                )
+                            })
+                            .unwrap()
+                            .unwrap();
+                        // The adapter announces a call while the model is still
+                        // writing its input, well before the tool runs. Wait for
+                        // the test to let the announcement settle first.
+                        if !matches!(tool, AgentTool::EditRacing) {
+                            let mut proceed_rx = proceed.borrow_mut().take().unwrap();
+                            proceed_rx.next().await;
+                            proceed.replace(Some(proceed_rx));
+                            fs.insert_file(&file, new_text.as_bytes().to_vec()).await;
+                        }
+
+                        thread
+                            .update(&mut cx, |thread, cx| {
+                                thread.handle_session_update(
+                                    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                                        id,
+                                        acp::ToolCallUpdateFields::new()
+                                            .status(acp::ToolCallStatus::Completed)
+                                            .content(vec![acp::ToolCallContent::Diff(
+                                                acp::Diff::new(file.clone(), " ctx\n+hunk")
+                                                    .old_text(" ctx\n-hunk"),
+                                            )])
+                                            .locations(vec![
+                                                acp::ToolCallLocation::new(file.clone()).line(1),
+                                            ]),
+                                    )),
+                                    cx,
+                                )
+                            })
+                            .unwrap()
+                            .unwrap();
+                    }
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                }
+                .boxed_local()
+            }
+        }));
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        for edits in edits_per_turn {
+            let send =
+                cx.update(|cx| thread.update(cx, |thread, cx| thread.send(vec!["Go".into()], cx)));
+            for _ in 0..edits {
+                cx.run_until_parked();
+                proceed_tx.unbounded_send(()).unwrap();
+            }
+            send.await.unwrap();
+            cx.run_until_parked();
+        }
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/test/file.txt"), cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        (thread, buffer, fs)
+    }
+
+    /// The rows at which unreviewed hunks start, in order.
+    fn unreviewed_rows(thread: &Entity<AcpThread>, cx: &TestAppContext) -> Vec<u32> {
+        thread.read_with(cx, |thread, cx| {
+            thread
+                .action_log()
+                .read(cx)
+                .changed_buffers(cx)
+                .flat_map(|(buffer, diff)| {
+                    let snapshot = buffer.read(cx).snapshot();
+                    diff.read(cx)
+                        .snapshot(cx)
+                        .hunks(&snapshot)
+                        .map(|hunk| hunk.range.start.row)
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        })
+    }
+
+    fn buffer_text(buffer: &Entity<Buffer>, cx: &TestAppContext) -> String {
+        buffer.read_with(cx, |buffer, _| buffer.text())
+    }
+
+    const BEFORE: &str = "a\nb\nc\nd\ne\nf\ng\n";
+    const AFTER: &str = "A\nb\nc\nd\ne\nf\nG\n";
+
+    /// The case that kept failing in real use: the file is open, and the
+    /// agent's write arrives as a reload of it.
+    #[gpui::test]
+    async fn test_agent_edit_to_open_file_is_reviewable(cx: &mut TestAppContext) {
+        let (thread, buffer, _) = agent_turns(
+            Some(BEFORE),
+            &[&[AFTER]],
+            AgentTool::Edit,
+            true,
+            false,
+            false,
+            cx,
+        )
+        .await;
+        assert_eq!(buffer_text(&buffer, cx), AFTER);
+        assert_eq!(unreviewed_rows(&thread, cx), vec![0, 6]);
+    }
+
+    #[gpui::test]
+    async fn test_agent_edit_to_unopened_file_is_reviewable(cx: &mut TestAppContext) {
+        let (thread, buffer, _) = agent_turns(
+            Some(BEFORE),
+            &[&[AFTER]],
+            AgentTool::Edit,
+            false,
+            false,
+            false,
+            cx,
+        )
+        .await;
+        assert_eq!(buffer_text(&buffer, cx), AFTER);
+        assert_eq!(unreviewed_rows(&thread, cx), vec![0, 6]);
+    }
+
+    // Reopening a thread replays its tool calls outside any turn. Claiming a
+    // file then rebased review onto the text the file has now, which already
+    // contains those edits, so the next real edit landed on disk with nothing
+    // to review -- the agent appearing to change a file while insisting it had
+    // not. Asserted at the gate itself: building a replayed `acp::ToolCall`
+    // here would pin the test to a non-exhaustive upstream struct.
+    #[gpui::test]
+    async fn test_replayed_tool_calls_do_not_claim_files(cx: &mut TestAppContext) {
+        let (thread, buffer, _) = agent_turns(
+            Some(BEFORE),
+            &[&[AFTER]],
+            AgentTool::Edit,
+            true,
+            false,
+            false,
+            cx,
+        )
+        .await;
+        assert_eq!(unreviewed_rows(&thread, cx), vec![0, 6]);
+
+        thread.read_with(cx, |thread, cx| {
+            assert!(
+                !thread.action_log.read(cx).agent_turn_active(),
+                "the turn has ended, so any tool call arriving now is history,                  and claiming files for it would move the review base"
+            );
+        });
+
+        // Unchanged by the replay that follows the turn.
+        assert_eq!(buffer_text(&buffer, cx), AFTER);
+        assert_eq!(unreviewed_rows(&thread, cx), vec![0, 6]);
+    }
+
+    #[gpui::test]
+    async fn test_agent_edit_after_read_is_reviewable(cx: &mut TestAppContext) {
+        let (thread, _, _) = agent_turns(
+            Some(BEFORE),
+            &[&[AFTER]],
+            AgentTool::Edit,
+            false,
+            true,
+            true,
+            cx,
+        )
+        .await;
+        assert_eq!(unreviewed_rows(&thread, cx), vec![0, 6]);
+    }
+
+    /// A whole-file write is announced with no `old_text` at all. It must
+    /// still diff against the file it replaced, not as a new file.
+    #[gpui::test]
+    async fn test_agent_write_over_existing_file_diffs_against_it(cx: &mut TestAppContext) {
+        let (thread, _, _) = agent_turns(
+            Some(BEFORE),
+            &[&[AFTER]],
+            AgentTool::Write,
+            true,
+            false,
+            true,
+            cx,
+        )
+        .await;
+        assert_eq!(
+            unreviewed_rows(&thread, cx),
+            vec![0, 6],
+            "only the lines that changed, not the whole file"
+        );
+    }
+
+    /// Several edits to one file in a turn review as one change against where
+    /// the file stood before any of them.
+    #[gpui::test]
+    async fn test_agent_edits_accumulate_within_a_turn(cx: &mut TestAppContext) {
+        let middle = "A\nb\nc\nd\ne\nf\ng\n";
+        let (thread, buffer, _) = agent_turns(
+            Some(BEFORE),
+            &[&[middle, AFTER]],
+            AgentTool::Edit,
+            true,
+            false,
+            true,
+            cx,
+        )
+        .await;
+        assert_eq!(buffer_text(&buffer, cx), AFTER);
+        assert_eq!(unreviewed_rows(&thread, cx), vec![0, 6]);
+    }
+
+    /// What was not reviewed in one turn is still there to review after the
+    /// next: nothing leaves review except by the user keeping or rejecting it.
+    #[gpui::test]
+    async fn test_unreviewed_edits_survive_the_next_turn(cx: &mut TestAppContext) {
+        let middle = "A\nb\nc\nd\ne\nf\ng\n";
+        let (thread, buffer, _) = agent_turns(
+            Some(BEFORE),
+            &[&[middle], &[AFTER]],
+            AgentTool::Edit,
+            true,
+            false,
+            true,
+            cx,
+        )
+        .await;
+        assert_eq!(buffer_text(&buffer, cx), AFTER);
+        assert_eq!(unreviewed_rows(&thread, cx), vec![0, 6]);
+    }
+
+    #[gpui::test]
+    async fn test_agent_edit_with_crlf_line_endings(cx: &mut TestAppContext) {
+        let (thread, _, _) = agent_turns(
+            Some("a\r\nb\r\nc\r\n"),
+            &[&["a\r\nB\r\nc\r\n"]],
+            AgentTool::Edit,
+            true,
+            false,
+            false,
+            cx,
+        )
+        .await;
+        assert_eq!(
+            unreviewed_rows(&thread, cx),
+            vec![1],
+            "only the line that changed"
+        );
+    }
+
+    /// Typing in the file is the user's own change, never the agent's.
+    #[gpui::test]
+    async fn test_user_typing_is_not_taken_for_the_agent(cx: &mut TestAppContext) {
+        let (thread, buffer, _) = agent_turns(
+            Some(BEFORE),
+            &[&[AFTER]],
+            AgentTool::Edit,
+            true,
+            false,
+            true,
+            cx,
+        )
+        .await;
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [(language::Point::new(3, 0)..language::Point::new(3, 1), "D")],
+                None,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            unreviewed_rows(&thread, cx),
+            vec![0, 6],
+            "the user's own edit is not offered back for review"
+        );
+    }
+
+    /// The write reaches the open buffer before the editor hears the agent
+    /// announce it. Review still measures against the file as it stood.
+    #[gpui::test]
+    async fn test_agent_write_landing_before_its_announcement(cx: &mut TestAppContext) {
+        let (thread, buffer, _) = agent_turns(
+            Some(BEFORE),
+            &[&[AFTER]],
+            AgentTool::EditRacing,
+            true,
+            false,
+            true,
+            cx,
+        )
+        .await;
+        assert_eq!(buffer_text(&buffer, cx), AFTER);
+        assert_eq!(unreviewed_rows(&thread, cx), vec![0, 6]);
+    }
+
+    /// An agent editing through a shell names no file. A file it read earlier
+    /// still gets its change reviewed.
+    #[gpui::test]
+    async fn test_agent_shell_edit_to_a_read_file(cx: &mut TestAppContext) {
+        let (thread, buffer, _) = agent_turns(
+            Some(BEFORE),
+            &[&[AFTER]],
+            AgentTool::Shell,
+            false,
+            true,
+            true,
+            cx,
+        )
+        .await;
+        assert_eq!(buffer_text(&buffer, cx), AFTER);
+        assert_eq!(unreviewed_rows(&thread, cx), vec![0, 6]);
+    }
+
+    /// A turn that rewrites a whole file is still reviewed a line at a time,
+    /// and each line answered leaves the rest waiting.
+    ///
+    /// Offered as one change, a rewrite can only be taken whole: accepting any
+    /// of it accepts the rest unseen, which is the opposite of reviewing it.
+    #[gpui::test]
+    async fn test_a_rewritten_file_is_reviewed_line_by_line(cx: &mut TestAppContext) {
+        let before = "one\ntwo\nthree\nfour\n";
+        let after = "ONE\nTWO\nTHREE\nFOUR\n";
+        let (thread, buffer, fs) = agent_turns(
+            Some(before),
+            &[&[after]],
+            AgentTool::Write,
+            true,
+            false,
+            true,
+            cx,
+        )
+        .await;
+        assert_eq!(
+            unreviewed_rows(&thread, cx),
+            vec![0, 1, 2, 3],
+            "every rewritten line is its own change to answer"
+        );
+
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+
+        // Accept the first line. The rest must stay.
+        action_log.update(cx, |log, cx| {
+            log.keep_edits_in_range(
+                buffer.clone(),
+                language::Point::new(0, 0)..language::Point::new(0, 0),
+                None,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            unreviewed_rows(&thread, cx),
+            vec![1, 2, 3],
+            "accepting one line must not take the others with it"
+        );
+        assert_eq!(
+            buffer_text(&buffer, cx),
+            after,
+            "accepting keeps the agent's line"
+        );
+
+        // Reject the second line. Only that line goes back.
+        let (task, _) = action_log.update(cx, |log, cx| {
+            log.reject_edits_in_ranges(
+                buffer.clone(),
+                vec![language::Point::new(1, 0)..language::Point::new(1, 0)],
+                None,
+                cx,
+            )
+        });
+        task.await.unwrap();
+        cx.run_until_parked();
+
+        let expected = "ONE\ntwo\nTHREE\nFOUR\n";
+        assert_eq!(
+            buffer_text(&buffer, cx),
+            expected,
+            "rejecting one line puts back that line and no other"
+        );
+        assert_eq!(
+            fs.load(Path::new(path!("/test/file.txt"))).await.unwrap(),
+            expected,
+            "and the file on disk agrees"
+        );
+        assert_eq!(
+            unreviewed_rows(&thread, cx),
+            vec![2, 3],
+            "the lines not yet answered are still waiting"
+        );
+    }
+
+    async fn check_keeping_one_hunk_leaves_the_rest(with_git: bool, cx: &mut TestAppContext) {
+        let (thread, buffer, _) = agent_turns(
+            Some(BEFORE),
+            &[&[AFTER]],
+            AgentTool::Edit,
+            true,
+            false,
+            with_git,
+            cx,
+        )
+        .await;
+        assert_eq!(unreviewed_rows(&thread, cx), vec![0, 6]);
+
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+        action_log.update(cx, |log, cx| {
+            log.keep_edits_in_range(
+                buffer.clone(),
+                language::Point::new(0, 0)..language::Point::new(0, 0),
+                None,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            unreviewed_rows(&thread, cx),
+            vec![6],
+            "keeping one hunk must leave the other waiting for review"
+        );
+        assert_eq!(
+            buffer_text(&buffer, cx),
+            AFTER,
+            "keeping changes nothing in the file"
+        );
+    }
+
+    async fn check_rejecting_one_hunk_reverts_only_it(with_git: bool, cx: &mut TestAppContext) {
+        let (thread, buffer, fs) = agent_turns(
+            Some(BEFORE),
+            &[&[AFTER]],
+            AgentTool::Edit,
+            true,
+            false,
+            with_git,
+            cx,
+        )
+        .await;
+        assert_eq!(unreviewed_rows(&thread, cx), vec![0, 6]);
+
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+        let (task, _) = action_log.update(cx, |log, cx| {
+            log.reject_edits_in_ranges(
+                buffer.clone(),
+                vec![language::Point::new(0, 0)..language::Point::new(0, 0)],
+                None,
+                cx,
+            )
+        });
+        task.await.unwrap();
+        cx.run_until_parked();
+
+        let reverted = "a\nb\nc\nd\ne\nf\nG\n";
+        assert_eq!(
+            buffer_text(&buffer, cx),
+            reverted,
+            "rejecting puts back what was there"
+        );
+        assert_eq!(
+            fs.load(Path::new(path!("/test/file.txt"))).await.unwrap(),
+            reverted,
+            "and the file on disk agrees"
+        );
+        assert_eq!(
+            unreviewed_rows(&thread, cx),
+            vec![6],
+            "the other hunk is untouched"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_keeping_one_hunk_leaves_the_rest(cx: &mut TestAppContext) {
+        check_keeping_one_hunk_leaves_the_rest(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_keeping_one_hunk_leaves_the_rest_in_git_repo(cx: &mut TestAppContext) {
+        check_keeping_one_hunk_leaves_the_rest(true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_rejecting_one_hunk_reverts_only_it(cx: &mut TestAppContext) {
+        check_rejecting_one_hunk_reverts_only_it(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn test_rejecting_one_hunk_reverts_only_it_in_git_repo(cx: &mut TestAppContext) {
+        check_rejecting_one_hunk_reverts_only_it(true, cx).await;
+    }
+
+    /// A file the agent created is rejected by removing it, not by restoring
+    /// the agent's own contents.
+    #[gpui::test]
+    async fn test_rejecting_a_created_file_removes_it(cx: &mut TestAppContext) {
+        let (thread, buffer, fs) = agent_turns(
+            None,
+            &[&["new\nfile\n"]],
+            AgentTool::Write,
+            false,
+            false,
+            true,
+            cx,
+        )
+        .await;
+        assert_eq!(
+            unreviewed_rows(&thread, cx),
+            vec![0, 1],
+            "a new file is offered a line at a time, like any other change"
+        );
+
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+        let (task, _) = action_log.update(cx, |log, cx| {
+            log.reject_edits_in_ranges(
+                buffer.clone(),
+                vec![language::Point::new(0, 0)..language::Point::new(0, 0)],
+                None,
+                cx,
+            )
+        });
+        task.await.unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            !fs.is_file(Path::new(path!("/test/file.txt"))).await,
+            "rejecting a created file removes it"
+        );
     }
 
     #[gpui::test(iterations = 10)]

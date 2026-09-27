@@ -83,7 +83,9 @@ impl Filter {
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<TeamNotesPanel>(window, cx);
+            // Opens as a centre-pane tab: this panel is registered with the
+            // workspace but not docked, so there is no dock focus to toggle.
+            workspace.open_panel_as_tab::<TeamNotesPanel>(window, cx);
         });
         workspace.register_action(|workspace, _: &AddNote, window, cx| {
             TeamNotesPanel::start_note_at_cursor(workspace, window, cx);
@@ -274,13 +276,20 @@ impl TeamNotesPanel {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        log::info!("team notes: add note requested");
+        // The editor in front, or failing that the one used last. Pressing the
+        // note button in the team tab makes the tab the active item, so asking
+        // only for the active item found no editor and the button did nothing.
         let Some(editor) = workspace
             .active_item(cx)
             .and_then(|item| item.act_as::<Editor>(cx))
+            .or_else(|| last_used_editor(workspace, cx))
         else {
+            log::info!("team notes: no editor to attach a note to");
             return;
         };
         let Some(panel) = workspace.panel::<TeamNotesPanel>(cx) else {
+            log::warn!("team notes: the team panel is not registered in this workspace");
             return;
         };
 
@@ -308,10 +317,14 @@ impl TeamNotesPanel {
                 },
             ))
         }) else {
+            log::warn!("team notes: the last editor has no file on disk to anchor a note to");
             return;
         };
 
-        workspace.open_panel::<TeamNotesPanel>(window, cx);
+        log::info!("team notes: opening a note on {file}:{}", anchor.line + 1);
+        // A tab, not a dock: `open_panel` only knows docks, so it silently
+        // did nothing and the composer opened somewhere nobody could see.
+        workspace.open_panel_as_tab::<TeamNotesPanel>(window, cx);
         panel.update(cx, |panel, cx| {
             panel.filter = Filter::Notes;
             panel.open_composer(
@@ -331,7 +344,9 @@ impl TeamNotesPanel {
         let Some(panel) = workspace.panel::<TeamNotesPanel>(cx) else {
             return;
         };
-        workspace.open_panel::<TeamNotesPanel>(window, cx);
+        // A tab, not a dock: `open_panel` only knows docks, so it silently
+        // did nothing and the composer opened somewhere nobody could see.
+        workspace.open_panel_as_tab::<TeamNotesPanel>(window, cx);
         panel.update(cx, |panel, cx| {
             panel.filter = Filter::Tickets;
             panel.open_composer(
@@ -423,9 +438,33 @@ impl TeamNotesPanel {
         };
 
         let mut records = self.records.clone();
+        self.hand_to_agents(&record, &said_in(&record), window, cx);
         records.push(record);
         self.commit(records, cx);
         self.focus_handle.focus(window, cx);
+    }
+
+    /// Sends the record to every agent `said` mentions.
+    ///
+    /// Dispatched by name because the agent panel's crate depends on this one
+    /// for ticket mentions, so this one cannot depend on it back.
+    fn hand_to_agents(
+        &self,
+        record: &NoteThread,
+        said: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for agent in crate::mentioned_agents(said) {
+            let prompt = crate::prompt_for_agent(record, said);
+            match cx.build_action(
+                "agent::AskAgent",
+                Some(serde_json::json!({ "agent": agent, "prompt": prompt })),
+            ) {
+                Ok(action) => window.dispatch_action(action, cx),
+                Err(error) => log::warn!("team notes: could not hand {agent} the record: {error}"),
+            }
+        }
     }
 
     fn submit_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -443,8 +482,12 @@ impl TeamNotesPanel {
             record.messages.push(Message {
                 author: self.author.to_string(),
                 at: crate::now_timestamp(),
-                body,
+                body: body.clone(),
             });
+            // Replying `@claude can you take this` on a ticket hands it over,
+            // with the reply as the ask and the ticket as the brief.
+            let record = record.clone();
+            self.hand_to_agents(&record, &body, window, cx);
         }
         self.commit(records, cx);
         self.focus_handle.focus(window, cx);
@@ -607,15 +650,22 @@ impl TeamNotesPanel {
             .as_deref()
             .is_some_and(|name| name.eq_ignore_ascii_case(&self.author));
 
+        let group = SharedString::from(format!("record-group-{}", record.id));
+
         v_flex()
             .id(SharedString::from(record.id.clone()))
+            .group(group.clone())
             .w_full()
-            .p_2()
-            .gap_1p5()
+            .px_2()
+            .py_1p5()
+            .gap_1()
             .rounded_md()
+            // A frame, so each record reads as one thing. Without it a list of
+            // tickets was loose lines of text with no edge between them.
             .border_1()
             .border_color(cx.theme().colors().border_variant)
-            .bg(cx.theme().colors().elevated_surface_background.opacity(0.5))
+            .bg(cx.theme().colors().element_background)
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
             .when(closed, |this| this.opacity(0.55))
             .child(
                 h_flex()
@@ -659,10 +709,20 @@ impl TeamNotesPanel {
                     })
                     .when_some(location, |this, location| {
                         this.child(
-                            Label::new(location)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .truncate(),
+                            Button::new(
+                                SharedString::from(format!("open-{}", record.id)),
+                                location,
+                            )
+                            .label_size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(true)
+                            .tooltip(Tooltip::text("Go to this line"))
+                            .on_click(cx.listener({
+                                let id = id.clone();
+                                move |this, _, window, cx| {
+                                    this.jump_to(id.clone(), window, cx)
+                                }
+                            })),
                         )
                     }),
             )
@@ -691,17 +751,7 @@ impl TeamNotesPanel {
             .child(
                 h_flex()
                     .gap_1()
-                    .when(record.file.is_some(), |this| {
-                        this.child(
-                            Button::new(SharedString::from(format!("open-{}", record.id)), "Open")
-                                .label_size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .on_click(cx.listener({
-                                    let id = id.clone();
-                                    move |this, _, window, cx| this.jump_to(id.clone(), window, cx)
-                                })),
-                        )
-                    })
+                    .when(!replying, |this| this.visible_on_hover(group.clone()))
                     .when(!replying, |this| {
                         this.child(
                             Button::new(
@@ -1382,8 +1432,7 @@ impl Render for TeamNotesPanel {
                     })
                     .when(filter != Filter::Messages, |this| this.child(
                         h_flex()
-                            .justify_between()
-                            .child(Label::new("Team").size(LabelSize::Small))
+                            .justify_end()
                             .child(
                                 h_flex()
                                     .gap_1()
@@ -1402,10 +1451,51 @@ impl Render for TeamNotesPanel {
                                                 );
                                             })),
                                     )
+                                    // Labelled, not icons: a pin and a plus side
+                                    // by side did not say which made a note,
+                                    // and people concluded notes could not be
+                                    // made at all. A note goes on the line
+                                    // under your cursor in the file you were
+                                    // last in.
                                     .child(
-                                        IconButton::new("new-ticket", IconName::Plus)
-                                            .icon_size(IconSize::Small)
-                                            .icon_color(Color::Muted)
+                                        Button::new("new-note", "Note")
+                                            .start_icon(
+                                                Icon::new(IconName::Pin).size(IconSize::XSmall),
+                                            )
+                                            .label_size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .tooltip(Tooltip::text(
+                                                "Add a note on the line your cursor is on",
+                                            ))
+                                            // Called directly rather than by
+                                            // dispatching `AddNote`: an action
+                                            // only reaches the workspace when
+                                            // focus is inside it, and a click
+                                            // on this button does not put it
+                                            // there, so the note silently
+                                            // never started. Deferred, because
+                                            // starting a note updates this
+                                            // panel, which is mid-render here.
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                let workspace = this.workspace.clone();
+                                                window.defer(cx, move |window, cx| {
+                                                    workspace
+                                                        .update(cx, |workspace, cx| {
+                                                            TeamNotesPanel::start_note_at_cursor(
+                                                                workspace, window, cx,
+                                                            );
+                                                        })
+                                                        .log_err();
+                                                });
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("new-ticket", "Ticket")
+                                            .start_icon(
+                                                Icon::new(IconName::Plus).size(IconSize::XSmall),
+                                            )
+                                            .label_size(LabelSize::Small)
+                                            .color(Color::Muted)
                                             .tooltip(Tooltip::text("New Ticket"))
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.filter = Filter::Tickets;
@@ -1448,17 +1538,26 @@ impl Render for TeamNotesPanel {
                     ))
                     .child(
                         h_flex()
+                            .p_0p5()
                             .gap_0p5()
+                            .rounded_md()
+                            .bg(cx.theme().colors().element_background)
                             .children(Filter::ALL.into_iter().map(|option| {
                                 let label = if option == Filter::Inbox && inbox_count > 0 {
                                     format!("Inbox {inbox_count}")
                                 } else {
                                     option.label().to_string()
                                 };
+                                let is_selected = option == filter;
                                 Button::new(SharedString::from(option.label()), label)
                                     .label_size(LabelSize::XSmall)
-                                    .color(if option == filter {
-                                        Color::Accent
+                                    .style(if is_selected {
+                                        ButtonStyle::Filled
+                                    } else {
+                                        ButtonStyle::Subtle
+                                    })
+                                    .color(if is_selected {
+                                        Color::Default
                                     } else {
                                         Color::Muted
                                     })
@@ -1720,4 +1819,49 @@ mod tests {
     fn an_empty_file_has_no_rows_to_find() {
         assert_eq!(row_and_line_at("", 0), (0, String::new()));
     }
+}
+
+/// What the author wrote in a new record, for recognising who it mentions.
+///
+/// A ticket's words are its title; everything else's are its first message.
+fn said_in(record: &NoteThread) -> String {
+    match record.kind {
+        Kind::Ticket => record.title.clone().unwrap_or_default(),
+        _ => record
+            .messages
+            .first()
+            .map(|message| message.body.clone())
+            .unwrap_or_default(),
+    }
+}
+
+/// The file editor used most recently in any pane, for attaching a note to.
+///
+/// Ranked by each pane's activation history rather than by pane order, so it
+/// is the file you were last looking at, not the first one that happens to be
+/// open.
+fn last_used_editor(workspace: &Workspace, cx: &App) -> Option<Entity<Editor>> {
+    let mut best: Option<(usize, Entity<Editor>)> = None;
+    for pane in workspace.panes() {
+        let pane = pane.read(cx);
+        for entry in pane.activation_history() {
+            let Some(editor) = pane
+                .items()
+                .find(|item| item.item_id() == entry.entity_id)
+                .and_then(|item| item.act_as::<Editor>(cx))
+            else {
+                continue;
+            };
+            let has_file = editor
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .is_some_and(|buffer| buffer.read(cx).file().is_some());
+            if has_file && best.as_ref().is_none_or(|(time, _)| entry.timestamp > *time) {
+                best = Some((entry.timestamp, editor));
+            }
+        }
+    }
+    best.map(|(_, editor)| editor)
 }

@@ -1,0 +1,126 @@
+# Builds the Acuto installer for Windows and publishes it as a GitHub Release.
+#
+# Run it by pushing a version tag:
+#
+#   git tag v0.1.0
+#   git push origin v0.1.0
+#
+# or from the Actions tab ("Acuto release (Windows)" > "Run workflow").
+#
+# The installer is attached to the release as `Acuto-x86_64.exe`, so
+# https://github.com/<owner>/<repo>/releases/latest/download/Acuto-x86_64.exe
+# always serves the newest one.
+#
+# The build is not code signed. Signing needs a paid certificate; until there is
+# one, Windows shows a SmartScreen warning the first time the installer runs.
+
+name: Acuto release (Windows)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v (e.g. 0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: acuto-release-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      # Tuned for GitHub's free runner (4 cores, 16 GB): no debug info and no
+      # link-time optimisation. Both roughly halve the build and keep the final
+      # link inside the runner's memory; the editor loses a few percent of speed.
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      ACUTO_SKIP_REMOTE_SERVER: "1"
+    steps:
+      - name: Work out the version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ github.event.inputs.version }}"
+          } else {
+            $version = "${{ github.ref_name }}".TrimStart("v")
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+') {
+            throw "'$version' is not a version like 0.1.0"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+
+      # A second page file on the runner's larger drive. Linking the editor is
+      # the one step that can exceed 16 GB of memory.
+      - name: Add swap space
+        uses: al-cheb/configure-pagefile-action@v1.4
+        with:
+          minimum-size: 16GB
+          maximum-size: 24GB
+          disk-root: "D:"
+
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        shell: pwsh
+        # rust-toolchain.toml pins the version; this installs it.
+        run: rustup show
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-release
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          Set-Content -Path crates/zed/RELEASE_CHANNEL -Value "stable" -NoNewline
+          ./script/bundle-windows.ps1 -Architecture x86_64
+
+      - name: Keep the installer with the run
+        uses: actions/upload-artifact@v4
+        with:
+          name: Acuto-x86_64
+          path: target/Acuto-x86_64.exe
+          if-no-files-found: error
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v${{ steps.version.outputs.version }}"
+          $notes = @"
+          ## Install
+
+          Download **Acuto-x86_64.exe** below and run it.
+
+          Windows may say "Windows protected your PC" because this build is not code signed yet. Click **More info**, then **Run anyway**.
+          "@
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag target/Acuto-x86_64.exe --clobber
+          } else {
+            gh release create $tag target/Acuto-x86_64.exe --title "Acuto $($tag.TrimStart('v'))" --notes $notes --target "${{ github.sha }}"
+          }

@@ -36,8 +36,8 @@ use zed_actions::{
 
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
-use crate::agent_thread_item::AgentThreadItem;
 use crate::agent_connection_store::AgentConnectionStore;
+use crate::agent_thread_item::AgentThreadItem;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
@@ -45,8 +45,9 @@ use crate::terminal_thread_metadata_store::{
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
-    Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
-    NewExternalAgentThreadInPane, NewNativeAgentThreadFromSummary, NewThreadInPane,
+    Agent, AgentInitialContent, AgentThreadSource, AskAgent, ExternalSourcePrompt,
+    NewExternalAgentThread, NewExternalAgentThreadInPane, NewNativeAgentThreadFromSummary,
+    NewThreadInPane,
 };
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
@@ -98,8 +99,8 @@ use ui::{
 use util::ResultExt as _;
 use workspace::{
     CollaboratorId, DraggedPanelItem, DraggedPanelItemPreview, DraggedSelection, DraggedTab,
-    MultiWorkspace, PathList, SerializedPathList,
-    ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
+    MultiWorkspace, PathList, SerializedPathList, ToggleWorkspaceSidebar, ToggleZoom,
+    ToolbarItemView, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
 };
@@ -445,6 +446,21 @@ pub fn init(cx: &mut App) {
                         }
                     },
                 )
+                .register_action(|workspace, action: &AskAgent, window, cx| {
+                    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                        log::warn!("ask agent: no agent panel in this workspace");
+                        return;
+                    };
+                    workspace.focus_panel::<AgentPanel>(window, cx);
+                    panel.update(cx, |panel, cx| {
+                        panel.ask_agent(
+                            AgentId::new(action.agent.clone()),
+                            action.prompt.clone(),
+                            window,
+                            cx,
+                        );
+                    });
+                })
                 .register_action(|workspace, action: &SelectAgent, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| {
@@ -1465,14 +1481,22 @@ impl AgentPanel {
                     // active). When restoring a thread, prefer its agent
                     // so the draft survives reload bound to the right
                     // backend; otherwise fall back to the serialized
-                    // selection, then the global last-used agent.
+                    // selection, then the global last-used agent, and
+                    // finally to whatever the settings say a new thread
+                    // should use.
+                    //
+                    // That last step is what a first launch hits, and without
+                    // it every new profile opened on the built-in agent -- the
+                    // one that needs an API key of its own, while the agents
+                    // the user actually configured sat one menu away.
                     let initial_agent = match &thread_to_restore {
                         Some((info, _)) => Some(clamp(info.agent_type.clone())),
                         None => serialized_panel
                             .as_ref()
                             .and_then(|p| p.selected_agent.clone())
                             .map(clamp)
-                            .or(global_fallback),
+                            .or(global_fallback)
+                            .or_else(|| panel.initial_panel_agent(cx).map(clamp)),
                     };
                     if let Some(agent) = initial_agent {
                         panel.selected_agent = agent;
@@ -1969,17 +1993,89 @@ impl AgentPanel {
     /// Opens a new thread in the active pane using whichever agent is
     /// configured for new tabs.
     ///
-    /// The built-in agent unless the Claude Code page says otherwise, so the
-    /// default stays ours and preferring Claude is a deliberate choice rather
-    /// than something a launchpad button decided.
+    /// With no agent configured this asks rather than guessing: the agents run
+    /// on different subscriptions, so opening the wrong one is not a neutral
+    /// default. The one exception is when exactly one agent is set up, where
+    /// there is nothing to ask about.
     pub fn new_thread_in_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let agent = match AgentSettings::get_global(cx).default_agent {
-            settings::DefaultAgent::ClaudeCode => {
-                AgentId::new(agent_servers::CLAUDE_AGENT_ID).into()
-            }
-            settings::DefaultAgent::Acuto => Agent::NativeAgent,
+        let Some(agent) = self.agent_for_new_thread(cx) else {
+            self.new_thread_menu_handle.toggle(window, cx);
+            return;
         };
         self.open_new_thread_in_pane_for(agent, window, cx);
+    }
+
+    /// Where a thread is being opened.
+    ///
+    /// The two surfaces are used for different work -- the panel for a question
+    /// asked while reading code, a tab for a job left running -- and people
+    /// reach for different agents for each, usually because they pay for them
+    /// differently.
+    fn agent_for_surface(&self, surface: AgentSurface, cx: &App) -> Option<Agent> {
+        let settings = AgentSettings::get_global(cx);
+        let setting = match surface {
+            AgentSurface::Panel => settings.panel_agent,
+            AgentSurface::Tab => settings.tab_agent,
+        }
+        .unwrap_or(settings.default_agent);
+
+        if let Some(agent_id) = setting.agent_id() {
+            return Some(AgentId::new(agent_id).into());
+        }
+        if setting == settings::DefaultAgent::Acuto {
+            return Some(Agent::NativeAgent);
+        }
+
+        // `Ask`. One configured agent is not a choice, so take it; several are,
+        // so hand it back to the user.
+        let configured = self.configured_agents(cx);
+        match configured.len() {
+            1 => configured.into_iter().next(),
+            _ => None,
+        }
+    }
+
+    /// The agent a new tab should use, or `None` to ask the user.
+    fn agent_for_new_thread(&self, cx: &App) -> Option<Agent> {
+        self.agent_for_surface(AgentSurface::Tab, cx)
+    }
+
+    /// The external agents that are set up, in a stable, meaningful order.
+    ///
+    /// `external_agents()` walks a hash map, so anything that picked "the first
+    /// one" got a different answer between runs. The known agents lead in the
+    /// order most people would rank them, and anything else follows sorted, so
+    /// the panel opens the same agent every time.
+    fn configured_agents(&self, cx: &App) -> Vec<Agent> {
+        const PREFERRED: [&str; 5] = [
+            agent_servers::CLAUDE_AGENT_ID,
+            agent_servers::CODEX_ID,
+            agent_servers::COPILOT_ID,
+            agent_servers::GEMINI_ID,
+            agent_servers::ANTIGRAVITY_ID,
+        ];
+
+        let store = self.project.read(cx).agent_server_store();
+        let mut ids: Vec<_> = store.read(cx).external_agents().cloned().collect();
+        ids.sort_by_key(|id| {
+            let rank = PREFERRED
+                .iter()
+                .position(|known| *known == id.0.as_ref())
+                .unwrap_or(PREFERRED.len());
+            (rank, id.0.clone())
+        });
+        ids.into_iter().map(|id| Agent::Custom { id }).collect()
+    }
+
+    /// The agent the panel should show when it has no thread to restore.
+    ///
+    /// Deliberately never the built-in agent while an SDK is set up. The house
+    /// agent needs an API key of its own, so opening it by default puts a
+    /// paywall in front of someone who already pays for Claude or Codex, and
+    /// the panel gives no hint that the other agents are one menu away.
+    fn initial_panel_agent(&self, cx: &App) -> Option<Agent> {
+        self.agent_for_surface(AgentSurface::Panel, cx)
+            .or_else(|| self.configured_agents(cx).into_iter().next())
     }
 
     pub fn new_external_agent_thread_in_pane(
@@ -4220,15 +4316,16 @@ impl AgentPanel {
     /// entries against the three places a live thread can be before it draws.
     fn prune_thread_tabs(&mut self, cx: &App) {
         let active = self.active_thread_id(cx);
-        let draft = self.draft_thread.as_ref().map(|draft| draft.read(cx).thread_id);
+        let draft = self
+            .draft_thread
+            .as_ref()
+            .map(|draft| draft.read(cx).thread_id);
         let retained = &self.retained_threads;
         let kept = self
             .thread_tabs
             .iter()
             .copied()
-            .filter(|id| {
-                Some(*id) == active || Some(*id) == draft || retained.contains_key(id)
-            })
+            .filter(|id| Some(*id) == active || Some(*id) == draft || retained.contains_key(id))
             .collect::<Vec<_>>();
         self.thread_tabs = kept;
     }
@@ -4343,17 +4440,16 @@ impl AgentPanel {
             let successor = index.and_then(|index| {
                 self.thread_tabs
                     .get(index)
-                    .or_else(|| index.checked_sub(1).and_then(|prev| self.thread_tabs.get(prev)))
+                    .or_else(|| {
+                        index
+                            .checked_sub(1)
+                            .and_then(|prev| self.thread_tabs.get(prev))
+                    })
                     .copied()
             });
             match successor {
                 Some(successor) => self.activate_retained_thread(successor, false, window, cx),
-                None => self.activate_new_thread(
-                    false,
-                    AgentThreadSource::AgentPanel,
-                    window,
-                    cx,
-                ),
+                None => self.activate_new_thread(false, AgentThreadSource::AgentPanel, window, cx),
             }
         }
 
@@ -4379,7 +4475,11 @@ impl AgentPanel {
         let successor = if was_active {
             self.thread_tabs
                 .get(index)
-                .or_else(|| index.checked_sub(1).and_then(|prev| self.thread_tabs.get(prev)))
+                .or_else(|| {
+                    index
+                        .checked_sub(1)
+                        .and_then(|prev| self.thread_tabs.get(prev))
+                })
                 .copied()
         } else {
             None
@@ -4436,12 +4536,9 @@ impl AgentPanel {
                 // Whether the thread is mid-response. With several threads
                 // running at once this is the only way to tell which one is
                 // working, since only the active one shows its transcript.
-                let is_generating = view
-                    .read(cx)
-                    .root_thread_view()
-                    .is_some_and(|thread_view| {
-                        thread_view.read(cx).thread.read(cx).status() == ThreadStatus::Generating
-                    });
+                let is_generating = view.read(cx).root_thread_view().is_some_and(|thread_view| {
+                    thread_view.read(cx).thread.read(cx).status() == ThreadStatus::Generating
+                });
                 Some((
                     *id,
                     view.read(cx).title(cx),
@@ -4456,9 +4553,13 @@ impl AgentPanel {
         }
 
         let panel_handle = cx.entity().downgrade();
+        // Pills rather than folder tabs. The active one takes the selection
+        // fill and full-strength text, the rest are clear until hovered. The
+        // old folder tabs used the panel's own colour for the active tab, which
+        // on a light theme made it the one tab you could not see.
         let colors = cx.theme().colors();
-        let active_bg = colors.panel_background;
-        let inactive_bg = colors.surface_background;
+        let active_bg = colors.element_selected;
+        let inactive_bg = gpui::transparent_black();
         let hover_bg = colors.element_hover;
 
         Some(
@@ -4472,146 +4573,152 @@ impl AgentPanel {
                 // The index is unique and stable within a single render.
                 .children(tabs.into_iter().enumerate().map(
                     |(ix, (id, title, is_active, is_generating))| {
-                    let drag_title = title.clone();
-                    let tab = h_flex()
-                        .id(("agent-thread-tab", ix))
-                        .group(SharedString::from(format!("agent-thread-tab-{ix}")))
-                        .min_w_0()
-                        // Wider than before but with smaller text: thread
-                        // titles are sentences, so the tab needs both to show
-                        // enough of one to tell threads apart.
-                        .max_w_48()
-                        .pl_2()
-                        .pr_1()
-                        .py_1()
-                        .gap_1()
-                        .rounded_t_md()
-                        .cursor_pointer()
-                        .map(|this| {
-                            if is_active {
-                                this.bg(active_bg)
-                            } else {
-                                this.bg(inactive_bg).hover(|style| style.bg(hover_bg))
-                            }
-                        })
-                        .when(is_generating, |this| {
-                            // Animated on a wrapping div: `opacity` comes from
-                            // `Styled`, which `Indicator` does not implement.
-                            this.child(
-                                div()
-                                    .flex_none()
-                                    .child(Indicator::dot().color(Color::Accent))
-                                    .with_animation(
-                                        ("agent-thread-tab-pulse", ix),
-                                        Animation::new(Duration::from_secs(2))
-                                            .repeat()
-                                            .with_easing(pulsating_between(0.3, 1.0)),
-                                        |this, delta| this.opacity(delta),
-                                    ),
+                        let drag_title = title.clone();
+                        let tab = h_flex()
+                            .id(("agent-thread-tab", ix))
+                            .group(SharedString::from(format!("agent-thread-tab-{ix}")))
+                            .min_w_0()
+                            // Wider than before but with smaller text: thread
+                            // titles are sentences, so the tab needs both to show
+                            // enough of one to tell threads apart.
+                            .max_w(px(160.))
+                            .pl_2()
+                            .pr_1()
+                            .py_0p5()
+                            .gap_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .map(|this| {
+                                if is_active {
+                                    this.bg(active_bg)
+                                } else {
+                                    this.bg(inactive_bg).hover(|style| style.bg(hover_bg))
+                                }
+                            })
+                            .when(is_generating, |this| {
+                                // Animated on a wrapping div: `opacity` comes from
+                                // `Styled`, which `Indicator` does not implement.
+                                this.child(
+                                    div()
+                                        .flex_none()
+                                        .child(Indicator::dot().color(Color::Accent))
+                                        .with_animation(
+                                            ("agent-thread-tab-pulse", ix),
+                                            Animation::new(Duration::from_secs(2))
+                                                .repeat()
+                                                .with_easing(pulsating_between(0.3, 1.0)),
+                                            |this, delta| this.opacity(delta),
+                                        ),
+                                )
+                            })
+                            .child(
+                                div().min_w_0().flex_1().child(
+                                    Label::new(title)
+                                        .size(LabelSize::Small)
+                                        .color(if is_active {
+                                            Color::Default
+                                        } else {
+                                            Color::Muted
+                                        })
+                                        .single_line()
+                                        .truncate(),
+                                ),
                             )
-                        })
-                        .child(
-                            div().min_w_0().flex_1().child(
-                                Label::new(title)
-                                    .size(LabelSize::XSmall)
-                                    .color(if is_active { Color::Default } else { Color::Muted })
-                                    .single_line(),
-                            ),
-                        )
-                        .child(
-                            IconButton::new(("agent-thread-tab-close", ix), IconName::Close)
-                                .icon_size(IconSize::Indicator)
-                                .shape(ui::IconButtonShape::Square)
-                                // Hidden until the tab is hovered so a row of
-                                // crosses does not compete with the titles, but
-                                // always shown on the active tab, which is the
-                                // one most likely to be closed next.
-                                .when(!is_active, |this| {
-                                    this.visible_on_hover(SharedString::from(format!(
-                                        "agent-thread-tab-{ix}"
-                                    )))
-                                })
-                                .tooltip(Tooltip::text("Close Thread"))
-                                .on_click(cx.listener(move |panel, _, window, cx| {
+                            .child(
+                                IconButton::new(("agent-thread-tab-close", ix), IconName::Close)
+                                    .icon_size(IconSize::Indicator)
+                                    .shape(ui::IconButtonShape::Square)
+                                    // Hidden until the tab is hovered so a row of
+                                    // crosses does not compete with the titles, but
+                                    // always shown on the active tab, which is the
+                                    // one most likely to be closed next.
+                                    .when(!is_active, |this| {
+                                        this.visible_on_hover(SharedString::from(format!(
+                                            "agent-thread-tab-{ix}"
+                                        )))
+                                    })
+                                    .tooltip(Tooltip::text("Close Thread"))
+                                    .on_click(cx.listener(move |panel, _, window, cx| {
+                                        panel.close_thread_tab(id, window, cx);
+                                    })),
+                            )
+                            .on_click(cx.listener(move |panel, _, window, cx| {
+                                panel.activate_retained_thread(id, true, window, cx);
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Middle,
+                                cx.listener(move |panel, _, window, cx| {
                                     panel.close_thread_tab(id, window, cx);
-                                })),
-                        )
-                        .on_click(cx.listener(move |panel, _, window, cx| {
-                            panel.activate_retained_thread(id, true, window, cx);
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Middle,
-                            cx.listener(move |panel, _, window, cx| {
-                                panel.close_thread_tab(id, window, cx);
-                            }),
-                        )
-
-                        // Dragging a tab into the editor area promotes the
-                        // thread to a pane item. The payload carries a builder
-                        // rather than the item itself: the drop may never
-                        // happen, and detaching the thread from the panel on
-                        // mouse-down would empty the panel for a drag the user
-                        // then abandons.
-                        .on_drag(
-                            DraggedPanelItem {
-                                label: drag_title.clone(),
-                                icon: Some(IconName::ZedAssistant),
-                                build: {
-                                    let panel = panel_handle.clone();
-                                    Rc::new(move |window, cx| {
-                                        let view = panel
-                                            .update(cx, |panel, cx| {
-                                                panel.detach_thread_for_pane(id, window, cx)
-                                            })
-                                            .ok()
-                                            .flatten()?;
-                                        Some(Box::new(
-                                            cx.new(|_| AgentThreadItem::new(view)),
-                                        )
-                                            as Box<dyn workspace::item::ItemHandle>)
+                                }),
+                            )
+                            // Dragging a tab into the editor area promotes the
+                            // thread to a pane item. The payload carries a builder
+                            // rather than the item itself: the drop may never
+                            // happen, and detaching the thread from the panel on
+                            // mouse-down would empty the panel for a drag the user
+                            // then abandons.
+                            .on_drag(
+                                DraggedPanelItem {
+                                    label: drag_title.clone(),
+                                    icon: Some(IconName::ZedAssistant),
+                                    build: {
+                                        let panel = panel_handle.clone();
+                                        Rc::new(move |window, cx| {
+                                            let view = panel
+                                                .update(cx, |panel, cx| {
+                                                    panel.detach_thread_for_pane(id, window, cx)
+                                                })
+                                                .ok()
+                                                .flatten()?;
+                                            Some(Box::new(cx.new(|_| AgentThreadItem::new(view)))
+                                                as Box<dyn workspace::item::ItemHandle>)
+                                        })
+                                    },
+                                },
+                                |dragged, _offset, _window, cx| {
+                                    cx.new(|_| DraggedPanelItemPreview {
+                                        item: dragged.clone(),
                                     })
                                 },
-                            },
-                            |dragged, _offset, _window, cx| {
-                                cx.new(|_| DraggedPanelItemPreview {
-                                    item: dragged.clone(),
-                                })
-                            },
-                        );
+                            );
 
-                    right_click_menu(("agent-thread-tab-menu", ix))
-                        .trigger(move |_, _, _| tab)
-                        .menu({
-                            let panel = panel_handle.clone();
-                            move |window, cx| {
-                                let panel = panel.clone();
-                                ContextMenu::build(window, cx, move |menu, _, _| {
-                                    menu.entry("Open in Editor", None, {
-                                        let panel = panel.clone();
-                                        move |window, cx| {
-                                            panel
-                                                .update(cx, |panel, cx| {
-                                                    panel.open_thread_in_pane(id, window, cx)
-                                                })
-                                                .log_err();
-                                        }
+                        right_click_menu(("agent-thread-tab-menu", ix))
+                            .trigger(move |_, _, _| tab)
+                            .menu({
+                                let panel = panel_handle.clone();
+                                move |window, cx| {
+                                    let panel = panel.clone();
+                                    ContextMenu::build(window, cx, move |menu, _, _| {
+                                        menu.entry("Open in Editor", None, {
+                                            let panel = panel.clone();
+                                            move |window, cx| {
+                                                panel
+                                                    .update(cx, |panel, cx| {
+                                                        panel.open_thread_in_pane(id, window, cx)
+                                                    })
+                                                    .log_err();
+                                            }
+                                        })
+                                        .separator()
+                                        .entry(
+                                            "Close Thread",
+                                            None,
+                                            {
+                                                let panel = panel.clone();
+                                                move |window, cx| {
+                                                    panel
+                                                        .update(cx, |panel, cx| {
+                                                            panel.close_thread_tab(id, window, cx)
+                                                        })
+                                                        .log_err();
+                                                }
+                                            },
+                                        )
                                     })
-                                    .separator()
-                                    .entry("Close Thread", None, {
-                                        let panel = panel.clone();
-                                        move |window, cx| {
-                                            panel
-                                                .update(cx, |panel, cx| {
-                                                    panel.close_thread_tab(id, window, cx)
-                                                })
-                                                .log_err();
-                                        }
-                                    })
-                                })
-                            }
-                        })
+                                }
+                            })
                     },
-                ))
+                )),
         )
     }
 
@@ -4909,6 +5016,36 @@ impl AgentPanel {
                 store.migrate_agent_server_from_extensions(id, project.fs().clone(), cx);
             });
         });
+    }
+
+    /// Opens a fresh thread with `agent` and sends `prompt` as its first
+    /// message.
+    ///
+    /// A new thread every time rather than reusing the open one: a handed-over
+    /// ticket is its own piece of work, and appending it to whatever the agent
+    /// was last doing would mix two reviews into one set of changes.
+    pub fn ask_agent(
+        &mut self,
+        agent: AgentId,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        log::info!("ask agent: handing a prompt to {}", agent.0);
+        self.external_thread(
+            Some(crate::Agent::Custom { id: agent }),
+            None,
+            None,
+            None,
+            Some(AgentInitialContent::ContentBlock {
+                blocks: vec![acp::ContentBlock::from(prompt)],
+                auto_submit: true,
+            }),
+            true,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
     }
 
     pub fn new_agent_thread_with_external_source_prompt(
@@ -5488,6 +5625,15 @@ impl Focusable for AgentPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
+}
+
+/// Where an agent thread is being opened.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentSurface {
+    /// The dock panel beside the editor.
+    Panel,
+    /// A tab in the centre pane.
+    Tab,
 }
 
 fn agent_panel_dock_position(cx: &App) -> DockPosition {
@@ -6572,7 +6718,22 @@ impl AgentPanel {
             })
             .when(!has_custom_icon, |this| {
                 this.when_some(selected_agent_builtin_icon, |this, icon| {
-                    this.child(Icon::new(icon).color(Color::Muted))
+                    // In the agent's own colour, not grey. This mark is the one
+                    // place the panel says which agent you are talking to, and
+                    // a monochrome Claude or Codex mark is not the thing people
+                    // recognise from everywhere else those tools appear.
+                    let color = match &self.selected_agent {
+                        Agent::Custom { id } => {
+                            crate::conversation_view::claude_brand::AgentBrand::for_agent_in(
+                                id.0.as_ref(),
+                                cx,
+                            )
+                            .map(|brand| Color::Custom(brand.accent))
+                            .unwrap_or(Color::Muted)
+                        }
+                        _ => Color::Muted,
+                    };
+                    this.child(Icon::new(icon).color(color))
                 })
             })
             .tooltip(move |_, cx| {
@@ -6677,13 +6838,10 @@ impl AgentPanel {
             let sandbox_status = matches!(self.selected_agent, Agent::NativeAgent)
                 .then(|| {
                     self.active_conversation_view()
-                        .and_then(|conversation_view| {
-                            conversation_view.read(cx).root_thread_view()
-                        })
+                        .and_then(|conversation_view| conversation_view.read(cx).root_thread_view())
                         .and_then(|thread_view| {
-                            thread_view.update(cx, |thread_view, cx| {
-                                thread_view.render_sandbox_status(cx)
-                            })
+                            thread_view
+                                .update(cx, |thread_view, cx| thread_view.render_sandbox_status(cx))
                         })
                 })
                 .flatten();
@@ -6735,7 +6893,42 @@ impl AgentPanel {
                             .child(new_thread_menu)
                         })
                         .child(full_screen_button)
-                        .child(self.render_panel_options_menu(window, cx)),
+                        .child(self.render_panel_options_menu(window, cx))
+                        // Closing the panel from the panel. The dock button in
+                        // the status bar also toggles it, but that is across
+                        // the window from what you are looking at, and every
+                        // other panel-shaped thing in software closes from its
+                        // own corner.
+                        .child(
+                            IconButton::new("close-agent-panel", IconName::Close)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Close Agent Panel"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    // Deferred, and deliberately not through
+                                    // `cx.defer_in`. Closing the dock calls
+                                    // `set_active` on the panel it is closing,
+                                    // so doing it from a listener -- which is
+                                    // already holding this panel's lease --
+                                    // re-enters `AgentPanel::update` and
+                                    // panics. That panic crosses a boundary
+                                    // that cannot unwind, so it aborts the
+                                    // process rather than unwinding.
+                                    //
+                                    // `window.defer` hands back a plain `App`
+                                    // with no panel leased; `cx.defer_in` would
+                                    // hand back this panel again and land in
+                                    // exactly the same place.
+                                    let workspace = this.workspace.clone();
+                                    window.defer(cx, move |window, cx| {
+                                        workspace
+                                            .update(cx, |workspace, cx| {
+                                                workspace.close_panel::<Self>(window, cx);
+                                            })
+                                            .ok();
+                                    });
+                                })),
+                        ),
                 )
                 .into_any_element()
         };
@@ -7366,7 +7559,7 @@ impl AgentPanel {
 mod tests {
     use super::*;
     use crate::NewWorktreeBranchTarget;
-use crate::conversation_view::tests::{StubAgentServer, init_test};
+    use crate::conversation_view::tests::{StubAgentServer, init_test};
     use crate::test_support::{
         active_session_id, active_thread_id, open_thread_with_connection,
         open_thread_with_custom_connection, register_test_sidebar, send_message,

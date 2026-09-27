@@ -61,24 +61,13 @@ impl Item for AgentThreadItem {
         self.conversation_view.read(cx).title(cx)
     }
 
+    // Text only. The pane draws `tab_icon` beside this, so an icon here as
+    // well put two sparkles on every agent tab.
     fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
-        h_flex()
-            .gap_1()
-            .child(
-                Icon::new(IconName::ZedAssistant)
-                    .size(IconSize::XSmall)
-                    .color(if params.selected {
-                        Color::Default
-                    } else {
-                        Color::Muted
-                    }),
-            )
-            .child(
-                Label::new(self.tab_content_text(params.detail.unwrap_or(0), cx))
-                    .size(LabelSize::Small)
-                    .color(params.text_color())
-                    .single_line(),
-            )
+        Label::new(self.tab_content_text(params.detail.unwrap_or(0), cx))
+            .size(LabelSize::Small)
+            .color(params.text_color())
+            .single_line()
             .into_any_element()
     }
 
@@ -89,13 +78,31 @@ impl Item for AgentThreadItem {
     /// indistinguishable until you read every title -- which is the moment the
     /// icon was supposed to save.
     fn tab_icon(&self, _window: &Window, cx: &App) -> Option<Icon> {
-        let icon = self
-            .conversation_view
-            .read(cx)
-            .root_thread_view()
-            .map(|thread_view| thread_view.read(cx).agent_icon)
-            .unwrap_or(IconName::ZedAssistant);
-        Some(Icon::new(icon))
+        let conversation_view = self.conversation_view.read(cx);
+        let agent = conversation_view.agent_server();
+
+        // A known agent always wears its own mark in its brand colour (ink on a
+        // light theme), from the first frame: while it is still connecting as
+        // much as once it has loaded, so the icon never swaps under you.
+        if let Some(brand) = crate::conversation_view::claude_brand::AgentBrand::for_agent_in(
+            agent.agent_id().0.as_ref(),
+            cx,
+        ) {
+            return Some(Icon::new(brand.icon).color(Color::Custom(brand.accent)));
+        }
+
+        let Some(thread_view) = conversation_view.root_thread_view() else {
+            return Some(Icon::new(agent.logo()));
+        };
+        let thread_view = thread_view.read(cx);
+
+        // An agent installed with its own artwork ships an SVG; the built-in
+        // ones have an icon in the enum. Preferring the SVG means a custom
+        // agent shows its own mark rather than the generic assistant glyph.
+        if let Some(path) = thread_view.agent_icon_from_external_svg.clone() {
+            return Some(Icon::from_external_svg(path));
+        }
+        Some(Icon::new(thread_view.agent_icon))
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {

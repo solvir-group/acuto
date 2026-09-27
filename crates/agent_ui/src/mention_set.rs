@@ -138,6 +138,7 @@ impl MentionSet {
             MentionUri::Fetch { url } => self.confirm_mention_for_fetch(url, http_client, cx),
             MentionUri::Directory { .. } => Task::ready(Ok(Mention::Link)),
             MentionUri::Thread { id, .. } => self.confirm_mention_for_thread(id, cx),
+            MentionUri::Ticket { id, .. } => self.confirm_mention_for_ticket(id, cx),
             MentionUri::File { abs_path } => {
                 self.confirm_mention_for_file(abs_path, supports_images, cx)
             }
@@ -312,6 +313,7 @@ impl MentionSet {
             }
             MentionUri::Directory { .. } => Task::ready(Ok(Mention::Link)),
             MentionUri::Thread { id, .. } => self.confirm_mention_for_thread(id, cx),
+            MentionUri::Ticket { id, .. } => self.confirm_mention_for_ticket(id, cx),
             MentionUri::File { abs_path } => {
                 self.confirm_mention_for_file(abs_path, supports_images, cx)
             }
@@ -639,6 +641,41 @@ impl MentionSet {
                 content: summary.to_string(),
                 tracked_buffers: Vec::new(),
             })
+        })
+    }
+
+    /// The ticket as the agent needs it: what the work is, where, who owns it,
+    /// and everything anyone has said about it since.
+    ///
+    /// Read at send time rather than when the mention was typed, so an agent
+    /// handed a ticket sees its current status and every reply.
+    fn confirm_mention_for_ticket(&self, id: String, cx: &mut Context<Self>) -> Task<Result<Mention>> {
+        let Some(project) = self.project.upgrade() else {
+            return Task::ready(Err(anyhow!("project not found")));
+        };
+        let project = project.read(cx);
+        let fs = project.fs().clone();
+        let roots: Vec<std::path::PathBuf> = project
+            .visible_worktrees(cx)
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            .collect();
+
+        cx.background_spawn(async move {
+            for root in roots {
+                let Ok(contents) = fs.load(&team_notes::notes_file(&root)).await else {
+                    continue;
+                };
+                if let Some(ticket) = team_notes::parse(&contents)
+                    .into_iter()
+                    .find(|record| record.id == id)
+                {
+                    return Ok(Mention::Text {
+                        content: team_notes::brief_for_agent(&ticket),
+                        tracked_buffers: Vec::new(),
+                    });
+                }
+            }
+            Err(anyhow!("ticket {id} not found in any worktree's team notes"))
         })
     }
 
@@ -1519,3 +1556,4 @@ async fn fetch_url_content(http_client: Arc<HttpClientWithUrl>, url: String) -> 
         }
     }
 }
+

@@ -20,14 +20,13 @@ use git_ui_core::file_diff_view::FileDiffView;
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, Bounds, ClickEvent,
     ClipboardEntry as GpuiClipboardEntry, ClipboardItem, Context, CursorStyle, DismissEvent, Div,
-    DragMoveEvent, Entity, EventEmitter,
-    ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, FontWeight, Hsla,
-    InteractiveElement, KeyContext, ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, ParentElement,
-    PathPromptOptions, Pixels, Point, PromptLevel, Render, ScrollStrategy, Stateful, Styled,
-    Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred,
-    div, hsla, linear_color_stop, linear_gradient, point, px, size, transparent_white,
-    uniform_list,
+    DragMoveEvent, Entity, EventEmitter, ExternalDragPayload, ExternalPaths, FileDragPaths,
+    FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, KeyContext,
+    ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseExitEvent, ParentElement, PathPromptOptions, Pixels, Point,
+    PromptLevel, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
+    UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, div, hsla,
+    linear_color_stop, linear_gradient, point, px, size, transparent_white, uniform_list,
 };
 use language::DiagnosticSeverity;
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
@@ -61,7 +60,7 @@ use std::{
 };
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
+    ContextMenu, DecoratedIcon, FileIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
     IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, ProjectEmptyState,
     ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
 };
@@ -612,6 +611,20 @@ struct ItemColors {
 fn get_item_color(is_sticky: bool, cx: &App) -> ItemColors {
     let colors = cx.theme().colors();
 
+    // On a see-through theme the tree sits on frosted glass. Rows painted with
+    // the panel colour stacked a second wash on it, and a tinted selection
+    // over a tinted pane read as a cheap highlight. Here the rows are clear,
+    // hovering lifts a row with white, and the selected row is a white pill.
+    if colors.background.a < 1.0 && cx.theme().appearance().is_light() && !is_sticky {
+        return ItemColors {
+            default: gpui::transparent_white(),
+            hover: gpui::white().opacity(0.45),
+            marked: gpui::white().opacity(0.88),
+            focused: colors.panel_focused_border,
+            drag_over: colors.drop_target_background,
+        };
+    }
+
     ItemColors {
         default: if is_sticky {
             colors.panel_overlay_background
@@ -647,34 +660,13 @@ fn entry_icon_color(kind: EntryKind, file_name: &str, cx: &App) -> Color {
     }
 
     // A directory is not a kind of file, so it does not take a file's colour.
-    // Tinting every folder with the first accent made the panel read as a
-    // column of blue with the actual files as an afterthought.
+    // Tinting every folder made the panel read as a column of blue with the
+    // actual files as an afterthought.
     if !matches!(kind, EntryKind::File) {
         return Color::Muted;
     }
 
-    let index = match kind {
-        EntryKind::File => {
-            let extension = Path::new(file_name)
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-
-            match extension.as_str() {
-                "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "rs" | "go" | "py" | "rb"
-                | "java" | "kt" | "swift" | "c" | "h" | "cc" | "cpp" | "hpp" | "cs" | "php"
-                | "vue" | "svelte" | "sh" | "bash" | "ps1" | "lua" | "zig" | "ex" | "exs" => 1,
-                "css" | "scss" | "sass" | "less" | "pcss" | "postcss" | "styl" => 2,
-                "json" | "jsonc" | "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "lock"
-                | "env" => 3,
-                _ => 4,
-            }
-        }
-        _ => 0,
-    };
-
-    Color::Custom(cx.theme().accents().color_for_index(index))
+    file_icons::icon_color(Path::new(file_name), cx).map_or(Color::Muted, Color::Custom)
 }
 
 enum DeleteEntryOutcome {
@@ -5746,10 +5738,20 @@ impl ProjectPanel {
         // directory row shows one or the other. When enabled, render the chevron
         // beside the icon rather than in place of it, so a folder reads as both
         // "a folder" and "expandable".
+        //
+        // Unless the icon theme's directory glyph is itself a disclosure arrow,
+        // as a deliberately minimal theme's will be. Then "both" is the same
+        // arrow twice, side by side, which looks like a rendering fault rather
+        // than a design.
         let chevron = (settings.row.show_chevron_with_folder_icon
             && settings.folder_icons
             && kind.is_dir())
-        .then(|| FileIcons::get_chevron_icon(details.is_expanded, cx))
+        .then(|| {
+            let chevron = FileIcons::get_chevron_icon(details.is_expanded, cx);
+            let directory_icon =
+                FileIcons::get_folder_icon(details.is_expanded, details.path.as_std_path(), cx);
+            (chevron != directory_icon).then_some(chevron).flatten()
+        })
         .flatten();
 
         let mut icon = details.icon.clone();
@@ -5862,11 +5864,20 @@ impl ProjectPanel {
             .relative()
             .group(GROUP_NAME)
             .cursor_pointer()
-            .rounded_none()
+            // A couple of pixels of radius. Square corners make the selection
+            // read as a full-bleed band across the panel; rounding it slightly
+            // makes it read as a row that is selected.
+            .rounded_sm()
             .bg(bg_color)
             .border_1()
             .border_r_2()
             .border_color(border_color)
+            .when(
+                cx.theme().colors().background.a < 1.0
+                    && cx.theme().appearance().is_light()
+                    && !is_sticky,
+                |this| this.rounded_md(),
+            )
             .hover(|style| style.bg(bg_hover_color).border_color(border_hover_color))
             .when(is_sticky, |this| this.block_mouse_except_scroll())
             .when(!is_sticky, |this| {
@@ -6323,9 +6334,15 @@ impl ProjectPanel {
                                 .into_any_element(),
                             )
                         } else {
+                            // The theme decides how its own icons are drawn. A
+                            // monochrome set is tinted by language the way it
+                            // always was; a set with real artwork in it is
+                            // drawn as authored, because tinting a logo
+                            // produces a solid block in the shape of a logo.
+                            let colored = theme::GlobalTheme::icon_theme(cx).colored;
                             h_flex().child(
-                                Icon::from_path(icon.to_string())
-                                    .color(entry_icon_color(kind, &file_name, cx)),
+                                FileIcon::new(Some(icon.to_string().into()), colored)
+                                    .color(entry_icon_color(kind, &file_name, cx).color(cx)),
                             )
                         }
                     } else if let Some((icon_name, color)) =
@@ -6861,6 +6878,18 @@ impl ProjectPanel {
         Ok(())
     }
 
+    /// The visible row of the selected entry, if there is one.
+    ///
+    /// Used to break the indent guides around that row: the guides are painted
+    /// as a decoration over the list, so an unbroken one runs straight through
+    /// the selection bar of the file you are looking at, which is the one row
+    /// where the tree structure is least worth drawing.
+    fn selected_visible_index(&self, cx: &App) -> Option<usize> {
+        let (worktree, entry) = self.selected_entry(cx)?;
+        let (_, _, index) = self.index_for_entry(entry.id, worktree.id())?;
+        Some(index)
+    }
+
     fn find_active_indent_guide(
         &self,
         indent_guides: &[IndentGuideLayout],
@@ -7359,6 +7388,7 @@ impl Render for ProjectPanel {
                                                     &params.indent_guides,
                                                     cx,
                                                 );
+                                            let selected_row = this.selected_visible_index(cx);
 
                                             let indent_size = params.indent_size;
                                             let item_height = params.item_height;
@@ -7367,41 +7397,79 @@ impl Render for ProjectPanel {
                                                 .indent_guides
                                                 .into_iter()
                                                 .enumerate()
-                                                .map(|(idx, layout)| {
+                                                .flat_map(|(idx, layout)| {
                                                     let offset = if layout.continues_offscreen {
                                                         px(0.)
                                                     } else {
                                                         PADDING_Y
                                                     };
-                                                    let bounds = Bounds::new(
-                                                        point(
-                                                            layout.offset.x * indent_size
-                                                                + LEFT_OFFSET,
-                                                            layout.offset.y * item_height + offset,
-                                                        ),
-                                                        size(
-                                                            px(1.),
-                                                            layout.length * item_height
-                                                                - offset * 2.,
-                                                        ),
-                                                    );
-                                                    ui::RenderedIndentGuide {
-                                                        bounds,
-                                                        layout,
-                                                        is_active: Some(idx)
-                                                            == active_indent_guide_index,
-                                                        hitbox: Some(Bounds::new(
-                                                            point(
-                                                                bounds.origin.x - HITBOX_OVERDRAW,
-                                                                bounds.origin.y,
-                                                            ),
-                                                            size(
-                                                                bounds.size.width
-                                                                    + HITBOX_OVERDRAW * 2.,
-                                                                bounds.size.height,
-                                                            ),
-                                                        )),
-                                                    }
+                                                    let is_active =
+                                                        Some(idx) == active_indent_guide_index;
+                                                    let x =
+                                                        layout.offset.x * indent_size + LEFT_OFFSET;
+                                                    let top =
+                                                        layout.offset.y * item_height + offset;
+                                                    let bottom = (layout.offset.y + layout.length)
+                                                        * item_height
+                                                        - offset;
+
+                                                    // A guide that runs through the selected row
+                                                    // stops above it and picks up below, so the
+                                                    // highlight bar reads as one clean shape
+                                                    // instead of one with a line ruled through it.
+                                                    // The tree structure is least worth drawing on
+                                                    // the row you are already looking at.
+                                                    let gap = selected_row
+                                                        .filter(|row| {
+                                                            *row >= layout.offset.y
+                                                                && *row
+                                                                    < layout.offset.y
+                                                                        + layout.length
+                                                        })
+                                                        .map(|row| {
+                                                            (
+                                                                row * item_height,
+                                                                (row + 1) * item_height,
+                                                            )
+                                                        });
+
+                                                    let spans = match gap {
+                                                        Some((gap_top, gap_bottom)) => {
+                                                            vec![
+                                                                (top, gap_top),
+                                                                (gap_bottom, bottom),
+                                                            ]
+                                                        }
+                                                        None => vec![(top, bottom)],
+                                                    };
+
+                                                    spans
+                                                        .into_iter()
+                                                        .filter(|(start, end)| end > start)
+                                                        .map(move |(start, end)| {
+                                                            let bounds = Bounds::new(
+                                                                point(x, start),
+                                                                size(px(1.), end - start),
+                                                            );
+                                                            ui::RenderedIndentGuide {
+                                                                bounds,
+                                                                layout,
+                                                                is_active,
+                                                                hitbox: Some(Bounds::new(
+                                                                    point(
+                                                                        bounds.origin.x
+                                                                            - HITBOX_OVERDRAW,
+                                                                        bounds.origin.y,
+                                                                    ),
+                                                                    size(
+                                                                        bounds.size.width
+                                                                            + HITBOX_OVERDRAW * 2.,
+                                                                        bounds.size.height,
+                                                                    ),
+                                                                )),
+                                                            }
+                                                        })
+                                                        .collect::<Vec<_>>()
                                                 })
                                                 .collect()
                                         },

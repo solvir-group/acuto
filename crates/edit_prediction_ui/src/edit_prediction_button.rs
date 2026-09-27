@@ -1269,7 +1269,7 @@ impl EditPredictionButton {
                             },
                         )
                         .entry(
-                            "Check your payment status or contact us at billing-support@zed.dev to continue using this feature.",
+                            "Check your payment status to continue using this feature.",
                             None,
                             |_window, cx| {
                                 cx.open_url(&zed_urls::account_url(cx))

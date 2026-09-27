@@ -8,8 +8,8 @@
 
 use std::time::Duration;
 
-use gpui::{Global, Hsla, Task, hsla, svg};
-use ui::{Tooltip, prelude::*};
+use gpui::{AnyElement, FontWeight, Global, Hsla, Task, hsla, img, svg};
+use ui::{DotPattern, DotSpinner, Tooltip, prelude::*};
 
 /// Claude's clay, `#D97757`.
 ///
@@ -18,23 +18,6 @@ use ui::{Tooltip, prelude::*};
 /// Claude, and a theme's accent belongs to whatever the theme wants to accent.
 pub(crate) fn claude_clay() -> Hsla {
     hsla(0.041, 0.631, 0.596, 1.0)
-}
-
-/// Text drawn on top of [`claude_clay`].
-///
-/// Clay is a mid-tone, so neither the theme's foreground nor its background is
-/// guaranteed to be readable on it. White is, in both light and dark themes,
-/// which is why the filled Claude controls set their own foreground instead of
-/// inheriting one.
-pub(crate) fn on_claude_clay() -> Hsla {
-    hsla(0., 0., 1., 0.96)
-}
-
-/// Clay at an alpha that reads as a tint rather than a fill.
-pub(crate) fn claude_clay_tint(alpha: f32) -> Hsla {
-    let mut color = claude_clay();
-    color.a = alpha;
-    color
 }
 
 /// Clay pushed to a warning: same family, unmistakably an alarm.
@@ -98,9 +81,7 @@ impl RemoteControlStatus {
 
         let poll = cx.spawn(async move |cx| {
             loop {
-                let running = cx
-                    .background_spawn(async { bridge_is_running() })
-                    .await;
+                let running = cx.background_spawn(async { bridge_is_running() }).await;
 
                 let changed = cx.update_global(|status: &mut RemoteControlStatus, _| {
                     let changed = status.bridge_running != running;
@@ -146,12 +127,9 @@ fn args_start_a_bridge(args: &[String]) -> bool {
         .is_some_and(|stem| stem == "claude");
 
     is_claude
-        && flags.iter().any(|flag| {
-            matches!(
-                flag.trim(),
-                "remote-control" | "--remote-control" | "--rc"
-            )
-        })
+        && flags
+            .iter()
+            .any(|flag| matches!(flag.trim(), "remote-control" | "--remote-control" | "--rc"))
 }
 
 fn bridge_is_running() -> bool {
@@ -255,20 +233,201 @@ pub(crate) fn thinking_word(elapsed_seconds: u64) -> &'static str {
     THINKING_WORDS[index]
 }
 
-/// What sits above the composer on an empty Claude thread.
+/// How one agent identifies itself in the panel.
 ///
-/// The mark and nothing else. A heading and a tagline over an empty input is a
-/// splash screen, and a splash screen in a work panel is the clearest possible
-/// signal that a thing was designed to be shown rather than used. One small
-/// glyph answers the only question the empty state has to answer -- which agent
-/// is about to reply -- and gets out of the way.
-pub(crate) fn claude_greeting(_cx: &App) -> impl IntoElement {
-    v_flex().items_center().pb_5().child(
-        svg()
-            .path(IconName::AiClaude.path())
-            .size(px(20.))
-            .text_color(claude_clay_tint(0.7)),
-    )
+/// Colour, mark and name together, because any one of them alone is ambiguous:
+/// two agents can share an icon family, and a name in grey placeholder text is
+/// not something anyone reads twice.
+/// How one agent identifies itself in the panel.
+///
+/// Colour, mark, name and motion together. Any one alone is ambiguous: two
+/// agents can share an icon family, a name in grey placeholder text is not
+/// something anyone reads twice, and a colour is useless to a reader who does
+/// not separate that pair of hues. The motion is the one that survives being
+/// small and being glanced at, so it carries most of the load.
+#[derive(Clone, Copy)]
+pub(crate) struct AgentBrand {
+    pub name: &'static str,
+    pub icon: IconName,
+    pub accent: Hsla,
+    /// The figure this agent's loader traces through the nine-dot grid.
+    pub pattern: DotPattern,
+    /// The vendor's own wordmark, where Acuto ships one. Without it the
+    /// greeting sets the mark beside the name instead.
+    pub wordmark: Option<Wordmark>,
+}
+
+/// A wordmark image, in a version for each kind of theme: the lettering is
+/// dark on light themes and light on dark ones, while the mark keeps its
+/// colour in both.
+#[derive(Clone, Copy)]
+pub(crate) struct Wordmark {
+    pub light: &'static str,
+    pub dark: &'static str,
+    /// Width over height, so the image is laid out at its own proportions.
+    pub aspect_ratio: f32,
+}
+
+/// Clay on a dark theme; the theme's ink on a light one, like every other
+/// agent colour (see `AgentBrand::for_agent_in`).
+pub(crate) fn claude_clay_in(cx: &gpui::App) -> Hsla {
+    use theme::ActiveTheme as _;
+    if cx.theme().appearance().is_light() {
+        cx.theme().colors().text
+    } else {
+        claude_clay()
+    }
+}
+
+impl AgentBrand {
+    /// The brand for an agent id, in the colours of the active theme.
+    ///
+    /// On a light theme every agent is drawn in the theme's ink: loaders,
+    /// marks, the send button. Four vendor colours on white made the panel look
+    /// like a sticker sheet; ink is how a professional light app draws its
+    /// chat. The agent is still told apart by its mark and its name. Dark
+    /// themes keep the vendor colours, which read well against a dark panel.
+    ///
+    /// Every drawing site goes through this rather than `for_agent`.
+    pub(crate) fn for_agent_in(agent_id: &str, cx: &gpui::App) -> Option<Self> {
+        use theme::ActiveTheme as _;
+        let mut brand = Self::for_agent(agent_id)?;
+        if cx.theme().appearance().is_light() {
+            brand.accent = cx.theme().colors().text;
+        }
+        Some(brand)
+    }
+
+    /// The brand for an agent id, or `None` for the built-in agent.
+    ///
+    /// The native agent deliberately has none: it is the house agent in the
+    /// house style, and branding it would imply it is another third party.
+    ///
+    /// Every colour here is the vendor's own published brand value, not an
+    /// approximation chosen to sit nicely with the theme -- the point of these
+    /// is to match what the user has seen everywhere else that agent appears.
+    /// Lightness is the one thing allowed to move, and only where the published
+    /// value is too dark to read against a dark panel.
+    pub(crate) fn for_agent(agent_id: &str) -> Option<Self> {
+        match agent_id {
+            agent_servers::CLAUDE_AGENT_ID => Some(Self {
+                name: "Claude Code",
+                icon: IconName::AiClaude,
+                // Anthropic's clay, #D97757, exactly.
+                accent: hsla(0.041, 0.631, 0.596, 1.0),
+                // Anthropic's mark is a radial burst, so the loader opens from
+                // the middle outwards.
+                pattern: DotPattern::Bloom,
+                wordmark: Some(Wordmark {
+                    light: "images/agents/claude_wordmark_light.png",
+                    dark: "images/agents/claude_wordmark_dark.png",
+                    aspect_ratio: 186. / 40.,
+                }),
+            }),
+            agent_servers::CODEX_ID => Some(Self {
+                name: "Codex",
+                icon: IconName::AiOpenAi,
+                // OpenAI draws Codex in black and white, not colour. On a dark
+                // panel that is near-white.
+                accent: hsla(0., 0., 0.92, 1.0),
+                // OpenAI's mark is a rotational knot, so one highlight runs
+                // round the ring with the centre held still.
+                pattern: DotPattern::Orbit,
+                wordmark: None,
+            }),
+            agent_servers::COPILOT_ID => Some(Self {
+                name: "GitHub Copilot",
+                icon: IconName::Copilot,
+                // GitHub's Copilot purple, #6E40C9, lifted slightly for the
+                // same reason.
+                accent: hsla(0.7225, 0.559, 0.60, 1.0),
+                // Copilot completes ahead of the cursor, so the loader scans
+                // left to right.
+                pattern: DotPattern::Sweep,
+                wordmark: None,
+            }),
+            agent_servers::GEMINI_ID => Some(Self {
+                name: "Gemini",
+                icon: IconName::AiGemini,
+                // Google blue, #4285F4, the predominant hue of the Gemini
+                // sparkle.
+                accent: hsla(0.604, 0.82, 0.62, 1.0),
+                // The sparkle is a four-point star on the diagonals, so the
+                // loader travels corner to corner.
+                pattern: DotPattern::Diagonal,
+                wordmark: None,
+            }),
+            agent_servers::ANTIGRAVITY_ID => Some(Self {
+                name: "Antigravity",
+                icon: IconName::AiAntigravity,
+                // Google blue, #3186FF, the colour the Antigravity arch is
+                // drawn in.
+                accent: hsla(0.6, 1.0, 0.596, 1.0),
+                // The arch lifts off the ground, so the whole grid rises and
+                // settles together.
+                pattern: DotPattern::Pulse,
+                wordmark: None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// This agent's loader: the nine-dot grid, in its colour, tracing its
+    /// figure.
+    pub(crate) fn loader(&self, id: impl Into<ElementId>) -> DotSpinner {
+        DotSpinner::new(id).color(self.accent).pattern(self.pattern)
+    }
+}
+
+/// What sits above the composer on an empty thread: the agent's full logo.
+///
+/// An empty panel is otherwise a box and a caret, which says nothing about who
+/// is about to reply -- and with several agents open at once that is the first
+/// thing worth knowing. The logo is the one people know from everywhere else
+/// the agent appears, at the size a logo is shown at, not a glyph.
+pub(crate) fn agent_greeting(brand: AgentBrand, cx: &App) -> AnyElement {
+    use theme::ActiveTheme as _;
+    const WORDMARK_HEIGHT: f32 = 40.;
+
+    let lockup = match brand.wordmark {
+        Some(wordmark) => {
+            let source = if cx.theme().appearance().is_light() {
+                wordmark.light
+            } else {
+                wordmark.dark
+            };
+            img(source)
+                .h(px(WORDMARK_HEIGHT))
+                .w(px(WORDMARK_HEIGHT * wordmark.aspect_ratio))
+                .into_any_element()
+        }
+        None => h_flex()
+            .gap_3()
+            .items_center()
+            .child(
+                svg()
+                    .path(brand.icon.path())
+                    .size(px(32.))
+                    .flex_none()
+                    .text_color(brand.accent),
+            )
+            .child(
+                div()
+                    .text_size(px(30.))
+                    .line_height(px(36.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().colors().text)
+                    .child(brand.name),
+            )
+            .into_any_element(),
+    };
+
+    v_flex()
+        .items_center()
+        .gap_2()
+        .pb_6()
+        .child(lockup)
+        .into_any_element()
 }
 
 /// Shown beside the mode selector while the agent may act without asking.
@@ -303,6 +462,55 @@ pub(crate) fn relaxed_permissions_warning() -> impl IntoElement {
 pub(crate) struct UsageLimit {
     /// When the limit lifts, as a Unix timestamp in seconds, if Claude said.
     pub resets_at: Option<i64>,
+    /// Which cap was hit, which decides whether waiting is worth it.
+    pub kind: UsageLimitKind,
+}
+
+/// The cap that was reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UsageLimitKind {
+    /// The rolling five-hour window. Rolls over on its own, usually soon.
+    Session,
+    /// The weekly allowance. Not worth waiting for.
+    Weekly,
+    /// Opus specifically, with the other models still available.
+    Model,
+    /// Requests arriving too fast, rather than an allowance being spent.
+    Rate,
+}
+
+impl UsageLimitKind {
+    /// The headline, which is the part read first and often the only part read.
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            UsageLimitKind::Session => "Session Limit Reached",
+            UsageLimitKind::Weekly => "Weekly Limit Reached",
+            UsageLimitKind::Model => "Model Limit Reached",
+            UsageLimitKind::Rate => "Sending Too Fast",
+        }
+    }
+
+    /// What has happened and what to do, in that order.
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            UsageLimitKind::Session => {
+                "Claude's usage for this five-hour window is spent. The thread is saved and \
+                 picks up exactly where it left off when the window rolls over."
+            }
+            UsageLimitKind::Weekly => {
+                "Claude's weekly allowance is spent. This one does not roll over shortly, so \
+                 another agent is the faster route -- the thread here is saved either way."
+            }
+            UsageLimitKind::Model => {
+                "This model's allowance is spent. Claude's other models are still available, \
+                 and switching to one keeps the thread going."
+            }
+            UsageLimitKind::Rate => {
+                "Requests are arriving faster than Claude will accept them. Nothing is spent \
+                 and nothing is lost; waiting a moment is enough."
+            }
+        }
+    }
 }
 
 /// Recognises Claude's usage-limit message.
@@ -313,9 +521,27 @@ pub(crate) struct UsageLimit {
 /// user the generic error callout they would have had anyway.
 pub(crate) fn parse_usage_limit(message: &str) -> Option<UsageLimit> {
     let lowered = message.to_ascii_lowercase();
-    if !lowered.contains("usage limit reached") && !lowered.contains("limit reached|") {
+
+    // Ordered most specific first: a weekly message also contains "limit
+    // reached", so testing for the session case first would swallow it and tell
+    // the user to wait five hours for something that lifts next week.
+    let kind = if lowered.contains("weekly limit") || lowered.contains("weekly usage") {
+        UsageLimitKind::Weekly
+    } else if lowered.contains("opus limit")
+        || lowered.contains("model limit")
+        || (lowered.contains("limit") && lowered.contains("switch to"))
+    {
+        UsageLimitKind::Model
+    } else if lowered.contains("rate limit") || lowered.contains("too many requests") {
+        UsageLimitKind::Rate
+    } else if lowered.contains("usage limit reached")
+        || lowered.contains("limit reached|")
+        || lowered.contains("session limit")
+    {
+        UsageLimitKind::Session
+    } else {
         return None;
-    }
+    };
 
     // `Claude AI usage limit reached|1740009600` -- the CLI appends the reset
     // time after a pipe, in Unix seconds.
@@ -327,7 +553,7 @@ pub(crate) fn parse_usage_limit(message: &str) -> Option<UsageLimit> {
         .and_then(|tail| tail.parse::<i64>().ok())
         .filter(|timestamp| *timestamp > 0);
 
-    Some(UsageLimit { resets_at })
+    Some(UsageLimit { resets_at, kind })
 }
 
 /// "resets at 3:00 PM", in the user's own timezone.
@@ -337,7 +563,10 @@ pub(crate) fn parse_usage_limit(message: &str) -> Option<UsageLimit> {
 pub(crate) fn usage_limit_reset_label(limit: &UsageLimit) -> Option<String> {
     let resets_at = limit.resets_at?;
     let reset = chrono::DateTime::from_timestamp(resets_at, 0)?.with_timezone(&chrono::Local);
-    Some(format!("Resets at {}.", reset.format("%-I:%M %p on %-d %b")))
+    Some(format!(
+        "Resets at {}.",
+        reset.format("%-I:%M %p on %-d %b")
+    ))
 }
 
 #[cfg(test)]
@@ -349,7 +578,8 @@ mod tests {
         assert_eq!(
             parse_usage_limit("Claude AI usage limit reached|1740009600"),
             Some(UsageLimit {
-                resets_at: Some(1740009600)
+                resets_at: Some(1740009600),
+                kind: UsageLimitKind::Session,
             })
         );
     }
@@ -358,8 +588,31 @@ mod tests {
     fn recognises_a_usage_limit_without_a_reset_time() {
         assert_eq!(
             parse_usage_limit("Claude usage limit reached. Try again later."),
-            Some(UsageLimit { resets_at: None })
+            Some(UsageLimit {
+                resets_at: None,
+                kind: UsageLimitKind::Session,
+            })
         );
+    }
+
+    #[test]
+    fn tells_the_weekly_cap_apart_from_the_session_window() {
+        // Both contain "limit reached", and reporting a weekly cap as a
+        // five-hour window would have the user wait for something that lifts
+        // next week.
+        let weekly = parse_usage_limit("Claude AI weekly limit reached").expect("weekly");
+        assert_eq!(weekly.kind, UsageLimitKind::Weekly);
+
+        let session = parse_usage_limit("Claude AI usage limit reached").expect("session");
+        assert_eq!(session.kind, UsageLimitKind::Session);
+    }
+
+    #[test]
+    fn tells_a_rate_limit_apart_from_a_spent_allowance() {
+        // Nothing is spent here, so the advice is the opposite: wait a moment
+        // rather than go and find another agent.
+        let rate = parse_usage_limit("rate limit exceeded").expect("rate");
+        assert_eq!(rate.kind, UsageLimitKind::Rate);
     }
 
     #[test]
@@ -386,8 +639,16 @@ mod tests {
             args_start_a_bridge(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
         };
 
-        assert!(bridge(&["C:\\Users\\me\\.local\\bin\\claude.exe", "remote-control"]));
-        assert!(bridge(&["/usr/local/bin/claude", "remote-control", "--name", "laptop"]));
+        assert!(bridge(&[
+            "C:\\Users\\me\\.local\\bin\\claude.exe",
+            "remote-control"
+        ]));
+        assert!(bridge(&[
+            "/usr/local/bin/claude",
+            "remote-control",
+            "--name",
+            "laptop"
+        ]));
         assert!(bridge(&["claude", "--remote-control"]));
         assert!(bridge(&["claude", "--rc"]));
     }
@@ -416,7 +677,10 @@ mod tests {
     fn ignores_a_trailing_pipe_that_is_not_a_timestamp() {
         assert_eq!(
             parse_usage_limit("Claude AI usage limit reached|soon"),
-            Some(UsageLimit { resets_at: None })
+            Some(UsageLimit {
+                resets_at: None,
+                kind: UsageLimitKind::Session,
+            })
         );
     }
 

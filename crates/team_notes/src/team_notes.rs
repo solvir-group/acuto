@@ -505,6 +505,62 @@ pub async fn team_roster(
 mod tests {
     use super::*;
 
+    fn ticket(title: &str) -> NoteThread {
+        NoteThread {
+            id: "20260924T000000-abc".to_string(),
+            kind: Kind::Ticket,
+            file: Some("src/login.rs".to_string()),
+            anchor: Some(Anchor {
+                line: 41,
+                text: "redirect(to)".to_string(),
+            }),
+            title: Some(title.to_string()),
+            status: Status::Open,
+            assignee: Some("codex".to_string()),
+            resolved: false,
+            messages: vec![Message {
+                author: "Drew".to_string(),
+                at: "2026-09-24T10:00:00+12:00".to_string(),
+                body: "Redirect loses the query string".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn agent_names_resolve_to_registry_ids() {
+        assert_eq!(agent_for_mention("claude"), Some("claude-acp"));
+        assert_eq!(agent_for_mention("Codex"), Some("codex-acp"));
+        assert_eq!(agent_for_mention("COPILOT"), Some("github-copilot-cli"));
+        assert_eq!(agent_for_mention("sam"), None);
+    }
+
+    #[test]
+    fn each_mentioned_agent_is_asked_once_and_people_are_not() {
+        let agents = mentioned_agents("@codex and @sam, then @claude -- @codex again");
+        assert_eq!(agents, vec!["codex-acp", "claude-acp"]);
+        assert!(mentioned_agents("email me at drew@codex.dev").is_empty());
+    }
+
+    // A ticket handed to an agent has to carry what the agent needs to act on
+    // it without the panel: where the work is, the line's text to find it by if
+    // it moved, and the discussion.
+    #[test]
+    fn a_ticket_prompt_carries_the_brief() {
+        let prompt = prompt_for_agent(&ticket("Fix the login redirect"), "@codex take this");
+        assert!(prompt.starts_with("@codex take this"));
+        assert!(prompt.contains("Fix the login redirect"));
+        assert!(prompt.contains("src/login.rs:42"));
+        assert!(prompt.contains("redirect(to)"));
+        assert!(prompt.contains("Redirect loses the query string"));
+    }
+
+    #[test]
+    fn a_plain_message_prompt_is_just_what_was_said() {
+        let mut message = ticket("unused");
+        message.kind = Kind::Message;
+        assert_eq!(prompt_for_agent(&message, "@claude hi"), "@claude hi");
+    }
+
     fn thread(id: &str, line: u32, text: &str) -> NoteThread {
         NoteThread {
             id: id.to_string(),
@@ -704,5 +760,89 @@ mod tests {
             normalize_path(Path::new("src").join("nested").join("file.rs").as_path()),
             "src/nested/file.rs"
         );
+    }
+}
+
+
+/// A ticket written out as a brief for an agent.
+///
+/// Framed as work to do rather than as a data record: the agent is told what
+/// the ticket asks for and where, then given the conversation in order, then
+/// told what to do when it is finished -- which is the part a raw dump leaves
+/// out and the part that makes handing over a ticket worth doing.
+pub fn brief_for_agent(ticket: &NoteThread) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Ticket {}: {}\n\n", ticket.id, ticket.headline()));
+    out.push_str(&format!("- Status: {}\n", ticket.status.label()));
+    if let Some(assignee) = &ticket.assignee {
+        out.push_str(&format!("- Assignee: @{assignee}\n"));
+    }
+    if let Some(file) = &ticket.file {
+        match &ticket.anchor {
+            Some(anchor) => out.push_str(&format!(
+                "- Location: {file}:{} (the line read `{}` when the ticket was written; \
+                 if it has moved, find it by that text)\n",
+                anchor.line + 1,
+                anchor.text.trim()
+            )),
+            None => out.push_str(&format!("- Location: {file}\n")),
+        }
+    }
+    out.push_str("\n## Discussion\n\n");
+    for message in &ticket.messages {
+        out.push_str(&format!("**{}** ({}):\n{}\n\n", message.author, message.at, message.body));
+    }
+    out.push_str(
+        "## When you are done\n\n\
+         Make the change the ticket asks for. Keep it to what the ticket describes; \
+         if you find something else wrong, say so rather than fixing it here. \
+         Finish with a short summary of what you changed and anything a reviewer \
+         should check.\n",
+    );
+    out
+}
+
+
+/// The agents a person can hand work to by name.
+///
+/// The name is what someone types after `@`; the id is the agent's registry
+/// id. Kept here, beside mention parsing, because the chat is where the name
+/// is recognised -- the agent panel never sees it.
+pub const AGENT_MENTIONS: &[(&str, &str)] = &[
+    ("claude", "claude-acp"),
+    ("codex", "codex-acp"),
+    ("copilot", "github-copilot-cli"),
+    ("antigravity", "antigravity-acp"),
+];
+
+/// The registry id of the agent `name` refers to, if it names one.
+pub fn agent_for_mention(name: &str) -> Option<&'static str> {
+    AGENT_MENTIONS
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(name))
+        .map(|(_, id)| *id)
+}
+
+/// Every agent `@mentioned` in `text`, once each, in the order they appear.
+pub fn mentioned_agents(text: &str) -> Vec<&'static str> {
+    let mut agents = Vec::new();
+    for name in extract_mentions(text) {
+        if let Some(agent) = agent_for_mention(&name)
+            && !agents.contains(&agent)
+        {
+            agents.push(agent);
+        }
+    }
+    agents
+}
+
+/// What an agent is sent when someone mentions it in the team chat.
+///
+/// On a ticket the whole ticket goes with it, so `@codex take this` is enough
+/// on its own. Anywhere else it is just what was said.
+pub fn prompt_for_agent(record: &NoteThread, said: &str) -> String {
+    match record.kind {
+        Kind::Ticket => format!("{said}\n\n{}", brief_for_agent(record)),
+        _ => said.to_string(),
     }
 }

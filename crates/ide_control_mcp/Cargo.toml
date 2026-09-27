@@ -1,0 +1,25 @@
+[package]
+name = "ide_control_mcp"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ide_control_mcp.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+gpui.workspace = true
+log.workspace = true
+paths.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings_json.workspace = true
+tiny_http.workspace = true
+uuid.workspace = true

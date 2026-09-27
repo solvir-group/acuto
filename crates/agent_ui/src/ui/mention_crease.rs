@@ -205,6 +205,10 @@ fn open_mention_uri(
         MentionUri::Fetch { url } => {
             cx.open_url(url.as_str());
         }
+        // The ticket lives in the team tab, so a click goes there.
+        MentionUri::Ticket { .. } => {
+            window.dispatch_action(Box::new(team_notes::ToggleFocus), cx);
+        }
         MentionUri::PastedImage { .. }
         | MentionUri::Selection { abs_path: None, .. }
         | MentionUri::Diagnostics { .. }

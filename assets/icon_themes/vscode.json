@@ -1,0 +1,510 @@
+{
+  "name": "VS Code Icons",
+  "author": "vscode-icons contributors",
+  "themes": [
+    {
+      "name": "VS Code",
+      "appearance": "dark",
+      "file_stems": {
+        "cmakelists.txt": "file_type_text",
+        "readme.md": "file_type_markdown",
+        ".gitignore": "file_type_git",
+        ".gitattributes": "file_type_git",
+        ".editorconfig": "file_type_editorconfig",
+        ".eslintrc": "file_type_eslint",
+        ".prettierrc": "file_type_prettier",
+        ".npmrc": "file_type_npm",
+        ".nvmrc": "file_type_node",
+        ".env": "file_type_config",
+        "package.json": "file_type_npm",
+        "tsconfig.json": "file_type_tsconfig",
+        "cargo.toml": "file_type_toml",
+        "go.mod": "file_type_go_package",
+        "go.sum": "file_type_go_package",
+        "requirements.txt": "file_type_text",
+        "pyproject.toml": "file_type_toml",
+        "composer.json": "file_type_composer",
+        "webpack.config.js": "file_type_webpack",
+        "vite.config.ts": "file_type_vite",
+        "tailwind.config.js": "file_type_tailwind",
+        "docker-compose.yml": "file_type_docker"
+      },
+      "file_suffixes": {
+        "ts": "file_type_typescript",
+        "tsx": "file_type_reactts",
+        "js": "file_type_js",
+        "jsx": "file_type_reactjs",
+        "mjs": "file_type_js",
+        "json": "file_type_json",
+        "json5": "file_type_json5",
+        "jsonc": "file_type_json",
+        "rs": "file_type_rust",
+        "go": "file_type_go",
+        "py": "file_type_python",
+        "pyc": "file_type_binary",
+        "rb": "file_type_ruby",
+        "erb": "file_type_erb",
+        "gemspec": "file_type_ruby",
+        "java": "file_type_java",
+        "kt": "file_type_kotlin",
+        "scala": "file_type_scala",
+        "swift": "file_type_swift",
+        "c": "file_type_c",
+        "h": "file_type_cheader",
+        "cc": "file_type_cpp",
+        "cpp": "file_type_cpp",
+        "hpp": "file_type_cppheader",
+        "cxx": "file_type_cpp",
+        "cs": "file_type_csharp",
+        "fs": "file_type_fsharp",
+        "fsx": "file_type_fsharp",
+        "php": "file_type_php",
+        "vue": "file_type_vue",
+        "svelte": "file_type_svelte",
+        "elm": "file_type_elm",
+        "lua": "file_type_lua",
+        "zig": "file_type_zig",
+        "nim": "file_type_nim",
+        "dart": "file_type_dartlang",
+        "ex": "file_type_elixir",
+        "erl": "file_type_erlang",
+        "hs": "file_type_haskell",
+        "ml": "file_type_ocaml",
+        "clj": "file_type_clojure",
+        "cljs": "file_type_clojurescript",
+        "cljc": "file_type_clojure",
+        "lisp": "file_type_lisp",
+        "el": "file_type_emacs",
+        "sql": "file_type_sql",
+        "db": "file_type_db",
+        "sqlite": "file_type_sqlite",
+        "css": "file_type_css",
+        "scss": "file_type_scss",
+        "sass": "file_type_sass",
+        "less": "file_type_less",
+        "styl": "file_type_stylus",
+        "pcss": "file_type_postcss",
+        "html": "file_type_html",
+        "htm": "file_type_html",
+        "xml": "file_type_xml",
+        "svg": "file_type_svg",
+        "astro": "file_type_astro",
+        "md": "file_type_markdown",
+        "mdx": "file_type_mdx",
+        "rst": "file_type_rest",
+        "adoc": "file_type_asciidoc",
+        "txt": "file_type_text",
+        "toml": "file_type_toml",
+        "yaml": "file_type_yaml",
+        "yml": "file_type_yaml",
+        "cfg": "file_type_ini",
+        "conf": "file_type_ini",
+        "env": "file_type_config",
+        "properties": "file_type_ini",
+        "sh": "file_type_shell",
+        "bash": "file_type_shell",
+        "zsh": "file_type_shell",
+        "fish": "file_type_shell",
+        "ps1": "file_type_powershell",
+        "bat": "file_type_bat",
+        "cmd": "file_type_bat",
+        "png": "file_type_image",
+        "jpg": "file_type_image",
+        "jpeg": "file_type_image",
+        "gif": "file_type_image",
+        "avif": "file_type_avif",
+        "ico": "file_type_image",
+        "bmp": "file_type_image",
+        "mp3": "file_type_audio",
+        "wav": "file_type_audio",
+        "flac": "file_type_audio",
+        "ogg": "file_type_audio",
+        "mp4": "file_type_video",
+        "mov": "file_type_video",
+        "webm": "file_type_video",
+        "mkv": "file_type_video",
+        "zip": "file_type_zip",
+        "tar": "file_type_zip",
+        "gz": "file_type_zip",
+        "bz2": "file_type_zip",
+        "xz": "file_type_zip",
+        "7z": "file_type_zip",
+        "rar": "file_type_zip",
+        "pdf": "file_type_pdf",
+        "doc": "file_type_word",
+        "docx": "file_type_word",
+        "xls": "file_type_excel",
+        "xlsx": "file_type_excel",
+        "ppt": "file_type_powerpoint",
+        "pptx": "file_type_powerpoint",
+        "csv": "file_type_text",
+        "tsv": "file_type_text",
+        "gql": "file_type_graphql",
+        "tf": "file_type_terraform",
+        "dockerfile": "file_type_docker",
+        "gradle": "file_type_gradle",
+        "groovy": "file_type_groovy",
+        "r": "file_type_r",
+        "jl": "file_type_julia",
+        "v": "file_type_verilog",
+        "glsl": "file_type_glsl",
+        "prisma": "file_type_prisma",
+        "sol": "file_type_solidity",
+        "cr": "file_type_crystal",
+        "nix": "file_type_nix",
+        "pl": "file_type_perl",
+        "pm": "file_type_perl",
+        "vim": "file_type_vim",
+        "vb": "file_type_vb",
+        "ipynb": "file_type_jupyter",
+        "wasm": "file_type_wasm",
+        "bin": "file_type_binary",
+        "exe": "file_type_binary",
+        "dll": "file_type_binary",
+        "so": "file_type_binary",
+        "log": "file_type_log",
+        "map": "file_type_map",
+        "patch": "file_type_patch",
+        "diff": "file_type_diff"
+      },
+      "file_icons": {
+        "default_file": {
+          "path": "icons/vscode_icons/default_file.svg"
+        },
+        "default_folder": {
+          "path": "icons/vscode_icons/default_folder.svg"
+        },
+        "default_folder_opened": {
+          "path": "icons/vscode_icons/default_folder_opened.svg"
+        },
+        "file_type_asciidoc": {
+          "path": "icons/vscode_icons/file_type_asciidoc.svg"
+        },
+        "file_type_astro": {
+          "path": "icons/vscode_icons/file_type_astro.svg"
+        },
+        "file_type_audio": {
+          "path": "icons/vscode_icons/file_type_audio.svg"
+        },
+        "file_type_avif": {
+          "path": "icons/vscode_icons/file_type_avif.svg"
+        },
+        "file_type_bat": {
+          "path": "icons/vscode_icons/file_type_bat.svg"
+        },
+        "file_type_binary": {
+          "path": "icons/vscode_icons/file_type_binary.svg"
+        },
+        "file_type_c": {
+          "path": "icons/vscode_icons/file_type_c.svg"
+        },
+        "file_type_cheader": {
+          "path": "icons/vscode_icons/file_type_cheader.svg"
+        },
+        "file_type_clojure": {
+          "path": "icons/vscode_icons/file_type_clojure.svg"
+        },
+        "file_type_clojurescript": {
+          "path": "icons/vscode_icons/file_type_clojurescript.svg"
+        },
+        "file_type_composer": {
+          "path": "icons/vscode_icons/file_type_composer.svg"
+        },
+        "file_type_config": {
+          "path": "icons/vscode_icons/file_type_config.svg"
+        },
+        "file_type_cpp": {
+          "path": "icons/vscode_icons/file_type_cpp.svg"
+        },
+        "file_type_cppheader": {
+          "path": "icons/vscode_icons/file_type_cppheader.svg"
+        },
+        "file_type_crystal": {
+          "path": "icons/vscode_icons/file_type_crystal.svg"
+        },
+        "file_type_csharp": {
+          "path": "icons/vscode_icons/file_type_csharp.svg"
+        },
+        "file_type_css": {
+          "path": "icons/vscode_icons/file_type_css.svg"
+        },
+        "file_type_dartlang": {
+          "path": "icons/vscode_icons/file_type_dartlang.svg"
+        },
+        "file_type_db": {
+          "path": "icons/vscode_icons/file_type_db.svg"
+        },
+        "file_type_diff": {
+          "path": "icons/vscode_icons/file_type_diff.svg"
+        },
+        "file_type_docker": {
+          "path": "icons/vscode_icons/file_type_docker.svg"
+        },
+        "file_type_editorconfig": {
+          "path": "icons/vscode_icons/file_type_editorconfig.svg"
+        },
+        "file_type_elixir": {
+          "path": "icons/vscode_icons/file_type_elixir.svg"
+        },
+        "file_type_elm": {
+          "path": "icons/vscode_icons/file_type_elm.svg"
+        },
+        "file_type_emacs": {
+          "path": "icons/vscode_icons/file_type_emacs.svg"
+        },
+        "file_type_erb": {
+          "path": "icons/vscode_icons/file_type_erb.svg"
+        },
+        "file_type_erlang": {
+          "path": "icons/vscode_icons/file_type_erlang.svg"
+        },
+        "file_type_eslint": {
+          "path": "icons/vscode_icons/file_type_eslint.svg"
+        },
+        "file_type_excel": {
+          "path": "icons/vscode_icons/file_type_excel.svg"
+        },
+        "file_type_fsharp": {
+          "path": "icons/vscode_icons/file_type_fsharp.svg"
+        },
+        "file_type_git": {
+          "path": "icons/vscode_icons/file_type_git.svg"
+        },
+        "file_type_glsl": {
+          "path": "icons/vscode_icons/file_type_glsl.svg"
+        },
+        "file_type_go": {
+          "path": "icons/vscode_icons/file_type_go.svg"
+        },
+        "file_type_go_package": {
+          "path": "icons/vscode_icons/file_type_go_package.svg"
+        },
+        "file_type_gradle": {
+          "path": "icons/vscode_icons/file_type_gradle.svg"
+        },
+        "file_type_graphql": {
+          "path": "icons/vscode_icons/file_type_graphql.svg"
+        },
+        "file_type_groovy": {
+          "path": "icons/vscode_icons/file_type_groovy.svg"
+        },
+        "file_type_haskell": {
+          "path": "icons/vscode_icons/file_type_haskell.svg"
+        },
+        "file_type_html": {
+          "path": "icons/vscode_icons/file_type_html.svg"
+        },
+        "file_type_image": {
+          "path": "icons/vscode_icons/file_type_image.svg"
+        },
+        "file_type_ini": {
+          "path": "icons/vscode_icons/file_type_ini.svg"
+        },
+        "file_type_java": {
+          "path": "icons/vscode_icons/file_type_java.svg"
+        },
+        "file_type_js": {
+          "path": "icons/vscode_icons/file_type_js.svg"
+        },
+        "file_type_json": {
+          "path": "icons/vscode_icons/file_type_json.svg"
+        },
+        "file_type_json5": {
+          "path": "icons/vscode_icons/file_type_json5.svg"
+        },
+        "file_type_julia": {
+          "path": "icons/vscode_icons/file_type_julia.svg"
+        },
+        "file_type_jupyter": {
+          "path": "icons/vscode_icons/file_type_jupyter.svg"
+        },
+        "file_type_kotlin": {
+          "path": "icons/vscode_icons/file_type_kotlin.svg"
+        },
+        "file_type_less": {
+          "path": "icons/vscode_icons/file_type_less.svg"
+        },
+        "file_type_lisp": {
+          "path": "icons/vscode_icons/file_type_lisp.svg"
+        },
+        "file_type_log": {
+          "path": "icons/vscode_icons/file_type_log.svg"
+        },
+        "file_type_lua": {
+          "path": "icons/vscode_icons/file_type_lua.svg"
+        },
+        "file_type_map": {
+          "path": "icons/vscode_icons/file_type_map.svg"
+        },
+        "file_type_markdown": {
+          "path": "icons/vscode_icons/file_type_markdown.svg"
+        },
+        "file_type_mdx": {
+          "path": "icons/vscode_icons/file_type_mdx.svg"
+        },
+        "file_type_nim": {
+          "path": "icons/vscode_icons/file_type_nim.svg"
+        },
+        "file_type_nix": {
+          "path": "icons/vscode_icons/file_type_nix.svg"
+        },
+        "file_type_node": {
+          "path": "icons/vscode_icons/file_type_node.svg"
+        },
+        "file_type_npm": {
+          "path": "icons/vscode_icons/file_type_npm.svg"
+        },
+        "file_type_ocaml": {
+          "path": "icons/vscode_icons/file_type_ocaml.svg"
+        },
+        "file_type_patch": {
+          "path": "icons/vscode_icons/file_type_patch.svg"
+        },
+        "file_type_pdf": {
+          "path": "icons/vscode_icons/file_type_pdf.svg"
+        },
+        "file_type_perl": {
+          "path": "icons/vscode_icons/file_type_perl.svg"
+        },
+        "file_type_php": {
+          "path": "icons/vscode_icons/file_type_php.svg"
+        },
+        "file_type_postcss": {
+          "path": "icons/vscode_icons/file_type_postcss.svg"
+        },
+        "file_type_powerpoint": {
+          "path": "icons/vscode_icons/file_type_powerpoint.svg"
+        },
+        "file_type_powershell": {
+          "path": "icons/vscode_icons/file_type_powershell.svg"
+        },
+        "file_type_prettier": {
+          "path": "icons/vscode_icons/file_type_prettier.svg"
+        },
+        "file_type_prisma": {
+          "path": "icons/vscode_icons/file_type_prisma.svg"
+        },
+        "file_type_python": {
+          "path": "icons/vscode_icons/file_type_python.svg"
+        },
+        "file_type_r": {
+          "path": "icons/vscode_icons/file_type_r.svg"
+        },
+        "file_type_reactjs": {
+          "path": "icons/vscode_icons/file_type_reactjs.svg"
+        },
+        "file_type_reactts": {
+          "path": "icons/vscode_icons/file_type_reactts.svg"
+        },
+        "file_type_rest": {
+          "path": "icons/vscode_icons/file_type_rest.svg"
+        },
+        "file_type_ruby": {
+          "path": "icons/vscode_icons/file_type_ruby.svg"
+        },
+        "file_type_rust": {
+          "path": "icons/vscode_icons/file_type_rust.svg"
+        },
+        "file_type_sass": {
+          "path": "icons/vscode_icons/file_type_sass.svg"
+        },
+        "file_type_scala": {
+          "path": "icons/vscode_icons/file_type_scala.svg"
+        },
+        "file_type_scss": {
+          "path": "icons/vscode_icons/file_type_scss.svg"
+        },
+        "file_type_shell": {
+          "path": "icons/vscode_icons/file_type_shell.svg"
+        },
+        "file_type_solidity": {
+          "path": "icons/vscode_icons/file_type_solidity.svg"
+        },
+        "file_type_sql": {
+          "path": "icons/vscode_icons/file_type_sql.svg"
+        },
+        "file_type_sqlite": {
+          "path": "icons/vscode_icons/file_type_sqlite.svg"
+        },
+        "file_type_stylus": {
+          "path": "icons/vscode_icons/file_type_stylus.svg"
+        },
+        "file_type_svelte": {
+          "path": "icons/vscode_icons/file_type_svelte.svg"
+        },
+        "file_type_svg": {
+          "path": "icons/vscode_icons/file_type_svg.svg"
+        },
+        "file_type_swift": {
+          "path": "icons/vscode_icons/file_type_swift.svg"
+        },
+        "file_type_tailwind": {
+          "path": "icons/vscode_icons/file_type_tailwind.svg"
+        },
+        "file_type_terraform": {
+          "path": "icons/vscode_icons/file_type_terraform.svg"
+        },
+        "file_type_text": {
+          "path": "icons/vscode_icons/file_type_text.svg"
+        },
+        "file_type_toml": {
+          "path": "icons/vscode_icons/file_type_toml.svg"
+        },
+        "file_type_tsconfig": {
+          "path": "icons/vscode_icons/file_type_tsconfig.svg"
+        },
+        "file_type_typescript": {
+          "path": "icons/vscode_icons/file_type_typescript.svg"
+        },
+        "file_type_vb": {
+          "path": "icons/vscode_icons/file_type_vb.svg"
+        },
+        "file_type_verilog": {
+          "path": "icons/vscode_icons/file_type_verilog.svg"
+        },
+        "file_type_video": {
+          "path": "icons/vscode_icons/file_type_video.svg"
+        },
+        "file_type_vim": {
+          "path": "icons/vscode_icons/file_type_vim.svg"
+        },
+        "file_type_vite": {
+          "path": "icons/vscode_icons/file_type_vite.svg"
+        },
+        "file_type_vue": {
+          "path": "icons/vscode_icons/file_type_vue.svg"
+        },
+        "file_type_wasm": {
+          "path": "icons/vscode_icons/file_type_wasm.svg"
+        },
+        "file_type_webpack": {
+          "path": "icons/vscode_icons/file_type_webpack.svg"
+        },
+        "file_type_word": {
+          "path": "icons/vscode_icons/file_type_word.svg"
+        },
+        "file_type_xml": {
+          "path": "icons/vscode_icons/file_type_xml.svg"
+        },
+        "file_type_yaml": {
+          "path": "icons/vscode_icons/file_type_yaml.svg"
+        },
+        "file_type_zig": {
+          "path": "icons/vscode_icons/file_type_zig.svg"
+        },
+        "file_type_zip": {
+          "path": "icons/vscode_icons/file_type_zip.svg"
+        }
+      },
+      "directory_icons": {
+        "collapsed": "icons/vscode_icons/default_folder.svg",
+        "expanded": "icons/vscode_icons/default_folder_opened.svg"
+      },
+      "chevron_icons": {
+        "collapsed": "icons/file_icons/chevron_right.svg",
+        "expanded": "icons/file_icons/chevron_down.svg"
+      },
+      "colored": true
+    }
+  ]
+}

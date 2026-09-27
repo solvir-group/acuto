@@ -11,6 +11,7 @@ pub enum IconName {
     AcpRegistry,
     AiAnthropic,
     AiAnthropicCompat,
+    AiAntigravity,
     AiBedrock,
     AiClaude,
     AiDeepSeek,

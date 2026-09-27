@@ -603,7 +603,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             }
         });
 
-        let search_button = cx.new(|_| search::search_status_button::SearchButton::new());
         let diagnostic_summary =
             cx.new(|cx| diagnostics::items::DiagnosticIndicator::new(workspace, cx));
         let active_file_name = cx.new(|_| workspace::active_file_name::ActiveFileName::new());
@@ -655,7 +654,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
         workspace.status_bar().update(cx, |status_bar, cx| {
-            status_bar.add_left_item(search_button, window, cx);
             status_bar.add_left_item(lsp_button, window, cx);
             status_bar.add_left_item(diagnostic_summary, window, cx);
             status_bar.add_left_item(active_file_name, window, cx);
@@ -805,6 +803,10 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
+        // Beside the tree rather than in the centre pane: searching is how you
+        // find a file, same as browsing for one.
+        let search_panel =
+            search::search_panel::SearchPanel::load(workspace_handle.clone(), cx.clone());
         let channels_panel =
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         // Replaces the collaboration panel in practice: that one needs a server
@@ -818,6 +820,9 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let problems_panel =
             diagnostics::problems_panel::ProblemsPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
+        // Every agent working in this window, whichever worktree it is in.
+        let crew_panel =
+            agent_ui::crew_panel::CrewPanel::load(workspace_handle.clone(), cx.clone());
 
         async fn add_panel_when_ready(
             panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
@@ -834,15 +839,38 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             }
         }
 
+        /// Loads a panel that opens as a centre-pane tab.
+        ///
+        /// A window has one sidebar per edge. Stacking git, the outline, team
+        /// notes and the crew into the right dock put all of them in the strip
+        /// the agent needs, so only the agent is docked there now and the rest
+        /// open where code opens.
+        async fn add_tab_panel_when_ready(
+            panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
+            workspace_handle: WeakEntity<Workspace>,
+            mut cx: gpui::AsyncWindowContext,
+        ) {
+            if let Some(panel) = panel_task.await.context("failed to load panel").log_err()
+            {
+                workspace_handle
+                    .update_in(&mut cx, |workspace, window, cx| {
+                        workspace.register_tab_panel(panel, window, cx);
+                    })
+                    .log_err();
+            }
+        }
+
         futures::join!(
             add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
+            add_tab_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(problems_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(team_notes_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(search_panel, workspace_handle.clone(), cx.clone()),
+            add_tab_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
+            add_tab_panel_when_ready(team_notes_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
+            add_tab_panel_when_ready(crew_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
 
@@ -1366,6 +1394,15 @@ fn register_actions(
              window: &mut Window,
              cx: &mut Context<Workspace>| {
                 workspace.toggle_panel_focus::<TerminalPanel>(window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &diagnostics::problems_panel::ToggleFocus,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                workspace
+                    .toggle_panel_focus::<diagnostics::problems_panel::ProblemsPanel>(window, cx);
             },
         )
         .register_action({

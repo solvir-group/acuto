@@ -18,6 +18,14 @@ pub struct IconThemeFamilyContent {
 pub struct IconThemeContent {
     pub name: String,
     pub appearance: AppearanceContent,
+    /// Whether this theme's icons carry their own colour.
+    ///
+    /// Monochrome icons are drawn as a silhouette tinted by the editor, which
+    /// keeps them legible on any background. Icons with real artwork in them
+    /// have to be drawn as-is, or every one of them comes out a flat block of
+    /// the same colour.
+    #[serde(default)]
+    pub colored: bool,
     #[serde(default)]
     pub directory_icons: DirectoryIconsContent,
     #[serde(default)]

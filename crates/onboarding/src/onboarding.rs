@@ -15,7 +15,7 @@ use serde::Deserialize;
 use settings::{SettingsStore, VsCodeSettingsSource};
 use std::sync::Arc;
 use ui::{
-    Divider, KeyBinding, ParentElement as _, StatefulInteractiveElement, Vector, VectorName,
+    Divider, KeyBinding, ParentElement as _, StatefulInteractiveElement,
     WithScrollbar as _, prelude::*, rems_from_px,
 };
 
@@ -297,7 +297,7 @@ impl Onboarding {
     }
 
     fn render_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        crate::basics_page::render_basics_page(&self.user_store, cx).into_any_element()
+        crate::basics_page::render_basics_page(cx).into_any_element()
     }
 }
 
@@ -347,10 +347,10 @@ impl Render for Onboarding {
                                     .child(
                                         h_flex()
                                             .gap_4()
-                                            .child(
-                                                Vector::square(VectorName::ZedLogo, rems(2.5))
-                                                    .color(Color::Accent),
-                                            )
+                                            // No mark. The one that sat here was
+                                            // Zed's, which a commercial fork cannot
+                                            // ship; Acuto's own belongs here once
+                                            // there is one to draw.
                                             .child(
                                                 v_flex()
                                                     .child(

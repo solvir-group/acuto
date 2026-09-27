@@ -7,7 +7,7 @@ use settings::{
 use std::sync::{Arc, OnceLock};
 use strum::{EnumMessage, IntoDiscriminant as _, VariantArray};
 use theme::SystemAppearance;
-use ui::IntoElement;
+use ui::{IconName, IntoElement};
 
 use crate::{
     ActionLink, DynamicItem, PROJECT, SettingField, SettingItem, SettingsFieldMetadata,
@@ -93,6 +93,7 @@ pub(crate) fn settings_data(cx: &App) -> Vec<SettingsPage> {
 fn agents_page() -> SettingsPage {
     SettingsPage {
         title: "Agents",
+        icon: IconName::ZedAssistant,
         items: vec![
             SettingsPageItem::SectionHeader("Threads"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -106,6 +107,54 @@ fn agents_page() -> SettingsPage {
                     },
                     write: |settings_content, value, _| {
                         settings_content.agent.get_or_insert_default().default_agent = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Review Changes",
+                description: "Hold an agent's edits for review instead of leaving them applied. Each file it touches opens as its own diff beside your code, and nothing is settled until you accept or reject each hunk.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.review_changes"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.review_changes.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.agent.get_or_insert_default().review_changes = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Panel Agent",
+                description: "Which agent opens in the side panel. Follows the default agent unless you set it.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.panel_agent"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.panel_agent.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.agent.get_or_insert_default().panel_agent = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Tab Agent",
+                description: "Which agent opens in a centre-pane tab. Follows the default agent unless you set it.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.tab_agent"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.tab_agent.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.agent.get_or_insert_default().tab_agent = value;
                     },
                 }),
                 metadata: None,
@@ -204,6 +253,7 @@ fn developer_page(cx: &App) -> SettingsPage {
 
     SettingsPage {
         title: "Developer",
+        icon: IconName::Code,
         items: items.into_boxed_slice(),
     }
 }
@@ -319,7 +369,7 @@ fn general_page(cx: &App) -> SettingsPage {
                             settings_content.project.worktree.private_files = value;
                         },
                     }
-                    .unimplemented(),
+                    
                 ),
                 metadata: None,
                 files: USER,
@@ -564,6 +614,7 @@ fn general_page(cx: &App) -> SettingsPage {
 
     SettingsPage {
         title: "General",
+        icon: IconName::Settings,
         items: concat_sections!(
             @vec,
             general_settings_section(cx),
@@ -578,7 +629,7 @@ fn general_page(cx: &App) -> SettingsPage {
 }
 
 fn appearance_page() -> SettingsPage {
-    fn theme_section() -> [SettingsPageItem; 3] {
+    fn theme_section() -> [SettingsPageItem; 4] {
         [
             SettingsPageItem::SectionHeader("Theme"),
             SettingsPageItem::DynamicItem(DynamicItem {
@@ -760,6 +811,20 @@ fn appearance_page() -> SettingsPage {
                     }
                 }).collect(),
             }),
+            SettingsPageItem::SettingItem(SettingItem {
+                files: USER,
+                title: "Token Theme",
+                description: "Which syntax palette colours code, independently of the theme.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("token_theme"),
+                    pick: |settings_content| settings_content.theme.token_theme.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.theme.token_theme = value;
+                    },
+                }),
+                metadata: None,
+            }),
             SettingsPageItem::DynamicItem(DynamicItem {
                 discriminant: SettingItem {
                     files: USER,
@@ -844,11 +909,21 @@ fn appearance_page() -> SettingsPage {
                                         let Some(value) = value else {
                                             return;
                                         };
+                                        // Insert rather than require. A fresh
+                                        // profile has no `icon_theme` key at
+                                        // all, and matching on `as_mut()` meant
+                                        // the first selection anyone ever made
+                                        // was discarded.
                                         match settings_content
                                             .theme
-                                            .icon_theme.as_mut() {
-                                                Some(settings::IconThemeSelection::Static(theme_name)) => *theme_name = value,
-                                                _ => return
+                                            .icon_theme
+                                            .get_or_insert_with(|| {
+                                                settings::IconThemeSelection::Static(value.clone())
+                                            }) {
+                                                settings::IconThemeSelection::Static(theme_name) => *theme_name = value,
+                                                selection => {
+                                                    *selection = settings::IconThemeSelection::Static(value)
+                                                }
                                             }
                                     },
                                 }),
@@ -1116,7 +1191,7 @@ fn appearance_page() -> SettingsPage {
                             settings_content.theme.buffer_font_fallbacks = value;
                         },
                     }
-                    .unimplemented(),
+                    
                 ),
                 metadata: None,
             }),
@@ -1198,7 +1273,7 @@ fn appearance_page() -> SettingsPage {
                             settings_content.theme.ui_font_fallbacks = value;
                         },
                     }
-                    .unimplemented(),
+                    
                 ),
                 metadata: None,
             }),
@@ -1603,6 +1678,7 @@ fn appearance_page() -> SettingsPage {
 
     SettingsPage {
         title: "Appearance",
+        icon: IconName::Sparkle,
         items,
     }
 }
@@ -1694,6 +1770,7 @@ fn keymap_page() -> SettingsPage {
 
     SettingsPage {
         title: "Keymap",
+        icon: IconName::Keyboard,
         items,
     }
 }
@@ -3329,6 +3406,7 @@ fn editor_page() -> SettingsPage {
 
     SettingsPage {
         title: "Editor",
+        icon: IconName::Pencil,
         items: items,
     }
 }
@@ -3635,6 +3713,7 @@ fn languages_and_tools_page(cx: &App) -> SettingsPage {
 
     SettingsPage {
         title: "Languages & Tools",
+        icon: IconName::Book,
         items: {
             concat_sections!(
                 non_editor_language_settings_data(),
@@ -4003,6 +4082,7 @@ fn search_and_files_page() -> SettingsPage {
 
     SettingsPage {
         title: "Search & Files",
+        icon: IconName::MagnifyingGlass,
         items: concat_sections![search_section(), file_finder_section(), file_scan_section()],
     }
 }
@@ -4594,8 +4674,6 @@ fn window_and_layout_page() -> SettingsPage {
                 files: USER,
                 title: "Maximum Tabs",
                 description: "Maximum open tabs in a pane. Will not close an unsaved tab.",
-                // todo(settings_ui): The default for this value is null and it's use in code
-                // is complex, so I'm going to come back to this later
                 field: Box::new(
                     SettingField {
                         organization_override: None,
@@ -4604,8 +4682,7 @@ fn window_and_layout_page() -> SettingsPage {
                         write: |settings_content, value, _| {
                             settings_content.workspace.max_tabs = value;
                         },
-                    }
-                    .unimplemented(),
+                    },
                 ),
                 metadata: None,
             }),
@@ -5192,6 +5269,7 @@ fn window_and_layout_page() -> SettingsPage {
 
     SettingsPage {
         title: "Window & Layout",
+        icon: IconName::Screen,
         items: concat_sections![
             status_bar_section(),
             title_bar_section(),
@@ -5865,7 +5943,7 @@ fn panels_page() -> SettingsPage {
                             settings_content.project.worktree.hidden_files = value;
                         },
                     }
-                    .unimplemented(),
+                    
                 ),
                 metadata: None,
                 files: USER,
@@ -6735,6 +6813,7 @@ fn panels_page() -> SettingsPage {
 
     SettingsPage {
         title: "Panels",
+        icon: IconName::Blocks,
         items: concat_sections![
             project_panel_section(),
             terminal_panel_section(),
@@ -6862,6 +6941,7 @@ fn debugger_page() -> SettingsPage {
 
     SettingsPage {
         title: "Debugger",
+        icon: IconName::Debug,
         items: concat_sections![general_section()],
     }
 }
@@ -7732,6 +7812,7 @@ fn terminal_page() -> SettingsPage {
 
     SettingsPage {
         title: "Terminal",
+        icon: IconName::Terminal,
         items: concat_sections![
             environment_section(),
             font_section(),
@@ -8243,6 +8324,7 @@ fn version_control_page() -> SettingsPage {
 
     SettingsPage {
         title: "Version Control",
+        icon: IconName::GitBranch,
         items: concat_sections![
             git_integration_section(),
             git_gutter_section(),
@@ -8356,6 +8438,7 @@ fn collaboration_page() -> SettingsPage {
 
     SettingsPage {
         title: "Collaboration",
+        icon: IconName::UserGroup,
         items: concat_sections![calls_section(), audio_settings()],
     }
 }
@@ -8899,6 +8982,7 @@ fn ai_page(cx: &App) -> SettingsPage {
 
     SettingsPage {
         title: "AI",
+        icon: IconName::AiZed,
         items: concat_sections!(
             @vec,
             general_section(),
@@ -8953,6 +9037,7 @@ fn network_page() -> SettingsPage {
 
     SettingsPage {
         title: "Network",
+        icon: IconName::Server,
         items: concat_sections![network_section()],
     }
 }

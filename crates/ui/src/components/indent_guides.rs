@@ -190,7 +190,11 @@ pub struct RenderedIndentGuide {
 }
 
 /// Represents the layout information for an indent guide.
-#[derive(Debug, PartialEq, Eq, Hash)]
+///
+/// `Copy` so a surface can render one layout as several segments -- breaking a
+/// guide around a row, for instance -- without having to rebuild the layout by
+/// hand for each piece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IndentGuideLayout {
     /// The starting position of the indent guide, where x is the indentation level
     /// and y is the starting row.

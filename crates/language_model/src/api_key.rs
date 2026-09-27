@@ -30,10 +30,28 @@ pub enum LoadStatus {
     Loaded(ApiKey),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiKey {
     source: ApiKeySource,
     key: Arc<str>,
+}
+
+/// Prints where the key came from, never the key.
+///
+/// Deliberately hand-written. A derived `Debug` here prints the secret, and it
+/// only takes one `{:?}` anywhere up the stack -- a wrapped error, a traced
+/// request, a panic formatting its locals -- to put a user's key in the log
+/// file that bug reports attach.
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKey")
+            .field("source", &self.source)
+            // Length, because "is the key the one I think it is" is the only
+            // question anyone is debugging here, and it can be answered without
+            // showing the key.
+            .field("key", &format_args!("[redacted; {} chars]", self.key.len()))
+            .finish()
+    }
 }
 
 impl ApiKeyState {
@@ -294,5 +312,42 @@ impl Display for ApiKeySource {
             ApiKeySource::EnvVar(var) => write!(f, "environment variable {}", var),
             ApiKeySource::SystemKeychain => write!(f, "system keychain"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_the_key() {
+        // The whole point of the hand-written impl. If someone re-derives
+        // `Debug` on `ApiKey`, this is what catches it -- and it catches it
+        // here rather than in a user's log file.
+        let key = ApiKey {
+            source: ApiKeySource::SystemKeychain,
+            key: "sk-ant-super-secret-value".into(),
+        };
+
+        let printed = format!("{key:?}");
+        assert!(!printed.contains("sk-ant-super-secret-value"));
+        assert!(!printed.contains("secret"));
+        assert!(printed.contains("redacted"));
+    }
+
+    #[test]
+    fn debug_survives_being_nested() {
+        // The realistic leak is not `{:?}` on the key itself -- it is `{:?}` on
+        // something three layers up that happens to contain one.
+        let status = LoadStatus::Loaded(ApiKey {
+            source: ApiKeySource::EnvVar("ANTHROPIC_API_KEY".into()),
+            key: "sk-ant-nested-secret".into(),
+        });
+
+        let printed = format!("{status:?}");
+        assert!(!printed.contains("sk-ant-nested-secret"));
+        // The variable name is not the secret, and knowing which one was used
+        // is the thing that makes a misconfiguration diagnosable.
+        assert!(printed.contains("ANTHROPIC_API_KEY"));
     }
 }

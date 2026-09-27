@@ -26,6 +26,15 @@ pub struct BufferDiff {
     secondary_diff: Option<Entity<BufferDiff>>,
     buffer_snapshot: text::BufferSnapshot,
     base_kind: DiffBaseKind,
+    /// Whether a run of changed lines is offered as one change or as a change
+    /// per line.
+    ///
+    /// Reading a diff, one block is what you want: the change is the unit of
+    /// thought. Deciding on someone else's work line by line is a different
+    /// job, and a rewrite that arrives as a single block cannot be taken in
+    /// part -- accepting any of it accepts all of it. Agent review sets this;
+    /// diffs against git do not.
+    line_granularity: bool,
 }
 
 /// Where this diff's base text came from. Only diffs whose base is HEAD
@@ -712,7 +721,7 @@ impl BufferDiffSnapshot {
             cursor.next();
         }
 
-        Patch::new(hunk_patch).compose(edits_since_diff)
+        Patch::new(coalesce_touching_edits(hunk_patch)).compose(edits_since_diff)
     }
 
     #[cfg(test)]
@@ -743,7 +752,7 @@ impl BufferDiffSnapshot {
                 new: Point::zero()..original_snapshot.max_point(),
             })
         }
-        let hunk_patch = Patch::new(hunk_edits);
+        let hunk_patch = Patch::new(coalesce_touching_edits(hunk_edits));
 
         hunk_patch.compose(buffer.edits_since::<Point>(original_snapshot.version()))
     }
@@ -1185,6 +1194,7 @@ fn compute_hunks(
     diff_base: Option<(Arc<str>, Rope)>,
     buffer: &text::BufferSnapshot,
     diff_options: Option<DiffOptions>,
+    line_granularity: bool,
 ) -> SumTree<InternalDiffHunk> {
     let mut tree = SumTree::new(buffer);
 
@@ -1220,7 +1230,13 @@ fn compute_hunks(
         diff.postprocess_lines(&input);
         let mut sink = HunkSink::new(&diff_base, &diff_base_rope, buffer, diff_options.as_ref());
         for hunk in diff.hunks() {
-            sink.process_change(hunk.before, hunk.after);
+            if line_granularity {
+                for (before, after) in split_change_per_line(hunk.before, hunk.after) {
+                    sink.process_change(before, after);
+                }
+            } else {
+                sink.process_change(hunk.before, hunk.after);
+            }
         }
         for hunk in sink.finish() {
             tree.push(hunk, buffer);
@@ -1240,6 +1256,58 @@ fn compute_hunks(
 
     tree
 }
+/// Breaks one run of changed lines into a change per line.
+///
+/// Replaced lines are paired off in order, which is what a rewrite looks like
+/// and what makes each line separately answerable. Lines with no counterpart
+/// are what is left over: added lines become a change each, so new code can be
+/// taken a line at a time, while removed lines stay together, since a deletion
+/// is one absence however many lines it swallowed and splitting it would stack
+/// several empty changes on the same row.
+/// Joins edits that touch or overlap on either side, which `Patch::new`
+/// forbids. Line-granular diffs produce adjacent edits by design.
+fn coalesce_touching_edits(edits: Vec<Edit<Point>>) -> Vec<Edit<Point>> {
+    let mut coalesced: Vec<Edit<Point>> = Vec::with_capacity(edits.len());
+    for edit in edits {
+        match coalesced.last_mut() {
+            Some(last) if edit.old.start <= last.old.end || edit.new.start <= last.new.end => {
+                last.old.end = last.old.end.max(edit.old.end);
+                last.new.end = last.new.end.max(edit.new.end);
+            }
+            _ => coalesced.push(edit),
+        }
+    }
+    coalesced
+}
+
+pub fn split_change_per_line(
+    before: Range<u32>,
+    after: Range<u32>,
+) -> Vec<(Range<u32>, Range<u32>)> {
+    let removed = before.end - before.start;
+    let added = after.end - after.start;
+    let paired = removed.min(added);
+
+    let mut changes = Vec::new();
+    for line in 0..paired {
+        changes.push((
+            before.start + line..before.start + line + 1,
+            after.start + line..after.start + line + 1,
+        ));
+    }
+    if removed > paired {
+        changes.push((before.start + paired..before.end, after.end..after.end));
+    }
+    for line in paired..added {
+        changes.push((before.end..before.end, after.start + line..after.start + line + 1));
+    }
+
+    if changes.is_empty() {
+        changes.push((before, after));
+    }
+    changes
+}
+
 struct HunkSink<'a> {
     diff_base_rope: &'a Rope,
     buffer: &'a text::BufferSnapshot,
@@ -1590,7 +1658,14 @@ impl BufferDiff {
             buffer_snapshot: buffer.clone(),
             secondary_diff: None,
             base_kind,
+            line_granularity: false,
         }
+    }
+
+    /// Offers each changed line as its own change, rather than each run of
+    /// changed lines. See [`BufferDiff::line_granularity`].
+    pub fn set_line_granularity(&mut self, line_granularity: bool) {
+        self.line_granularity = line_granularity;
     }
 
     pub fn new_with_base_text_buffer(
@@ -1606,6 +1681,7 @@ impl BufferDiff {
             buffer_snapshot: buffer.clone(),
             secondary_diff: None,
             base_kind,
+            line_granularity: false,
         }
     }
 
@@ -1645,6 +1721,7 @@ impl BufferDiff {
             buffer_snapshot: buffer.clone(),
             secondary_diff: None,
             base_kind,
+            line_granularity: false,
         }
     }
 
@@ -1956,6 +2033,7 @@ impl BufferDiff {
         let buffer_snapshot = buffer.clone();
         let base_text_snapshot = base_text_snapshot.clone();
         let base_text_exists = base_text.is_some();
+        let line_granularity = self.line_granularity;
         let unchanged_hunks = self.diff_snapshot.as_ref().and_then(|diff_snapshot| {
             if diff_snapshot.base_text_exists == base_text_exists
                 && diff_snapshot.base_text.version() == base_text_snapshot.version()
@@ -1975,9 +2053,10 @@ impl BufferDiff {
                     Some((base_text, base_text_snapshot.as_rope().clone())),
                     &buffer,
                     diff_options,
+                    line_granularity,
                 )
             } else {
-                compute_hunks(None, &buffer, diff_options)
+                compute_hunks(None, &buffer, diff_options, false)
             };
 
             BufferDiffUpdate {
@@ -2437,6 +2516,78 @@ mod tests {
     #[ctor::ctor(unsafe)]
     fn init_logger() {
         zlog::init_test();
+    }
+
+    // Line-granular review emits one hunk per changed line, so consecutive
+    // changed lines produce edits that touch. `Patch::new` rejects those, and
+    // the split diff view builds a patch straight from the hunks: before this
+    // was coalesced, opening a review of adjacent lines aborted the process.
+    #[test]
+    fn test_coalesce_touching_edits() {
+        let point = |row| Point::new(row, 0);
+
+        let touching = vec![
+            Edit {
+                old: point(16)..point(17),
+                new: point(16)..point(17),
+            },
+            Edit {
+                old: point(17)..point(18),
+                new: point(17)..point(18),
+            },
+            Edit {
+                old: point(18)..point(19),
+                new: point(18)..point(19),
+            },
+            Edit {
+                old: point(21)..point(22),
+                new: point(21)..point(22),
+            },
+        ];
+
+        let coalesced = coalesce_touching_edits(touching);
+        assert_eq!(
+            coalesced,
+            vec![
+                Edit {
+                    old: point(16)..point(19),
+                    new: point(16)..point(19),
+                },
+                Edit {
+                    old: point(21)..point(22),
+                    new: point(21)..point(22),
+                },
+            ]
+        );
+        // The assertion that used to abort lives inside `Patch::new`.
+        Patch::new(coalesced);
+    }
+
+    // Two insertions at the same base row share an empty `old` range, so they
+    // touch on the base side even though their `new` ranges do not.
+    #[test]
+    fn test_coalesce_touching_edits_joins_insertions_at_one_point() {
+        let point = |row| Point::new(row, 0);
+
+        let coalesced = coalesce_touching_edits(vec![
+            Edit {
+                old: point(4)..point(4),
+                new: point(4)..point(5),
+            },
+            Edit {
+                old: point(4)..point(4),
+                new: point(5)..point(6),
+            },
+        ]);
+
+        assert_eq!(
+            coalesced,
+            vec![Edit {
+                old: point(4)..point(4),
+                new: point(4)..point(6),
+            }]
+        );
+        Patch::new(coalesced);
     }
 
     #[gpui::test]
@@ -3867,6 +4018,7 @@ mod tests {
             Some((Arc::from(initial_base), Rope::from(initial_base))),
             buffer.snapshot(),
             None,
+            false,
         );
 
         // Insert "XXX\n" after "aaa\n" in the base text.
@@ -3878,6 +4030,7 @@ mod tests {
             Some((new_base_str_1.clone(), Rope::from(new_base_str_1.as_ref()))),
             buffer.snapshot(),
             None,
+            false,
         );
 
         let DiffChanged {
@@ -3927,6 +4080,7 @@ mod tests {
             Some((Arc::from(simple_base), Rope::from(simple_base))),
             buffer_2.snapshot(),
             None,
+            false,
         );
 
         // The base text is edited so "two" becomes "TWO", now matching the buffer.
@@ -3938,6 +4092,7 @@ mod tests {
             Some((new_base_str_2.clone(), Rope::from(new_base_str_2.as_ref()))),
             buffer_2.snapshot(),
             None,
+            false,
         );
 
         let DiffChanged {
@@ -3995,6 +4150,7 @@ mod tests {
             Some((Arc::from(base_3), Rope::from(base_3))),
             buffer_3.snapshot(),
             None,
+            false,
         );
 
         // Change "ddd" to "DDD" in the base text so that hunk disappears,
@@ -4007,6 +4163,7 @@ mod tests {
             Some((new_base_str_3.clone(), Rope::from(new_base_str_3.as_ref()))),
             buffer_3.snapshot(),
             None,
+            false,
         );
 
         let DiffChanged {
@@ -4063,6 +4220,7 @@ mod tests {
             Some((Arc::from(base_4), Rope::from(base_4))),
             buffer_4.snapshot(),
             None,
+            false,
         );
 
         // Edit the buffer: change "delta" to "DELTA" (new modification hunk).
@@ -4085,6 +4243,7 @@ mod tests {
             Some((new_base_str_4.clone(), Rope::from(new_base_str_4.as_ref()))),
             buffer_4.snapshot(),
             None,
+            false,
         );
 
         let DiffChanged {

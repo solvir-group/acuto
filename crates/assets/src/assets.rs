@@ -10,6 +10,11 @@ use rust_embed::RustEmbed;
 #[include = "icons/**/*"]
 #[include = "images/**/*"]
 #[include = "themes/**/*"]
+// Icon themes ship as data the same way colour themes do. Without this the
+// files exist in the repository, the loader reads an empty listing, and the
+// icon theme named in the default settings resolves to nothing -- which shows
+// up only as one line in the log and a silent fallback to the built-in set.
+#[include = "icon_themes/**/*"]
 #[exclude = "themes/src/*"]
 #[include = "sounds/**/*"]
 #[include = "prompts/**/*"]

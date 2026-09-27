@@ -112,10 +112,6 @@ impl Verdict {
             }
         }
     }
-
-    pub fn is_clean(&self) -> bool {
-        matches!(self, Self::Clean { .. })
-    }
 }
 
 /// Reports on the agent's edits once the language servers have caught up.
@@ -136,6 +132,13 @@ pub fn report(
         let Some(verdict) = Verdict::from_counts(&counts) else {
             return;
         };
+        // Only a verdict worth interrupting for. A clean turn used to raise a
+        // toast of its own, which meant a notification after every turn that
+        // edited anything -- saying, each time, that there was nothing to say.
+        // The review panel already shows what changed.
+        if !matches!(verdict, Verdict::Broken { .. }) {
+            return;
+        }
 
         workspace
             .update(cx, |workspace, cx| {

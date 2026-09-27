@@ -11,6 +11,7 @@ mod multi_workspace_tests;
 pub mod notifications;
 pub mod pane;
 pub mod pane_group;
+pub mod panel_item;
 pub mod path_list {
     pub use util::path_list::{PathList, SerializedPathList};
 }
@@ -26,6 +27,7 @@ pub mod tasks;
 mod theme_preview;
 mod toast_layer;
 mod toolbar;
+mod wallpaper;
 pub mod welcome;
 pub mod workspace_error;
 mod workspace_settings;
@@ -61,13 +63,15 @@ use futures::{
     future::{Shared, try_join_all},
 };
 use gpui::{
-    Action, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Axis, Bounds,
-    Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView, MouseButton,
-    PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful, Subscription,
-    SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds, WindowHandle,
-    WindowId, WindowOptions, actions, canvas, point, relative, size, transparent_black,
+    Action, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Axis, Background,
+    Bounds, Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView,
+    MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful,
+    Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds,
+    WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
+    transparent_black,
 };
+use gpui::{linear_color_stop, linear_gradient};
 pub use history_manager::*;
 pub use item::{
     FollowableItem, FollowableItemHandle, Item, ItemHandle, ItemSettings, PreviewTabsSettings,
@@ -162,7 +166,10 @@ pub use workspace_settings::{
 };
 use zed_actions::{Spawn, feedback::FileBugReport, theme::ToggleMode};
 
-use crate::{dock::PanelSizeState, item::ItemBufferKind, notifications::NotificationId};
+use crate::{
+    dock::PanelSizeState, item::ItemBufferKind, notifications::NotificationId,
+    panel_item::PanelItem,
+};
 use crate::{
     persistence::{
         SerializedAxis,
@@ -1382,6 +1389,11 @@ pub struct Workspace {
     left_dock: Entity<Dock>,
     bottom_dock: Entity<Dock>,
     right_dock: Entity<Dock>,
+    /// Panels that open as centre-pane tabs instead of being docked. They are
+    /// held here so that `panel::<T>` still finds them: status bar items and
+    /// other panels look each other up that way, and a panel that moved out of
+    /// a dock should not disappear from those lookups.
+    tab_panels: Vec<Arc<dyn PanelHandle>>,
     panes: Vec<Entity<Pane>>,
     panes_by_item: HashMap<EntityId, WeakEntity<Pane>>,
     active_pane: Entity<Pane>,
@@ -1798,6 +1810,12 @@ impl Workspace {
         let subscriptions = vec![
             cx.observe_window_activation(window, Self::on_window_activation_changed),
             cx.observe_window_bounds(window, move |this, window, cx| {
+                // The wallpaper backdrop is placed relative to the screen, so it
+                // has to follow the window as it moves. Only then: re-rendering
+                // the whole workspace for every move event is not free.
+                if wallpaper::is_active(cx) {
+                    cx.notify();
+                }
                 if !window.is_window_active() {
                     return;
                 }
@@ -1866,6 +1884,7 @@ impl Workspace {
             left_dock,
             bottom_dock,
             right_dock,
+            tab_panels: Vec::new(),
             _panels_task: None,
             project: project.clone(),
             follower_states: Default::default(),
@@ -2136,6 +2155,38 @@ impl Workspace {
                 })?
                 .await
                 .unwrap_or_default();
+
+            // A project opened for the first time has nothing restored and so
+            // nothing on screen. Its README is the one file it has volunteered
+            // as the thing to read first, so that is what opens -- and cloning
+            // a repository is always a first time.
+            // `open_items` returns a slot for every path it was given, opened
+            // or not, so "nothing opened" is every slot empty.
+            if opened_items.iter().all(Option::is_none) && !is_empty_workspace {
+                let readme = window
+                    .update(cx, |_, _window, cx| {
+                        workspace
+                            .read(cx)
+                            .project()
+                            .read(cx)
+                            .worktrees(cx)
+                            .find_map(|worktree| readme_path(&worktree, cx))
+                    })
+                    .ok()
+                    .flatten();
+
+                if let Some(readme) = readme {
+                    window
+                        .update(cx, |_, window, cx| {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace
+                                    .open_path(readme, None, true, window, cx)
+                                    .detach_and_log_err(cx);
+                            })
+                        })
+                        .log_err();
+                }
+            }
 
             // Restore default dock state for empty workspaces
             // Only restore if:
@@ -4569,6 +4620,80 @@ impl Workspace {
         self.all_docks()
             .iter()
             .find_map(|dock| dock.read(cx).panel::<T>())
+            .or_else(|| {
+                self.tab_panels
+                    .iter()
+                    .find_map(|panel| panel.to_any().downcast::<T>().ok())
+            })
+    }
+
+    /// Registers a panel that opens as a tab rather than in a dock.
+    ///
+    /// The panel is built exactly as a docked one is, so everything that looks
+    /// it up by type keeps working; it simply has no dock to live in until
+    /// something opens it.
+    pub fn register_tab_panel<T: Panel>(
+        &mut self,
+        panel: Entity<T>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus_handle = panel.panel_focus_handle(cx);
+        cx.on_focus_in(&focus_handle, window, Self::handle_panel_focused)
+            .detach();
+        self.tab_panels.push(Arc::new(panel));
+        cx.notify();
+    }
+
+    /// Opens a registered panel as a tab in the active pane, or activates the
+    /// tab that is already showing it.
+    ///
+    /// Returns false when no panel of that type was registered, so a caller can
+    /// fall back to the dock.
+    pub fn open_panel_as_tab<T: Panel>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(panel) = self
+            .tab_panels
+            .iter()
+            .find(|panel| panel.to_any().downcast::<T>().is_ok())
+            .cloned()
+        else {
+            return false;
+        };
+
+        // Searched across every pane, not just the active one: the tab may have
+        // been dragged elsewhere, and wrapping the same panel a second time
+        // would render one stateful view in two places.
+        let panel_id = panel.panel_id();
+        let existing = self.panes.iter().find_map(|pane| {
+            let ix = pane.read(cx).items().enumerate().find_map(|(ix, item)| {
+                let item = item.downcast::<PanelItem>()?;
+                (item.read(cx).panel_id() == panel_id).then_some(ix)
+            })?;
+            Some((pane.clone(), ix))
+        });
+
+        // A panel only does its work -- refreshing, watching -- once told it
+        // is active, which the dock does on showing it and a tab has to do
+        // itself, or a panel opened as a tab sits inert.
+        panel.set_active(true, window, cx);
+
+        if let Some((pane, ix)) = existing {
+            window.focus(&pane.focus_handle(cx), cx);
+            pane.update(cx, |pane, cx| {
+                pane.activate_item(ix, true, true, window, cx)
+            });
+        } else {
+            // Built before `cx.new` takes the context: constructing it reads
+            // the panel's name and icon, which needs the context too.
+            let panel_item = PanelItem::new(panel, window, cx);
+            let item = cx.new(|_| panel_item);
+            self.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+        }
+        true
     }
 
     // If a dock panel is zoomed, focus it instead of the center pane.
@@ -9080,6 +9205,39 @@ impl Render for DraggedDock {
     }
 }
 
+/// The workspace ground, with a shallow gradient across it.
+///
+/// The theme format has no gradients -- every colour in it is flat -- so a
+/// window built purely from theme values is a set of flat rectangles. This
+/// keeps the theme's colour and varies its lightness by a few points from top
+/// to bottom, which is the difference between a surface and a slab.
+///
+/// Derived rather than configured: every theme, including ones a user installs,
+/// gets ambience that matches its own background instead of a hardcoded tint
+/// that would only suit the ones shipped here.
+fn workspace_ambience(background: Hsla) -> Background {
+    // Away from the midpoint in both directions, so a light theme lifts at the
+    // top and a dark theme deepens at the bottom rather than both shifting the
+    // same way and one of them looking washed out.
+    let lift = 0.022;
+    let top = Hsla {
+        l: (background.l + lift).clamp(0., 1.),
+        ..background
+    };
+    let bottom = Hsla {
+        l: (background.l - lift * 0.6).clamp(0., 1.),
+        ..background
+    };
+
+    // 165 degrees: near-vertical with a slight lean, so the light reads as
+    // coming from somewhere rather than as a horizon line across the window.
+    linear_gradient(
+        165.,
+        linear_color_stop(top, 0.),
+        linear_color_stop(bottom, 1.),
+    )
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         static FIRST_PAINT: AtomicBool = AtomicBool::new(true);
@@ -9122,6 +9280,7 @@ impl Render for Workspace {
             .map(|(_, notification)| notification.entity_id())
             .collect::<Vec<_>>();
         let bottom_dock_layout = WorkspaceSettings::get_global(cx).bottom_dock_layout;
+        let wallpaper_backdrop = wallpaper::render_backdrop(window, cx);
 
         let pane_render_context = PaneRenderContext {
             follower_states: &self.follower_states,
@@ -9143,6 +9302,7 @@ impl Render for Workspace {
             .items_start()
             .text_color(colors.text)
             .overflow_hidden()
+            .children(wallpaper_backdrop)
             // Expose the title bar as an ARIA toolbar so region navigation
             // (FocusNextPart) can reach the top bar's controls and assistive
             // technology announces it as a toolbar. The contained controls form
@@ -9194,7 +9354,7 @@ impl Render for Workspace {
                     .child(
                         div()
                             .id("workspace")
-                            .bg(colors.background)
+                            .bg(workspace_ambience(colors.background))
                             .relative()
                             .flex_1()
                             .w_full()
@@ -10584,6 +10744,35 @@ pub fn open_workspace_by_id(
         })?;
 
         Ok(window)
+    })
+}
+
+/// The README at a worktree's root, if it has one.
+///
+/// Only the root: a README deeper in the tree documents a subdirectory, and
+/// opening one of those to introduce the project would be picking an arbitrary
+/// corner of it. Extensions are tried in the order they are commonly used, and
+/// the name is matched case-insensitively because both `README` and `Readme`
+/// are conventional.
+fn readme_path(worktree: &Entity<project::Worktree>, cx: &App) -> Option<ProjectPath> {
+    const STEMS: [&str; 3] = ["README", "Readme", "readme"];
+    const EXTENSIONS: [&str; 4] = ["md", "markdown", "rst", "txt"];
+
+    let worktree = worktree.read(cx);
+    let worktree_id = worktree.id();
+
+    // Looked up by name rather than by walking the tree: a walk visits every
+    // entry in a large repository, on the main thread, to find a root file.
+    STEMS.iter().find_map(|stem| {
+        EXTENSIONS.iter().find_map(|extension| {
+            let name = format!("{stem}.{extension}");
+            let path = RelPath::from_unix_str(&name).ok()?;
+            let entry = worktree.entry_for_path(path)?;
+            entry.is_file().then(|| ProjectPath {
+                worktree_id,
+                path: entry.path.clone(),
+            })
+        })
     })
 }
 

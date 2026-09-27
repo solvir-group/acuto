@@ -506,28 +506,18 @@ pub fn init(cx: &mut App) {
 
 fn init_renderers(cx: &mut App) {
     cx.default_global::<SettingFieldRenderer>()
+        // A setting with no control is not shown at all.
+        //
+        // The alternative -- a full row whose only affordance is a button
+        // reading "Edit in settings.json" -- costs the space of a real setting
+        // and delivers nothing but the news that this window cannot help. The
+        // setting is still editable in the file, which is where anyone who
+        // would have pressed that button was going anyway.
         .add_renderer::<UnimplementedSettingField>(
-            |settings_window, item, _, settings_file, _, sub_field, _, cx| {
-                render_settings_item(
-                    settings_window,
-                    item,
-                    settings_file,
-                    Button::new("open-in-settings-file", "Edit in settings.json")
-                        .style(ButtonStyle::Outlined)
-                        .size(ButtonSize::Medium)
-                        .tab_index(0_isize)
-                        .tooltip(Tooltip::for_action_title_in(
-                            "Edit in settings.json",
-                            &OpenCurrentFile,
-                            &settings_window.focus_handle,
-                        ))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_current_settings_file(window, cx);
-                        }))
-                        .into_any_element(),
-                    sub_field,
-                    cx,
-                )
+            |_settings_window, _item, _, _settings_file, _, _sub_field, _, _cx| {
+                // The renderer must return the row container type, so the row
+                // is emitted empty and with no height rather than skipped.
+                div().id("unimplemented-setting").h_0()
             },
         )
         .add_basic_renderer::<bool>(render_toggle_button)
@@ -559,6 +549,7 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<settings::DockPosition>(render_dropdown)
         .add_basic_renderer::<settings::SidebarDockPosition>(render_dropdown)
         .add_basic_renderer::<settings::DefaultAgent>(render_dropdown)
+        .add_basic_renderer::<settings::TokenTheme>(render_dropdown)
         .add_basic_renderer::<settings::AgentTerminalMode>(render_dropdown)
         .add_basic_renderer::<settings::GitGutterSetting>(render_dropdown)
         .add_basic_renderer::<settings::GitHunkStyleSetting>(render_dropdown)
@@ -599,6 +590,13 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<u32>(render_editable_number_field)
         .add_basic_renderer::<u64>(render_editable_number_field)
         .add_basic_renderer::<usize>(render_editable_number_field)
+        .add_basic_renderer::<Vec<String>>(render_string_list_field)
+        .add_basic_renderer::<Vec<settings::FontFamilyName>>(render_string_list_field)
+        .add_basic_renderer::<settings::ExtendingVec<String>>(render_extending_string_list_field)
+        // `max_tabs` is `Option<NonZeroUsize>`, and the type already satisfies
+        // the number field's trait -- it was never wired up, so the setting
+        // rendered as a dead row pointing at the JSON file.
+        .add_basic_renderer::<std::num::NonZero<usize>>(render_editable_number_field)
         .add_basic_renderer::<NonZero<usize>>(render_editable_number_field)
         .add_basic_renderer::<NonZeroU32>(render_editable_number_field)
         .add_basic_renderer::<settings::CodeFade>(render_editable_number_field)
@@ -1172,6 +1170,7 @@ impl Drop for SubPage {
 #[derive(Debug)]
 struct NavBarEntry {
     title: &'static str,
+    icon: Option<IconName>,
     is_root: bool,
     expanded: bool,
     page_index: usize,
@@ -1181,6 +1180,12 @@ struct NavBarEntry {
 
 struct SettingsPage {
     title: &'static str,
+    /// Shown beside the title in the navigation.
+    ///
+    /// Eighteen rows of identical grey text is a list you read linearly every
+    /// time, because nothing tells "Appearance" from "Editor" apart except the
+    /// word itself. A shape is something you can aim at from memory.
+    icon: IconName,
     items: Box<[SettingsPageItem]>,
 }
 
@@ -2234,6 +2239,7 @@ impl SettingsWindow {
         for (page_index, page) in self.pages.iter().enumerate() {
             navbar_entries.push(NavBarEntry {
                 title: page.title,
+                icon: Some(page.icon),
                 is_root: true,
                 expanded: false,
                 page_index,
@@ -2247,6 +2253,10 @@ impl SettingsWindow {
                 };
                 navbar_entries.push(NavBarEntry {
                     title,
+                    // Section rows sit under an icon-bearing page and carry an
+                    // indentation line of their own; a second icon there reads
+                    // as a second level of importance rather than as structure.
+                    icon: None,
                     is_root: false,
                     expanded: false,
                     page_index,
@@ -3332,6 +3342,7 @@ impl SettingsWindow {
                                             ("settings-ui-navbar-entry", entry_index),
                                             entry.title,
                                         )
+                                        .when_some(entry.icon, |item, icon| item.icon(icon))
                                         .track_focus(&entry.focus_handle)
                                         .root_item(entry.is_root)
                                         .toggle_state(this.is_navbar_entry_selected(entry_index))
@@ -5085,6 +5096,149 @@ fn get_current_value<'a, T>(
     })
 }
 
+/// Edits a `Vec<String>` setting as one comma-separated line.
+///
+/// Entries are trimmed and empties dropped, so a trailing comma or a stray
+/// double space does not become a pattern that matches nothing and silently
+/// does nothing. An empty line clears the setting rather than storing an empty
+/// list, which is the difference between "no override" and "override with
+/// nothing" -- for a glob list those mean opposite things.
+fn render_string_list_field<T>(
+    field: SettingField<Vec<T>>,
+    file: SettingsUiFile,
+    metadata: Option<&SettingsFieldMetadata>,
+    title: &'static str,
+    description: &'static str,
+    _window: &mut Window,
+    cx: &mut App,
+) -> AnyElement
+where
+    T: From<String> + AsRef<str> + Clone + Send + Sync + 'static,
+{
+    let (_, initial) =
+        SettingsStore::global(cx).get_value_from_file(file.to_settings(), field.pick);
+    let initial_text = initial.filter(|entries| !entries.is_empty()).map(|entries| {
+        entries
+            .iter()
+            .map(|entry| entry.as_ref())
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+
+    SettingsInputField::new(field.json_path.unwrap_or("settings-string-list-field"))
+        .tab_index(0)
+        .aria_label(title)
+        .when(!description.is_empty(), |editor| {
+            editor.aria_description(description)
+        })
+        .when_some(initial_text, |editor, text| editor.with_initial_text(text))
+        .with_placeholder(
+            metadata
+                .and_then(|metadata| metadata.placeholder)
+                .unwrap_or("Comma separated"),
+        )
+        .display_clear_button()
+        .confirm_on_focus_out()
+        .on_confirm({
+            move |new_text, window, cx| {
+                let entries: Option<Vec<T>> = new_text.and_then(|text| {
+                    let entries: Vec<T> = text
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .map(|entry| T::from(entry.to_string()))
+                        .collect();
+                    // Cleared, rather than set to an empty list.
+                    (!entries.is_empty()).then_some(entries)
+                });
+
+                update_settings_file(
+                    file.clone(),
+                    field.json_path,
+                    window,
+                    cx,
+                    move |settings, app| {
+                        (field.write)(settings, entries, app);
+                    },
+                )
+                .log_err();
+            }
+        })
+        .into_any_element()
+}
+
+/// The same control for settings stored as an `ExtendingVec`.
+///
+/// A newtype over `Vec<T>` whose merge semantics differ -- it extends the
+/// default rather than replacing it -- which changes nothing about how the list
+/// is typed or edited.
+///
+/// Written out rather than delegating to `render_string_list_field`: a
+/// `SettingField` holds fn pointers, so a wrapper cannot close over the field
+/// it is adapting.
+fn render_extending_string_list_field<T>(
+    field: SettingField<settings::ExtendingVec<T>>,
+    file: SettingsUiFile,
+    metadata: Option<&SettingsFieldMetadata>,
+    title: &'static str,
+    description: &'static str,
+    _window: &mut Window,
+    cx: &mut App,
+) -> AnyElement
+where
+    T: From<String> + AsRef<str> + Clone + Send + Sync + 'static,
+{
+    let (_, initial) =
+        SettingsStore::global(cx).get_value_from_file(file.to_settings(), field.pick);
+    let initial_text = initial.filter(|list| !list.0.is_empty()).map(|list| {
+        list.0
+            .iter()
+            .map(|entry| entry.as_ref())
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+
+    SettingsInputField::new(field.json_path.unwrap_or("settings-extending-list-field"))
+        .tab_index(0)
+        .aria_label(title)
+        .when(!description.is_empty(), |editor| {
+            editor.aria_description(description)
+        })
+        .when_some(initial_text, |editor, text| editor.with_initial_text(text))
+        .with_placeholder(
+            metadata
+                .and_then(|metadata| metadata.placeholder)
+                .unwrap_or("Comma separated"),
+        )
+        .display_clear_button()
+        .confirm_on_focus_out()
+        .on_confirm({
+            move |new_text, window, cx| {
+                let entries = new_text.and_then(|text| {
+                    let entries: Vec<T> = text
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .map(|entry| T::from(entry.to_string()))
+                        .collect();
+                    (!entries.is_empty()).then(|| settings::ExtendingVec(entries))
+                });
+
+                update_settings_file(
+                    file.clone(),
+                    field.json_path,
+                    window,
+                    cx,
+                    move |settings, app| {
+                        (field.write)(settings, entries, app);
+                    },
+                )
+                .log_err();
+            }
+        })
+        .into_any_element()
+}
+
 fn render_text_field<T: From<String> + Into<String> + AsRef<str> + Clone>(
     field: SettingField<T>,
     file: SettingsUiFile,
@@ -5512,6 +5666,7 @@ pub mod test {
             let search_bar = cx.new(|cx| Editor::single_line(window, cx));
             let dummy_page = SettingsPage {
                 title: "Test",
+                icon: IconName::Settings,
                 items: Box::new([]),
             };
             Self {
@@ -5653,6 +5808,7 @@ pub mod test {
             .into_iter()
             .map(|builder| SettingsPage {
                 title: builder.title,
+                icon: IconName::Settings,
                 items: builder.items.into_boxed_slice(),
             })
             .collect();

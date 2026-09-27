@@ -26,6 +26,15 @@
   // account and bills their subscription, which is the point: the editor should
   // use the plan they already pay for rather than quietly spending API credit.
   "agent_servers": {
+    // Codex and Copilot come from the same agent-client-protocol registry as
+    // Claude: their own binary, their own auth, their own agent loop. Acuto
+    // supplies the editor half of the protocol and nothing else.
+    "codex-acp": {
+      "type": "registry"
+    },
+    "github-copilot-cli": {
+      "type": "registry"
+    },
     "claude-acp": {
       "type": "registry",
       // Edits land without a prompt each time; shell commands still ask.
@@ -42,9 +51,53 @@
   // "light" is the frosted glass theme: translucent chrome over the Windows 11
   // Mica material, so the desktop shows through as a wash of colour. Switch to
   // it with mode: "light" or mode: "system".
+  // ------------------------------------------------------------ off-machine
+  //
+  // Acuto talks to nobody but the agent the user chose. Zed's own services --
+  // telemetry, collaboration, the update check -- are switched off here rather
+  // than left on and hoped about, because a fork that ships someone else's
+  // analytics endpoint is a fork that leaks its users to a third party.
+  //
+  // The panels for collaboration are hidden too: a button for a service that
+  // is turned off is a dead end with a login prompt behind it.
+  "telemetry": {
+    "diagnostics": false,
+    "metrics": false
+  },
+  "auto_update": false,
+  "collaboration_panel": {
+    "button": false
+  },
+  "chat_panel": {
+    "button": "never"
+  },
+  "notification_panel": {
+    "button": false
+  },
+
+  // ----------------------------------------------------------- token colours
+  //
+  // Syntax colours are editable per theme without touching the theme file.
+  // Keys are the ones a theme defines -- keyword, string, function, tag,
+  // attribute, comment, number, type, punctuation -- and each takes a colour
+  // plus optional font_style and font_weight.
+  //
+  // Uncomment and edit to taste; it hot-reloads, no restart.
+  //
+  // "theme_overrides": {
+  //   "Acuto Frosted Dark": {
+  //     "syntax": {
+  //       "keyword":  { "color": "#b49cebff" },
+  //       "string":   { "color": "#7fd3a3ff" },
+  //       "function": { "color": "#7fb0eeff" },
+  //       "comment":  { "color": "#5e6a7dff", "font_style": "italic" }
+  //     }
+  //   }
+  // },
+
   "theme": {
     "mode": "dark",
-    "dark": "Monochrome Dark",
+    "dark": "Acuto Frosted Dark",
     "light": "Acuto Frosted"
   },
 
@@ -60,7 +113,7 @@
   // Mono was installed the whole interface came back monospace, menus and
   // panels included. A first entry that resolves means the fallbacks never have
   // to be guessed at.
-  "ui_font_family": "Inter",
+  "ui_font_family": "Acuto Sans",
   "ui_font_fallbacks": ["Segoe UI Variable Text", "Segoe UI"],
   "ui_font_size": 15.5,
   "ui_font_weight": 400,
@@ -85,7 +138,7 @@
   // as `\`, `#` draws as `*`, and vice versa, in every file. Verified in the
   // font binary, not inferred. Buying the licensed font fixes it without any
   // change here beyond the family name.
-  "buffer_font_family": "Berkeley Mono Trial",
+  "buffer_font_family": "Acuto Mono",
   "buffer_font_fallbacks": ["Cascadia Mono", "Consolas"],
   "buffer_font_size": 14,
   "buffer_font_weight": 400,
@@ -101,8 +154,8 @@
   // than introducing a third.
   // Both Inter: the agent panel is prose, including the messages you type into
   // it. A monospace face there made a chat window look like a diff.
-  "agent_ui_font_family": "Inter",
-  "agent_buffer_font_family": "Inter",
+  "agent_ui_font_family": "Acuto Sans",
+  "agent_buffer_font_family": "Acuto Sans",
 
   // UNSTABLE upstream ("expect many elements to be broken"). It is the single
   // biggest lever on density. FIRST THING TO REMOVE if the UI looks wrong.
@@ -225,7 +278,7 @@
     "env": {
       "EDITOR": "C:/Users/broad/zed/target/debug/zed.exe --user-data-dir C:/Users/broad/zed-fork-data --wait"
     },
-    "font_family": "Berkeley Mono Trial",
+    "font_family": "Acuto Mono",
     "font_fallbacks": ["Cascadia Mono", "Consolas"],
     "font_size": 14,
     "line_height": { "custom": 1.5 }

@@ -217,6 +217,19 @@ pub fn deploy_context_menu(
                         .is_some()
                 });
 
+        // A diff-hunk delegate is installed only while an agent's changes are
+        // being reviewed in this editor, so its presence is the question being
+        // asked here, and asking it needs no dependency on the agent crate.
+        let reviewing_agent_changes = editor.diff_hunk_delegate.is_some();
+        let (window_accept_action, window_reject_action) = if reviewing_agent_changes {
+            (
+                cx.build_action("agent::Keep", None).ok(),
+                cx.build_action("agent::Reject", None).ok(),
+            )
+        } else {
+            (None, None)
+        };
+
         let evaluate_selection = window.is_action_available(&EvaluateSelectedText, cx);
         let run_to_cursor = window.is_action_available(&RunToCursor, cx);
         let format_selections = window.is_action_available(&FormatSelections, cx);
@@ -256,6 +269,20 @@ pub fn deploy_context_menu(
                     run_to_cursor || (evaluate_selection && has_selections),
                     |builder| builder.separator(),
                 )
+                // First, and separated. While a review is open this is the
+                // only thing being done with the file, and burying it under ten
+                // navigation entries would make the common action the hardest
+                // to reach.
+                .when(reviewing_agent_changes, |builder| {
+                    builder
+                        .when_some(window_accept_action, |builder, action| {
+                            builder.action("Accept Change", action)
+                        })
+                        .when_some(window_reject_action, |builder, action| {
+                            builder.action("Reject Change", action)
+                        })
+                        .separator()
+                })
                 .action("Go to Definition", Box::new(GoToDefinition::default()))
                 .action("Go to Declaration", Box::new(GoToDeclaration::default()))
                 .action(

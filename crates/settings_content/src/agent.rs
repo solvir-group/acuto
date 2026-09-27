@@ -318,8 +318,27 @@ pub struct AgentSettingsContent {
     pub terminal_mode: Option<AgentTerminalMode>,
     /// Which agent a new agent tab opens.
     ///
-    /// Default: acuto
+    /// Default: ask
     pub default_agent: Option<DefaultAgent>,
+    /// Whether to hold an agent's edits for review instead of leaving them
+    /// applied in place.
+    ///
+    /// When on, finishing a turn opens every file the agent touched as its own
+    /// diff in a pane beside the code, and nothing is settled until each hunk is
+    /// accepted or rejected.
+    ///
+    /// Default: false
+    pub review_changes: Option<bool>,
+    /// Which agent opens in the side panel, when it should differ from
+    /// `default_agent`.
+    ///
+    /// Default: null
+    pub panel_agent: Option<DefaultAgent>,
+    /// Which agent opens in a centre-pane tab, when it should differ from
+    /// `default_agent`.
+    ///
+    /// Default: null
+    pub tab_agent: Option<DefaultAgent>,
     /// Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     /// The command is sent to the shell as if typed, so it is interpreted by your
     /// configured shell (including on Windows and remote/WSL projects).
@@ -1051,12 +1070,40 @@ pub struct ToolRegexRule {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DefaultAgent {
-    /// The built-in agent.
+    /// Ask each time, listing whichever agents are configured.
+    ///
+    /// The default, and deliberately not a particular agent: which one you want
+    /// depends on which subscriptions you hold, and guessing wrong sends your
+    /// first prompt to something you are not paying for.
     #[default]
+    Ask,
+    /// The built-in agent, which needs an API key of its own.
     Acuto,
     /// Claude Code, over the agent client protocol, on your Anthropic
     /// subscription.
     ClaudeCode,
+    /// Codex, on your OpenAI subscription.
+    Codex,
+    /// GitHub Copilot CLI, on your GitHub subscription.
+    Copilot,
+    /// Gemini CLI, on your Google account.
+    Gemini,
+}
+
+impl DefaultAgent {
+    /// The agent server id this setting names, if it names one.
+    ///
+    /// `None` for the two values that are not an external agent: `Ask`, which
+    /// has no agent until the user picks one, and `Acuto`, which is in-process.
+    pub fn agent_id(self) -> Option<&'static str> {
+        match self {
+            DefaultAgent::Ask | DefaultAgent::Acuto => None,
+            DefaultAgent::ClaudeCode => Some("claude-acp"),
+            DefaultAgent::Codex => Some("codex-acp"),
+            DefaultAgent::Copilot => Some("github-copilot-cli"),
+            DefaultAgent::Gemini => Some("gemini"),
+        }
+    }
 }
 
 /// Where an agent's terminal commands run.

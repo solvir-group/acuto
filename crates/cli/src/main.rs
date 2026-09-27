@@ -48,10 +48,10 @@ trait InstalledApp {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "zed",
+    name = "acuto",
     disable_version_flag = true,
-    before_help = "The Zed CLI binary.
-This CLI is a separate binary that invokes Zed.
+    before_help = "The Acuto CLI binary.
+This CLI is a separate binary that invokes Acuto.
 
 Examples:
     `zed`
@@ -1148,7 +1148,7 @@ mod flatpak {
             let flatpak_dir = Path::new("/flatpak");
             let args = restart_cli_args(flatpak_dir, &["project".into()]);
             let parsed =
-                crate::Args::try_parse_from(std::iter::once(OsString::from("zed")).chain(args))
+                crate::Args::try_parse_from(std::iter::once(OsString::from("acuto")).chain(args))
                     .unwrap();
 
             assert_eq!(parsed.zed, Some(flatpak_dir.join("libexec/zed-editor")));
@@ -1274,9 +1274,19 @@ mod windows {
                 let cli = std::env::current_exe()?;
                 let dir = cli.parent().context("no parent path for cli")?;
 
-                // ../Zed.exe is the standard, lib/zed is for MSYS2, ./zed.exe is for the target
-                // directory in development builds.
-                let possible_locations = ["../Zed.exe", "../lib/zed/zed-editor.exe", "./zed.exe"];
+                // ../Acuto.exe is the standard, lib/acuto is for MSYS2, ./acuto.exe is
+                // for the target directory in development builds.
+                //
+                // The upstream names are kept as a trailing fallback so a CLI
+                // that finds itself beside an older install still launches
+                // something rather than reporting that nothing exists.
+                let possible_locations = [
+                    "../Acuto.exe",
+                    "../lib/acuto/acuto-editor.exe",
+                    "./acuto.exe",
+                    "../Zed.exe",
+                    "./zed.exe",
+                ];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
