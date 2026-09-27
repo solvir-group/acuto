@@ -808,6 +808,7 @@ dependencies = [
  "rustix 1.1.2",
  "rustix-openpty",
  "serde",
+ "serde_json",
  "signal-hook",
  "unicode-width",
  "vte",
