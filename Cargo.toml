@@ -530,8 +530,9 @@ aho-corasick = "1.1"
 # passthrough, so an embedder cannot see them at all. See
 # patches/alacritty-osc-passthrough.patch.
 #
-# Local path until the fork is pushed; swap for a git+rev then.
-alacritty_terminal = { path = "C:/Users/broad/acuto-forks/alacritty/alacritty_terminal" }
+# Vendored in-tree so the repository builds anywhere, including CI; the
+# change against upstream is patches/alacritty-osc-passthrough.patch.
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
 any_vec = "0.14"
 anyhow = "1.0.86"
 ashpd = { version = "0.13", default-features = false, features = [
@@ -982,7 +983,7 @@ features = [
 # has something to forward. Patch sections only apply from the workspace root,
 # so this must live here rather than inside the alacritty fork.
 # See patches/vte-osc-passthrough.patch.
-vte = { path = "C:/Users/broad/acuto-forks/vte" }
+vte = { path = "vendor/vte" }
 # Unify `tree_sitter_language::LanguageFn` between crates.io grammar crates and
 # the git tree-sitter above; two instances of the crate would make grammar
 # constants type-incompatible with `tree_sitter::Language`.

@@ -219,9 +219,16 @@ function MakeAppx {
         }
     }
     Copy-Item -Path "$manifestFile" -Destination "$innoDir\make_appx\AppxManifest.xml"
-    # Add makeAppx.exe to Path
-    $sdk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64"
-    $env:Path += ';' + $sdk
+    # Add makeAppx.exe to Path, from the newest Windows SDK installed rather than
+    # one pinned version: build machines are updated, and a missing SDK folder
+    # failed the bundle after the whole compile had finished.
+    $makeAppx = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\makeappx.exe" -ErrorAction SilentlyContinue |
+        Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+        Select-Object -First 1
+    if (-not $makeAppx) {
+        throw "makeappx.exe was not found; install the Windows 10/11 SDK"
+    }
+    $env:Path += ';' + $makeAppx.DirectoryName
     makeAppx.exe pack /d "$innoDir\make_appx" /p "$innoDir\zed_explorer_command_injector.appx" /nv
 }
 
