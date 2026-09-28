@@ -25,11 +25,11 @@ use std::{
 
 use futures::{AsyncReadExt as _, AsyncWriteExt as _, StreamExt as _};
 use gpui::{Anchor, Task};
-use ui::prelude::*;
-use ui::{ContextMenu, Tooltip, right_click_menu};
 use task::{RevealStrategy, SpawnInTerminal};
 use terminal_view::terminal_panel::TerminalPanel;
-use util::ResultExt as _;
+use ui::prelude::*;
+use ui::{ContextMenu, Tooltip, right_click_menu};
+use util::{ResultExt as _, maybe};
 use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
 /// How long a reload poll waits before answering "nothing yet".
@@ -189,6 +189,36 @@ impl LiveServerButton {
         Some(worktree.read(cx).abs_path())
     }
 
+    /// The page to open in the browser, as a URL path.
+    ///
+    /// The HTML file you are editing, when it is inside the served folder:
+    /// that is the page you want to see, and a folder of loose pages has no
+    /// `index.html` for `/` to find. Otherwise `/`, which serves `index.html`
+    /// when there is one and a list of the folder's pages when there is not.
+    fn page_to_open(&self, root: &Path, cx: &App) -> String {
+        let active_page = maybe!({
+            let workspace = self.workspace.upgrade()?;
+            let workspace = workspace.read(cx);
+            let project_path = workspace.active_item(cx)?.project_path(cx)?;
+            let absolute = workspace
+                .project()
+                .read(cx)
+                .absolute_path(&project_path, cx)?;
+            let is_page = absolute
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+                });
+            if !is_page {
+                return None;
+            }
+            let relative = absolute.strip_prefix(root).ok()?;
+            Some(url_path_for(relative))
+        });
+        active_page.unwrap_or_else(|| "/".to_string())
+    }
+
     fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.state {
             ServerState::Running { .. } => self.stop(cx),
@@ -204,12 +234,7 @@ impl LiveServerButton {
     /// would throw all of that away. The terminal already linkifies the URL it
     /// prints, which is both more accurate than guessing a port and correct when
     /// the usual one was taken.
-    fn start_dev_server(
-        &mut self,
-        script: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn start_dev_server(&mut self, script: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -289,10 +314,8 @@ impl LiveServerButton {
         // Bound on the foreground so the port is known before the button
         // redraws: a button that says "starting" and then a port one frame
         // later reads as a glitch for something this fast.
-        let listener = match std::net::TcpListener::bind(SocketAddr::from((
-            Ipv4Addr::LOCALHOST,
-            0,
-        ))) {
+        let listener = match std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        {
             Ok(listener) => listener,
             Err(error) => {
                 self.state = ServerState::Failed(format!("Could not bind: {error}").into());
@@ -347,17 +370,19 @@ impl LiveServerButton {
             }
         }));
 
+        let page = self.page_to_open(&root, cx);
         self.state = ServerState::Running {
             port,
             root: root.clone(),
         };
-        cx.open_url(&format!("http://127.0.0.1:{port}/"));
+        cx.open_url(&format!("http://127.0.0.1:{port}{page}"));
         cx.notify();
     }
 
     fn open_in_browser(&self, cx: &mut App) {
-        if let ServerState::Running { port, .. } = self.state {
-            cx.open_url(&format!("http://127.0.0.1:{port}/"));
+        if let ServerState::Running { port, root } = &self.state {
+            let page = self.page_to_open(root, cx);
+            cx.open_url(&format!("http://127.0.0.1:{port}{page}"));
         }
     }
 }
@@ -550,8 +575,7 @@ async fn await_change(since: u64, changes: &ChangeLog, root: &Path) -> Vec<u8> {
             return http_response(
                 200,
                 "application/json",
-                format!("{{\"generation\":{current},\"styles_only\":{styles_only}}}")
-                    .into_bytes(),
+                format!("{{\"generation\":{current},\"styles_only\":{styles_only}}}").into_bytes(),
             );
         }
 
@@ -622,8 +646,46 @@ async fn serve_path(request_path: &str, root: &Path) -> Vec<u8> {
         return http_response(403, "text/plain; charset=utf-8", b"Forbidden".to_vec());
     };
 
+    let is_directory = path.is_dir();
+    // `/site` must become `/site/` before its page is served: the browser
+    // resolves the page's relative links against the URL, and without the
+    // slash `style.css` would be looked for next to the folder, not in it.
+    if is_directory && !request_path.ends_with('/') {
+        let relative = path.strip_prefix(root).unwrap_or(Path::new(""));
+        return redirect_response(&format!("{}/", url_path_for(relative).trim_end_matches('/')));
+    }
+    if is_directory {
+        let index = path.join("index.html");
+        if index.is_file() {
+            path = index;
+        }
+    }
+
+    // A symlink or junction inside the project is followed by the filesystem,
+    // so a path built only from plain names can still lead outside the folder.
+    // Both are resolved to where they really are, and anything outside the
+    // real root is refused: a page served from here must not be able to read
+    // the rest of the disk.
+    let (Ok(real_root), Ok(real_path)) = (
+        smol::fs::canonicalize(root).await,
+        smol::fs::canonicalize(&path).await,
+    ) else {
+        return http_response(
+            404,
+            "text/html; charset=utf-8",
+            not_found_page(request_path).into_bytes(),
+        );
+    };
+    if !real_path.starts_with(&real_root) {
+        return http_response(403, "text/plain; charset=utf-8", b"Forbidden".to_vec());
+    }
+
     if path.is_dir() {
-        path = path.join("index.html");
+        return http_response(
+            200,
+            "text/html; charset=utf-8",
+            directory_listing(&path, request_path).await.into_bytes(),
+        );
     }
 
     let Ok(bytes) = smol::fs::read(&path).await else {
@@ -685,6 +747,99 @@ fn inject_reload_script(mut html: Vec<u8>) -> Vec<u8> {
     }
 }
 
+/// A page linking to what is in `directory`, for a folder with no
+/// `index.html`.
+///
+/// A folder of loose pages is the usual shape of a first project, and a 404 at
+/// `/` told its owner nothing about why; this shows them their pages instead.
+/// Hidden entries are left out: `.git` and `.acuto` are not pages.
+async fn directory_listing(directory: &Path, request_path: &str) -> String {
+    let mut folders = Vec::new();
+    let mut files = Vec::new();
+    if let Ok(mut entries) = smol::fs::read_dir(directory).await {
+        while let Some(Ok(entry)) = entries.next().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            match entry.file_type().await {
+                Ok(kind) if kind.is_dir() => folders.push(name),
+                Ok(_) => files.push(name),
+                Err(_) => continue,
+            }
+        }
+    }
+    folders.sort_by_key(|name| name.to_lowercase());
+    files.sort_by_key(|name| name.to_lowercase());
+
+    let base = if request_path.ends_with('/') {
+        request_path.to_string()
+    } else {
+        format!("{request_path}/")
+    };
+    let mut items = String::new();
+    for name in &folders {
+        items.push_str(&format!(
+            "<li><a href=\"{}{}/\">{}/</a></li>",
+            html_escape(&base),
+            html_escape(&url_segment(name)),
+            html_escape(name)
+        ));
+    }
+    for name in &files {
+        items.push_str(&format!(
+            "<li><a href=\"{}{}\">{}</a></li>",
+            html_escape(&base),
+            html_escape(&url_segment(name)),
+            html_escape(name)
+        ));
+    }
+    if items.is_empty() {
+        items.push_str("<li>This folder is empty.</li>");
+    }
+
+    format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>{title}</title>\
+         <body style=\"font-family:system-ui;padding:2rem 3rem;line-height:1.7\">\
+         <h1 style=\"font-size:1.3rem\">{title}</h1>\
+         <p style=\"color:#666\">No index.html here, so these are the files in this folder.</p>\
+         <ul>{items}</ul>{RELOAD_SCRIPT}</body>",
+        title = html_escape(request_path)
+    )
+}
+
+/// A worktree-relative path as a URL path, each segment escaped.
+fn url_path_for(relative: &Path) -> String {
+    let mut path = String::new();
+    for component in relative.components() {
+        if let Component::Normal(segment) = component {
+            path.push('/');
+            path.push_str(&url_segment(&segment.to_string_lossy()));
+        }
+    }
+    if path.is_empty() {
+        path.push('/');
+    }
+    path
+}
+
+/// Escapes the characters a file name can hold that would change a URL's
+/// meaning, and leaves the rest readable.
+fn url_segment(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for character in name.chars() {
+        match character {
+            ' ' => out.push_str("%20"),
+            '#' => out.push_str("%23"),
+            '?' => out.push_str("%3F"),
+            '%' => out.push_str("%25"),
+            '"' => out.push_str("%22"),
+            _ => out.push(character),
+        }
+    }
+    out
+}
+
 fn not_found_page(request_path: &str) -> String {
     format!(
         "<!doctype html><meta charset=\"utf-8\"><title>404</title>\
@@ -732,6 +887,17 @@ fn content_type_for(path: &Path) -> &'static str {
         "pdf" => "application/pdf",
         _ => "application/octet-stream",
     }
+}
+
+fn redirect_response(location: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 301 Moved Permanently\r\n\
+         Location: {location}\r\n\
+         Content-Length: 0\r\n\
+         Cache-Control: no-store\r\n\
+         Connection: close\r\n\r\n"
+    )
+    .into_bytes()
 }
 
 fn http_response(status: u16, content_type: &str, body: Vec<u8>) -> Vec<u8> {
@@ -803,6 +969,16 @@ mod tests {
         // Extensions are compared without regard to case.
         changes.record([PathBuf::from("site/Theme.CSS")]);
         assert!(changes.styles_only.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_page_path_becomes_an_escaped_url_path() {
+        assert_eq!(url_path_for(Path::new("hello.html")), "/hello.html");
+        assert_eq!(
+            url_path_for(Path::new("site").join("my page.html").as_path()),
+            "/site/my%20page.html"
+        );
+        assert_eq!(url_segment("a#b?c"), "a%23b%3Fc");
     }
 
     #[test]

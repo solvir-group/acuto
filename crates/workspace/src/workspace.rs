@@ -9691,7 +9691,7 @@ impl Render for Workspace {
                                     .bg(colors.background)
                                     .child(zoomed_view)
                                     .inset_0()
-                                    .shadow_lg();
+                                    .when(!theme.appearance().is_light(), |this| this.shadow_lg());
 
                                 if !WorkspaceSettings::get_global(cx).zoomed_padding {
                                     return Some(div);

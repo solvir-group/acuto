@@ -9,6 +9,7 @@ use strum::{EnumIter, EnumString, IntoStaticStr};
 #[strum(serialize_all = "snake_case")]
 pub enum IconName {
     AcpRegistry,
+    AcutoMark,
     AiAnthropic,
     AiAnthropicCompat,
     AiAntigravity,
@@ -197,6 +198,7 @@ pub enum IconName {
     Mic,
     MicMute,
     Minimize,
+    Moon,
     Notepad,
     OnCall,
     Option,
@@ -250,6 +252,7 @@ pub enum IconName {
     Star,
     StarFilled,
     Stop,
+    Sun,
     Tab,
     Table,
     Terminal,

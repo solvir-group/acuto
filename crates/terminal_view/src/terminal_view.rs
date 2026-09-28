@@ -1475,7 +1475,6 @@ impl TerminalView {
         if previous != self.suggestion {
             cx.notify();
         }
-
     }
 
     fn focus_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1663,7 +1662,7 @@ impl TerminalView {
                 .bg(cx.theme().colors().elevated_surface_background)
                 .border_1()
                 .border_color(cx.theme().colors().border)
-                .shadow_md()
+                .when(!cx.theme().appearance().is_light(), |this| this.shadow_md())
                 .child(
                     Icon::new(IconName::XCircle)
                         .size(IconSize::Small)
@@ -1673,16 +1672,8 @@ impl TerminalView {
                     h_flex()
                         .min_w_0()
                         .gap_1p5()
-                        .child(
-                            Label::new(command)
-                                .size(LabelSize::Small)
-                                .truncate(),
-                        )
-                        .child(
-                            Label::new(exit)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
+                        .child(Label::new(command).size(LabelSize::Small).truncate())
+                        .child(Label::new(exit).size(LabelSize::Small).color(Color::Muted))
                         .children(duration.map(|duration| {
                             Label::new(duration)
                                 .size(LabelSize::Small)
@@ -1693,10 +1684,10 @@ impl TerminalView {
                     Button::new("terminal-fix-failure", "Fix")
                         .label_size(LabelSize::Small)
                         .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                        .tooltip(Tooltip::text("Turn this failure into a diff you can review"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.fix_failure(window, cx)
-                        })),
+                        .tooltip(Tooltip::text(
+                            "Turn this failure into a diff you can review",
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| this.fix_failure(window, cx))),
                 )
                 .child(
                     IconButton::new("terminal-rerun-failure", IconName::RotateCw)
@@ -1885,11 +1876,11 @@ impl Render for TerminalView {
                 )
                 .with_priority(1)
             }))
-            // Anchored to the pane rather than drawn inline after the cursor:
-            // the suggestion is only ever as accurate as the reconstructed
-            // input line, and a floating hint that can be ignored is the
-            // honest presentation of something that might be wrong. Inline
-            // ghost text reads as the shell's own certainty.
+        // Anchored to the pane rather than drawn inline after the cursor:
+        // the suggestion is only ever as accurate as the reconstructed
+        // input line, and a floating hint that can be ignored is the
+        // honest presentation of something that might be wrong. Inline
+        // ghost text reads as the shell's own certainty.
     }
 }
 

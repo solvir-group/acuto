@@ -3220,7 +3220,7 @@ impl Sidebar {
             .border_b_1()
             .border_color(color.border.opacity(0.5))
             .child(header_element)
-            .shadow_sm()
+            .when(!cx.theme().appearance().is_light(), |this| this.shadow_sm())
             .into_any_element();
 
         Some(element)

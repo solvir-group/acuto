@@ -793,38 +793,43 @@ impl AgentDiffPane {
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
-                .children(rejected.into_iter().enumerate().map(|(index, (id, preview))| {
-                    h_flex()
-                        .w_full()
-                        .gap_1()
-                        .justify_between()
-                        .child(
-                            Label::new(if preview.is_empty() {
-                                "(blank line)".to_string()
-                            } else {
-                                preview
-                            })
-                            // Muted and struck through: still present, plainly
-                            // not applied.
-                            .size(LabelSize::XSmall)
-                            .color(Color::Hidden)
-                            .strikethrough()
-                            .single_line(),
-                        )
-                        .child(
-                            Button::new(("restore-rejected", index), "Restore")
-                                .label_size(LabelSize::XSmall)
-                                .on_click({
-                                    let action_log = action_log.clone();
-                                    cx.listener(move |_this, _event, _window, cx| {
-                                        action_log.update(cx, |log, cx| {
-                                            log.restore_rejected_hunk(id, cx);
-                                        });
-                                        cx.notify();
+                .children(
+                    rejected
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (id, preview))| {
+                            h_flex()
+                                .w_full()
+                                .gap_1()
+                                .justify_between()
+                                .child(
+                                    Label::new(if preview.is_empty() {
+                                        "(blank line)".to_string()
+                                    } else {
+                                        preview
                                     })
-                                }),
-                        )
-                }))
+                                    // Muted and struck through: still present, plainly
+                                    // not applied.
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Hidden)
+                                    .strikethrough()
+                                    .single_line(),
+                                )
+                                .child(
+                                    Button::new(("restore-rejected", index), "Restore")
+                                        .label_size(LabelSize::XSmall)
+                                        .on_click({
+                                            let action_log = action_log.clone();
+                                            cx.listener(move |_this, _event, _window, cx| {
+                                                action_log.update(cx, |log, cx| {
+                                                    log.restore_rejected_hunk(id, cx);
+                                                });
+                                                cx.notify();
+                                            })
+                                        }),
+                                )
+                        }),
+                )
                 .into_any_element(),
         )
     }
@@ -923,7 +928,12 @@ fn render_diff_hunk_controls(
         .bg(cx.theme().colors().editor_background)
         .gap_1()
         .block_mouse_except_scroll()
-        .when(opaque_window, |this| this.shadow_md())
+        // No drop shadow on a light theme: every hunk has these controls, and
+        // on white a shadow under each is a row of grey smears.
+        .when(
+            opaque_window && !cx.theme().appearance().is_light(),
+            |this| this.shadow_md(),
+        )
         .children(vec![
             Button::new(("reject", row as u64), "Reject")
                 .disabled(is_created_file)
@@ -2057,9 +2067,7 @@ mod tests {
         // The agent's write: claimed when announced, then landing on disk
         // and reloading the open buffer.
         cx.update(|_, cx| {
-            action_log.update(cx, |log, cx| {
-                log.agent_will_write(buffer.clone(), cx)
-            });
+            action_log.update(cx, |log, cx| log.agent_will_write(buffer.clone(), cx));
         });
         fs.insert_file(path!("/test/file.txt"), b"one\nTWO\nthree\n".to_vec())
             .await;
@@ -2075,17 +2083,29 @@ mod tests {
 
         let (panels, panes) = workspace.read_with(cx, |workspace, cx| {
             (
-                workspace.items_of_type::<AgentDiffPane>(cx).collect::<Vec<_>>(),
+                workspace
+                    .items_of_type::<AgentDiffPane>(cx)
+                    .collect::<Vec<_>>(),
                 workspace.panes().len(),
             )
         });
-        assert_eq!(panels.len(), 1, "the end of the turn should open the review panel");
-        assert_eq!(panes, 2, "the panel opens in a split beside the code, not over it");
+        assert_eq!(
+            panels.len(),
+            1,
+            "the end of the turn should open the review panel"
+        );
+        assert_eq!(
+            panes, 2,
+            "the panel opens in a split beside the code, not over it"
+        );
 
         let hunks = panels[0].read_with(cx, |panel, cx| {
             panel.multibuffer.read(cx).snapshot(cx).diff_hunks().count()
         });
-        assert_eq!(hunks, 1, "the panel should show the agent's change as a hunk to review");
+        assert_eq!(
+            hunks, 1,
+            "the panel should show the agent's change as a hunk to review"
+        );
 
         // A second turn reuses the panel rather than stacking another.
         thread.update(cx, |_, cx| {
@@ -2161,9 +2181,7 @@ mod tests {
         cx.run_until_parked();
 
         cx.update(|_, cx| {
-            action_log.update(cx, |log, cx| {
-                log.agent_will_write(buffer.clone(), cx)
-            });
+            action_log.update(cx, |log, cx| log.agent_will_write(buffer.clone(), cx));
         });
         fs.insert_file(path!("/test/file.txt"), after.as_bytes().to_vec())
             .await;
@@ -2178,7 +2196,9 @@ mod tests {
         cx.run_until_parked();
 
         let panel = workspace
-            .read_with(cx, |workspace, cx| workspace.items_of_type::<AgentDiffPane>(cx).next())
+            .read_with(cx, |workspace, cx| {
+                workspace.items_of_type::<AgentDiffPane>(cx).next()
+            })
             .expect("the review panel should be open");
         let editor = panel.read_with(cx, |panel, cx| panel.editor.read(cx).rhs_editor().clone());
 
@@ -2252,7 +2272,11 @@ mod tests {
             expected,
             "and write it to disk"
         );
-        assert_eq!(unreviewed_rows(cx), Vec::<u32>::new(), "nothing left to review");
+        assert_eq!(
+            unreviewed_rows(cx),
+            Vec::<u32>::new(),
+            "nothing left to review"
+        );
     }
 
     #[gpui::test]
@@ -2748,7 +2772,7 @@ mod tests {
 ///
 /// Nothing here decides *what* changed. The panel reads the action log, which
 /// `AcpThread` fills as each edit arrives; this only puts it on screen.
-fn open_review_panel(
+pub(crate) fn open_review_panel(
     thread: &Entity<AcpThread>,
     workspace: &WeakEntity<Workspace>,
     window: &mut Window,
@@ -2759,9 +2783,9 @@ fn open_review_panel(
         .iter()
         .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
         .map_or(0, |ix| ix + 1);
-    let turn_diffs: usize = entries
-        .get(turn_start..)
-        .map_or(0, |entries| entries.iter().map(|entry| entry.diffs().count()).sum());
+    let turn_diffs: usize = entries.get(turn_start..).map_or(0, |entries| {
+        entries.iter().map(|entry| entry.diffs().count()).sum()
+    });
     let action_log = thread.read(cx).action_log().read(cx);
     let unreviewed = action_log.changed_buffers(cx).count();
     let agent_edited = action_log.agent_edited_this_turn();

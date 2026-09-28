@@ -379,6 +379,106 @@ impl AgentBrand {
     }
 }
 
+/// Who an agent is signed in as, read from the login its own command-line tool
+/// saved on this computer.
+///
+/// Agents keep their own credentials, so an agent that was ever signed in on
+/// this machine just works, with nothing in Acuto saying as whom. This finds
+/// the account the way each tool records it. `None` when the tool keeps no
+/// readable record, which is not the same as being signed out.
+///
+/// Reads files; call it off the main thread.
+pub(crate) fn saved_account(agent_id: &str) -> Option<String> {
+    use serde::Deserialize;
+    use serde::de::IgnoredAny;
+
+    // Each file is streamed into a type naming only the fields read here.
+    // Everything else -- access tokens, refresh tokens, keys -- is skipped as
+    // it is parsed, so no secret is ever held in memory. `IgnoredAny` records
+    // that an API key is set without keeping the key.
+    #[derive(Deserialize)]
+    struct ClaudeConfig {
+        #[serde(rename = "oauthAccount")]
+        oauth_account: Option<ClaudeAccount>,
+    }
+    #[derive(Deserialize)]
+    struct ClaudeAccount {
+        #[serde(rename = "emailAddress")]
+        email_address: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct CodexAuth {
+        #[serde(rename = "OPENAI_API_KEY")]
+        api_key: Option<IgnoredAny>,
+        tokens: Option<CodexTokens>,
+    }
+    #[derive(Deserialize)]
+    struct CodexTokens {
+        id_token: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct GeminiAccounts {
+        active: Option<String>,
+    }
+
+    fn read<T: serde::de::DeserializeOwned>(path: std::path::PathBuf) -> Option<T> {
+        let file = std::fs::File::open(path).ok()?;
+        serde_json::from_reader(std::io::BufReader::new(file)).ok()
+    }
+
+    let home = util::paths::home_dir();
+    let api_key_set = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+
+    match agent_id {
+        agent_servers::CLAUDE_AGENT_ID => {
+            if api_key_set("ANTHROPIC_API_KEY") {
+                return Some("an Anthropic API key".into());
+            }
+            read::<ClaudeConfig>(home.join(".claude.json"))?
+                .oauth_account?
+                .email_address
+                .filter(|email| !email.is_empty())
+        }
+        agent_servers::CODEX_ID => {
+            let auth = read::<CodexAuth>(home.join(".codex").join("auth.json"))?;
+            if let Some(email) = auth
+                .tokens
+                .and_then(|tokens| tokens.id_token)
+                .as_deref()
+                .and_then(email_in_id_token)
+            {
+                return Some(email);
+            }
+            auth.api_key.map(|_| "an OpenAI API key".into())
+        }
+        agent_servers::GEMINI_ID => {
+            if api_key_set("GEMINI_API_KEY") {
+                return Some("a Gemini API key".into());
+            }
+            read::<GeminiAccounts>(home.join(".gemini").join("google_accounts.json"))?
+                .active
+                .filter(|email| !email.is_empty())
+        }
+        _ => None,
+    }
+}
+
+/// The `email` claim of an OpenID token, without verifying it: this only
+/// labels an account on screen, and a token Codex itself saved is not one
+/// anybody is trying to forge at us.
+fn email_in_id_token(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    #[derive(serde::Deserialize)]
+    struct Claims {
+        email: Option<String>,
+    }
+    serde_json::from_slice::<Claims>(&bytes).ok()?.email
+}
+
 /// What sits above the composer on an empty thread: the agent's full logo.
 ///
 /// An empty panel is otherwise a box and a caret, which says nothing about who

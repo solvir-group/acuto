@@ -953,7 +953,9 @@ impl TitleBar {
     /// because the changes are unstaged is a button that appears broken, and
     /// the panel is one click away for anyone who wants to stage selectively.
     fn render_top_bar_git(&self, has_repository: bool) -> AnyElement {
-        fn dispatch(name: &'static str) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        fn dispatch(
+            name: &'static str,
+        ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
             move |_, window, cx| {
                 if let Some(action) = cx.build_action(name, None).log_err() {
                     window.dispatch_action(action, cx);
@@ -993,9 +995,9 @@ impl TitleBar {
             .into_any_element()
     }
 
-    /// Where feature requests go. Empty until there is somewhere to send them,
-    /// which the button says rather than pretending otherwise.
-    const FEATURE_REQUEST_URL: &'static str = "";
+    /// Where feedback goes. The button says so if this is ever emptied, rather
+    /// than doing nothing when clicked.
+    const FEATURE_REQUEST_URL: &'static str = "https://acuto.dev/feedback";
 
     /// The window-frame row: a link to the project's repository and a way to
     /// ask for something.
@@ -1035,9 +1037,9 @@ impl TitleBar {
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
             .tooltip(Tooltip::text(if has_destination {
-                "Request a Feature"
+                "Feedback"
             } else {
-                "Request a Feature - not open yet"
+                "Feedback - not open yet"
             }))
             .on_click(move |_, _, cx| {
                 if has_destination {
@@ -1052,7 +1054,7 @@ impl TitleBar {
                         workspace.show_toast(
                             Toast::new(
                                 NotificationId::unique::<FeatureRequestUnavailable>(),
-                                "Feature requests are not open yet.",
+                                "Feedback is not open yet.",
                             ),
                             cx,
                         );
@@ -1087,8 +1089,9 @@ impl TitleBar {
                     .tooltip(Tooltip::text("Project Panel"))
                     .icon_size(IconSize::Small)
                     .on_click(move |_, window, cx| {
-                        if let Some(action) =
-                            cx.build_action("project_panel::ToggleFocus", None).log_err()
+                        if let Some(action) = cx
+                            .build_action("project_panel::ToggleFocus", None)
+                            .log_err()
                         {
                             window.dispatch_action(action, cx);
                         }
@@ -1538,7 +1541,9 @@ impl TitleBar {
                                     .w_full()
                                     .gap_1()
                                     .justify_between()
-                                    .child(Label::new("Restart to update Acuto").color(Color::Accent))
+                                    .child(
+                                        Label::new("Restart to update Acuto").color(Color::Accent),
+                                    )
                                     .child(
                                         Icon::new(IconName::Download)
                                             .size(IconSize::Small)
@@ -1660,7 +1665,6 @@ impl TitleBar {
             .anchor(Anchor::TopRight)
     }
 }
-
 
 /// A notification id for the "no feature tracker yet" toast.
 struct FeatureRequestUnavailable;

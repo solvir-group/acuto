@@ -590,6 +590,9 @@ pub enum AcpServerViewEvent {
 impl EventEmitter<AcpServerViewEvent> for ConversationView {}
 
 pub struct ConversationView {
+    /// Set while the sign-in card is showing because the user asked to switch
+    /// account, rather than because the agent needs one. It gets a way back.
+    switching_account: bool,
     agent: Rc<dyn AgentServer>,
     connection_store: Entity<AgentConnectionStore>,
     connection_key: Agent,
@@ -860,6 +863,7 @@ impl ConversationView {
         let thread_id = thread_id.unwrap_or_else(ThreadId::new);
 
         Self {
+            switching_account: false,
             agent: agent.clone(),
             connection_store: connection_store.clone(),
             connection_key: connection_key.clone(),
@@ -1564,6 +1568,40 @@ impl ConversationView {
         self.agent.clone()
     }
 
+    /// Whether the agent offers a way to sign in, and so to switch account.
+    pub(crate) fn can_switch_account(&self) -> bool {
+        self.as_connected()
+            .is_some_and(|connected| !connected.connection.auth_methods().is_empty())
+    }
+
+    /// Brings the sign-in card back so another account can be used.
+    pub(crate) fn show_sign_in(&mut self, cx: &mut Context<Self>) {
+        let Some(connected) = self.as_connected_mut() else {
+            return;
+        };
+        if connected.connection.auth_methods().is_empty() {
+            return;
+        }
+        connected.auth_state = AuthState::Unauthenticated {
+            description: None,
+            pending_auth_method: None,
+        };
+        self.switching_account = true;
+        cx.emit(StateChange);
+        cx.notify();
+    }
+
+    /// Leaves the sign-in card opened by [`Self::show_sign_in`] and keeps the
+    /// account already in use.
+    fn keep_current_account(&mut self, cx: &mut Context<Self>) {
+        if let Some(connected) = self.as_connected_mut() {
+            connected.auth_state = AuthState::Ok;
+        }
+        self.switching_account = false;
+        cx.emit(StateChange);
+        cx.notify();
+    }
+
     pub fn is_loading(&self) -> bool {
         matches!(self.server_state, ServerState::Loading { .. })
     }
@@ -1709,6 +1747,14 @@ impl ConversationView {
                 // is not actually idle and a notification here would fire just before the
                 // next turn starts.
                 if !sent_queued_message {
+                    // Every conversation opens its own review. The review panel
+                    // used to open only for the one thread `AgentDiff` followed
+                    // per window, which was whichever connected last -- so once a
+                    // second thread existed, finishing a turn in the first
+                    // opened nothing.
+                    if AgentSettings::get_global(cx).review_changes {
+                        crate::agent_diff::open_review_panel(thread, &self.workspace, window, cx);
+                    }
                     let used_tools = thread.read(cx).used_tools_since_last_user_message();
                     self.notify_with_sound(
                         if used_tools {
@@ -1980,6 +2026,7 @@ impl ConversationView {
                                 })
                             }
                         } else {
+                            this.switching_account = false;
                             this.reset(window, cx);
                         }
                         this.auth_task.take()
@@ -2028,6 +2075,7 @@ impl ConversationView {
                             active.update(cx, |active, cx| active.handle_thread_error(err, cx));
                         }
                     } else {
+                        this.switching_account = false;
                         this.reset(window, cx);
                     }
                     this.auth_task.take()
@@ -2434,6 +2482,7 @@ impl ConversationView {
                 .into_any_element()
         };
 
+        let switching_account = self.switching_account && pending_auth_method.is_none();
         v_flex()
             .w_full()
             .max_w(px(360.))
@@ -2443,6 +2492,16 @@ impl ConversationView {
             .children(brand.map(|brand| agent_greeting(brand, cx)))
             .child(Headline::new(heading).size(HeadlineSize::Small))
             .child(body)
+            .when(switching_account, |this| {
+                this.child(
+                    Button::new("keep-current-account", "Keep current account")
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.keep_current_account(cx);
+                        })),
+                )
+            })
             .into_any_element()
     }
 

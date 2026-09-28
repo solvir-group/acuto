@@ -1728,13 +1728,10 @@
   // Automatically update Acuto. This setting may be ignored on Linux if
   // installed through a package manager.
   //
-  // Off. The updater polls Zed's release service once an hour, sending a stable
-  // install identifier with every check, and on a version bump it would fetch
-  // and install an upstream Zed build over this one. Both halves are wrong for
-  // a fork: the beacon is somebody else's telemetry and the payload is somebody
-  // else's product. Turn this back on once it points at a release service of
-  // our own.
-  "auto_update": false,
+  // Checks Acuto's GitHub releases (github.com/solvir-group/acuto) about once an
+  // hour and installs a newer version the next time Acuto restarts. Nothing
+  // identifying is sent: the check is an ordinary request for the release list.
+  "auto_update": true,
   // How to render LSP `textDocument/documentColor` colors in the editor.
   //
   // Possible values:
@@ -1992,10 +1989,11 @@
     },
     "open_ai_compatible_api": {
       "api_url": "https://integrate.api.nvidia.com/v1/chat/completions",
-      // Not the "flash" variants: they are reasoning models that answer with
-      // `reasoning_content` and leave `content` null, so a prediction request
-      // spends its whole budget thinking and returns nothing to insert.
-      "model": "z-ai/glm-5.3",
+      // gpt-oss-20b answers a completion in about a second on NVIDIA's free
+      // tier. GLM 5.3 is also offered there, but it was timing out after more
+      // than a minute, which is no use for a suggestion made while typing.
+      // Any model from build.nvidia.com/models can be set here instead.
+      "model": "openai/gpt-oss-20b",
       "prompt_format": "glm",
       "max_output_tokens": 512,
       "prediction_debounce": 0,

@@ -89,7 +89,6 @@ pub struct TerminalPanel {
     active: bool,
 }
 
-
 /// A shell that is installed on this machine and can be opened in a terminal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AvailableShell {
@@ -315,34 +314,41 @@ impl TerminalPanel {
                                 move |window, cx| {
                                     let focus_handle = focus_handle.clone();
                                     let workspace = workspace.clone();
-                                    let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
-                                        menu = menu.context(focus_handle.clone()).action(
-                                            "New Terminal",
-                                            workspace::NewTerminal::default().boxed_clone(),
-                                        );
+                                    let menu =
+                                        ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                            menu = menu.context(focus_handle.clone()).action(
+                                                "New Terminal",
+                                                workspace::NewTerminal::default().boxed_clone(),
+                                            );
 
-                                        // Everything installed, so the chevron
-                                        // answers "what else can I open?" --
-                                        // which is the only reason to press it.
-                                        let shells = available_shells();
-                                        if !shells.is_empty() {
-                                            menu = menu.separator().header("Open With");
-                                            for shell in shells {
-                                                let workspace = workspace.clone();
-                                                menu = menu.entry(shell.label, None, move |window, cx| {
-                                                    open_shell(&workspace, &shell, window, cx);
-                                                });
+                                            // Everything installed, so the chevron
+                                            // answers "what else can I open?" --
+                                            // which is the only reason to press it.
+                                            let shells = available_shells();
+                                            if !shells.is_empty() {
+                                                menu = menu.separator().header("Open With");
+                                                for shell in shells {
+                                                    let workspace = workspace.clone();
+                                                    menu = menu.entry(
+                                                        shell.label,
+                                                        None,
+                                                        move |window, cx| {
+                                                            open_shell(
+                                                                &workspace, &shell, window, cx,
+                                                            );
+                                                        },
+                                                    );
+                                                }
                                             }
-                                        }
 
-                                        // We want the focus to go back to terminal panel once task modal is dismissed,
-                                        // hence we focus that first. Otherwise, we'd end up without a focused element, as
-                                        // context menu will be gone the moment we spawn the modal.
-                                        menu.separator().action(
-                                            "Spawn Task",
-                                            zed_actions::Spawn::modal().boxed_clone(),
-                                        )
-                                    });
+                                            // We want the focus to go back to terminal panel once task modal is dismissed,
+                                            // hence we focus that first. Otherwise, we'd end up without a focused element, as
+                                            // context menu will be gone the moment we spawn the modal.
+                                            menu.separator().action(
+                                                "Spawn Task",
+                                                zed_actions::Spawn::modal().boxed_clone(),
+                                            )
+                                        });
 
                                     Some(menu)
                                 }

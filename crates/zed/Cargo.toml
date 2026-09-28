@@ -5,7 +5,7 @@ name = "acuto"
 # Own version line, not upstream's. This number reaches the update
 # manifest, the User-Agent and every crash tag, and inheriting 1.18.0 would
 # have all three claim to be a build of Zed.
-version = "0.1.0"
+version = "0.1.1"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Zed Team <hi@zed.dev>"]

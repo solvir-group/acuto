@@ -1,6 +1,6 @@
 use crate::{
-    NewFile, Open, OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation,
-    ToggleWorkspaceSidebar, Workspace, WorkspaceSettings,
+    NewFile, Open, OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation, Workspace,
+    WorkspaceSettings,
     item::{Item, ItemEvent},
     persistence::WorkspaceDb,
 };
@@ -13,10 +13,11 @@ use gpui::{
 use gpui::{WeakEntity, linear_color_stop, linear_gradient};
 use menu::{SelectNext, SelectPrevious};
 
+use gpui::img;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{DefaultOpenBehavior, Settings};
-use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
+use ui::{ButtonLike, Divider, DividerColor, KeyBinding, prelude::*};
 use util::ResultExt;
 use zed_actions::{OpenOnboarding, OpenSettings, assistant::ToggleFocus};
 
@@ -348,8 +349,9 @@ impl WelcomePage {
                         KeyBinding::for_action_in(&ToggleFocus, &self.focus_handle, cx)
                             .size(rems_from_px(12_f32)),
                     )
+                    // Only the agent panel. It used to toggle the threads sidebar
+                    // too, which then sat open taking a third of the window.
                     .on_click(move |_, window, cx| {
-                        focus.dispatch_action(&ToggleWorkspaceSidebar, window, cx);
                         focus.dispatch_action(&ToggleFocus, window, cx);
                     }),
             )
@@ -389,6 +391,70 @@ impl WelcomePage {
             self.focus_handle.clone(),
         )
     }
+}
+
+/// Width over height of `images/acuto_logo.png`.
+const ACUTO_LOGO_ASPECT_RATIO: f32 = 79. / 90.;
+
+/// The two looks Acuto ships: Frosted for light, Noir for dark.
+const LIGHT_THEME: &str = "Acuto Frosted";
+const DARK_THEME: &str = "Acuto Noir";
+
+/// Light or dark, the first choice a new user makes.
+///
+/// Writes a light/dark pair rather than one theme, so switching later from
+/// the settings keeps both halves of the pair.
+fn render_theme_choice(cx: &mut App) -> impl IntoElement {
+    let is_light = cx.theme().appearance().is_light();
+    let choice = |id: &'static str, label: &'static str, light: bool| {
+        let selected = light == is_light;
+        Button::new(id, label)
+            .full_width()
+            .label_size(LabelSize::Small)
+            .toggle_state(selected)
+            .style(if selected {
+                ButtonStyle::Filled
+            } else {
+                ButtonStyle::Outlined
+            })
+            .start_icon(
+                Icon::new(if light { IconName::Sun } else { IconName::Moon })
+                    .size(IconSize::Small)
+                    .color(if selected {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    }),
+            )
+            .on_click(move |_, _, cx| write_theme_choice(light, cx))
+    };
+
+    v_flex()
+        .w_full()
+        .gap_1()
+        .child(SectionHeader::new("Theme"))
+        .child(
+            h_flex()
+                .w_full()
+                .gap_2()
+                .child(choice("welcome-theme-light", "Light", true))
+                .child(choice("welcome-theme-dark", "Dark", false)),
+        )
+}
+
+fn write_theme_choice(light: bool, cx: &mut App) {
+    let fs = <dyn fs::Fs>::global(cx);
+    settings::update_settings_file(fs, cx, move |settings, _cx| {
+        settings.theme.theme = Some(settings::ThemeSelection::Dynamic {
+            mode: if light {
+                theme_settings::ThemeAppearanceMode::Light
+            } else {
+                theme_settings::ThemeAppearanceMode::Dark
+            },
+            light: theme_settings::ThemeName(LIGHT_THEME.into()),
+            dark: theme_settings::ThemeName(DARK_THEME.into()),
+        });
+    });
 }
 
 impl Render for WelcomePage {
@@ -457,15 +523,15 @@ impl Render for WelcomePage {
                             .justify_center()
                             .mb_4()
                             .gap_4()
-                            .child(Vector::square(VectorName::ZedLogo, rems_from_px(45_f32)))
                             .child(
-                                v_flex().child(Headline::new(welcome_label)).child(
-                                    Label::new("Agent diffs you can actually read")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                ),
-                            ),
+                                img("images/acuto_logo.png")
+                                    .flex_none()
+                                    .h(rems_from_px(45.0_f32))
+                                    .w(rems_from_px(45. * ACUTO_LOGO_ASPECT_RATIO)),
+                            )
+                            .child(Headline::new(welcome_label)),
                     )
+                    .child(render_theme_choice(cx))
                     .child(first_section.render(Default::default(), &self.focus_handle))
                     .child(second_section)
                     .when(ai_enabled && !showing_recent_projects, |this| {

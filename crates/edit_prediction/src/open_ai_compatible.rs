@@ -1,10 +1,18 @@
 use anyhow::{Context as _, Result};
 use cloud_llm_client::predict_edits_v3::{RawCompletionRequest, RawCompletionResponse};
 use futures::AsyncReadExt as _;
+use gpui::http_client::HttpRequestExt as _;
 use gpui::{App, AppContext as _, Entity, Global, SharedString, Task, http_client};
 use language::language_settings::{OpenAiCompatibleEditPredictionSettings, all_language_settings};
 use language_model::{ApiKeyState, EnvVar, env_var};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+
+/// How long a prediction request may take before it is abandoned.
+///
+/// A suggestion that arrives after the next keystroke is already wrong, and a
+/// service that stops answering must not leave requests hanging for minutes:
+/// that looked exactly like predictions being switched off.
+const PREDICTION_TIMEOUT: Duration = Duration::from_secs(12);
 
 pub fn open_ai_compatible_api_url(cx: &App) -> SharedString {
     all_language_settings(None, cx)
@@ -148,6 +156,7 @@ pub(crate) async fn send_custom_server_request(
             let mut http_request_builder = http_client::Request::builder()
                 .method(http_client::Method::POST)
                 .uri(settings.api_url.as_ref())
+                .timeout(PREDICTION_TIMEOUT)
                 .header("Content-Type", "application/json");
 
             if let Some(api_key) = api_key {
@@ -379,6 +388,7 @@ async fn post_chat_completion(
     let mut http_request_builder = http_client::Request::builder()
         .method(http_client::Method::POST)
         .uri(settings.api_url.as_ref())
+        .timeout(PREDICTION_TIMEOUT)
         .header("Content-Type", "application/json");
 
     if let Some(api_key) = api_key {

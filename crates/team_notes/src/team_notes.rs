@@ -42,6 +42,7 @@
 //! anyone being asked. A format that generates merge conflicts is a format
 //! nobody will keep using.
 
+mod chat_completions;
 pub mod panel;
 
 pub use panel::{AddNote, NewTicket, TeamNotesPanel, ToggleFocus};
@@ -586,7 +587,10 @@ mod tests {
     fn an_unmoved_line_resolves_exactly() {
         let lines = ["fn main() {", "    let x = 1;", "}"];
         assert_eq!(
-            resolve_anchor(thread("a", 1, "let x = 1;").anchor.as_ref().unwrap(), &lines),
+            resolve_anchor(
+                thread("a", 1, "let x = 1;").anchor.as_ref().unwrap(),
+                &lines
+            ),
             Resolution::Exact(1)
         );
     }
@@ -596,7 +600,10 @@ mod tests {
         let lines = ["// added", "// added", "fn main() {", "    let x = 1;", "}"];
         // Recorded at line 1, the text is now at line 3.
         assert_eq!(
-            resolve_anchor(thread("a", 1, "let x = 1;").anchor.as_ref().unwrap(), &lines),
+            resolve_anchor(
+                thread("a", 1, "let x = 1;").anchor.as_ref().unwrap(),
+                &lines
+            ),
             Resolution::Moved(3)
         );
     }
@@ -620,7 +627,10 @@ mod tests {
     #[test]
     fn deleted_code_keeps_its_note_rather_than_losing_it() {
         let lines = ["fn main() {", "}"];
-        let resolution = resolve_anchor(thread("a", 1, "let x = 1;").anchor.as_ref().unwrap(), &lines);
+        let resolution = resolve_anchor(
+            thread("a", 1, "let x = 1;").anchor.as_ref().unwrap(),
+            &lines,
+        );
         assert!(resolution.has_drifted());
         // Clamped into the file, so jumping to it cannot land past the end.
         assert!(resolution.line() < lines.len() as u32);
@@ -630,7 +640,10 @@ mod tests {
     fn re_indentation_does_not_orphan_a_note() {
         let lines = ["fn main() {", "        let x = 1;", "}"];
         assert_eq!(
-            resolve_anchor(thread("a", 1, "    let x = 1;").anchor.as_ref().unwrap(), &lines),
+            resolve_anchor(
+                thread("a", 1, "    let x = 1;").anchor.as_ref().unwrap(),
+                &lines
+            ),
             Resolution::Exact(1)
         );
     }
@@ -725,7 +738,10 @@ mod tests {
 
     #[test]
     fn mentions_are_found_but_email_addresses_are_not() {
-        assert_eq!(extract_mentions("ping @drew and @sam-b"), vec!["drew", "sam-b"]);
+        assert_eq!(
+            extract_mentions("ping @drew and @sam-b"),
+            vec!["drew", "sam-b"]
+        );
         assert!(extract_mentions("mail me at drew@example.com").is_empty());
         assert!(extract_mentions("an @ on its own").is_empty());
         assert_eq!(extract_mentions("@drew, thoughts?"), vec!["drew"]);
@@ -761,8 +777,57 @@ mod tests {
             "src/nested/file.rs"
         );
     }
-}
 
+    #[test]
+    fn a_short_ref_is_six_digits_of_the_random_half() {
+        assert_eq!(
+            short_ref("001a0d11ed129-e8e265b5d79c4ad19429108cc49e4645"),
+            "e8e265"
+        );
+        assert_eq!(short_ref("abc"), "abc");
+    }
+
+    #[test]
+    fn refs_are_hex_words_after_a_hash() {
+        assert_eq!(
+            extract_refs("see #e8e265 and #ABCD12."),
+            vec!["e8e265", "abcd12"]
+        );
+        // Too short, inside a word, or not hex: none of these are tickets.
+        assert!(extract_refs("item #1, C#abcd, url#abcdef, #zzzzzz").is_empty());
+        assert_eq!(extract_refs("(#beef00)"), vec!["beef00"]);
+    }
+
+    #[test]
+    fn ref_spans_cover_the_hash_and_digits() {
+        let text = "do #e8e265 now";
+        let spans = ref_spans(text);
+        assert_eq!(spans, vec![3..10]);
+        assert_eq!(&text[spans[0].clone()], "#e8e265");
+    }
+
+    #[test]
+    fn referenced_records_are_found_once_each() {
+        let mut first = ticket("Launch");
+        first.id = "001a0d11ed129-e8e265b5d79c".to_string();
+        let mut second = ticket("Docs");
+        second.id = "001a0d11ed130-0badc0ffee00".to_string();
+        let records = vec![first, second];
+        let found = referenced_records("#e8e265 then #0badc0 then #e8e265", &records);
+        assert_eq!(
+            found
+                .iter()
+                .map(|record| record.headline())
+                .collect::<Vec<_>>(),
+            vec!["Launch", "Docs"]
+        );
+    }
+
+    #[test]
+    fn gemini_can_be_mentioned() {
+        assert_eq!(mentioned_agents("@gemini look at this"), vec!["gemini"]);
+    }
+}
 
 /// A ticket written out as a brief for an agent.
 ///
@@ -772,7 +837,11 @@ mod tests {
 /// out and the part that makes handing over a ticket worth doing.
 pub fn brief_for_agent(ticket: &NoteThread) -> String {
     let mut out = String::new();
-    out.push_str(&format!("# Ticket {}: {}\n\n", ticket.id, ticket.headline()));
+    out.push_str(&format!(
+        "# Ticket {}: {}\n\n",
+        ticket.id,
+        ticket.headline()
+    ));
     out.push_str(&format!("- Status: {}\n", ticket.status.label()));
     if let Some(assignee) = &ticket.assignee {
         out.push_str(&format!("- Assignee: @{assignee}\n"));
@@ -790,7 +859,10 @@ pub fn brief_for_agent(ticket: &NoteThread) -> String {
     }
     out.push_str("\n## Discussion\n\n");
     for message in &ticket.messages {
-        out.push_str(&format!("**{}** ({}):\n{}\n\n", message.author, message.at, message.body));
+        out.push_str(&format!(
+            "**{}** ({}):\n{}\n\n",
+            message.author, message.at, message.body
+        ));
     }
     out.push_str(
         "## When you are done\n\n\
@@ -802,7 +874,6 @@ pub fn brief_for_agent(ticket: &NoteThread) -> String {
     out
 }
 
-
 /// The agents a person can hand work to by name.
 ///
 /// The name is what someone types after `@`; the id is the agent's registry
@@ -812,6 +883,7 @@ pub const AGENT_MENTIONS: &[(&str, &str)] = &[
     ("claude", "claude-acp"),
     ("codex", "codex-acp"),
     ("copilot", "github-copilot-cli"),
+    ("gemini", "gemini"),
     ("antigravity", "antigravity-acp"),
 ];
 
@@ -834,6 +906,76 @@ pub fn mentioned_agents(text: &str) -> Vec<&'static str> {
         }
     }
     agents
+}
+
+/// How many hex digits a short reference keeps.
+const SHORT_REF_LEN: usize = 6;
+
+/// A short name for a record that a person can type, like `#e8e265`.
+///
+/// The full id is a timestamp and a UUID: unique, but not something anyone
+/// reads out. Six hex digits of the random half tell a repository's tickets
+/// apart and are short enough to type.
+pub fn short_ref(id: &str) -> &str {
+    let random = id.rsplit_once('-').map_or(id, |(_, random)| random);
+    let end = random
+        .char_indices()
+        .nth(SHORT_REF_LEN)
+        .map_or(random.len(), |(index, _)| index);
+    &random[..end]
+}
+
+/// Pulls `#ref` out of a body: a `#` starting a word, then hex digits.
+///
+/// At least four digits, so `#1` in "item #1" is not mistaken for a ticket, and
+/// only at the start of a word, so a URL fragment or `C#` is not either.
+pub fn extract_refs(text: &str) -> Vec<String> {
+    ref_spans(text)
+        .into_iter()
+        .map(|span| text[span.start + 1..span.end].to_ascii_lowercase())
+        .collect()
+}
+
+/// Where each `#ref` sits in `text`, as byte ranges that include the `#`.
+pub fn ref_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut found = Vec::new();
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while let Some(offset) = text[index..].find('#') {
+        let hash = index + offset;
+        index = hash + 1;
+        if hash > 0
+            && bytes
+                .get(hash - 1)
+                .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'(')
+        {
+            continue;
+        }
+        let rest = &text[hash + 1..];
+        let end = rest
+            .find(|character: char| !character.is_ascii_hexdigit())
+            .unwrap_or(rest.len());
+        if end >= 4 {
+            found.push(hash..hash + 1 + end);
+        }
+    }
+    found
+}
+
+/// The records `text` refers to with `#ref`, once each, in the order they
+/// are first mentioned.
+pub fn referenced_records<'a>(text: &str, records: &'a [NoteThread]) -> Vec<&'a NoteThread> {
+    let mut found: Vec<&NoteThread> = Vec::new();
+    for reference in extract_refs(text) {
+        if let Some(record) = records
+            .iter()
+            .find(|record| short_ref(&record.id).eq_ignore_ascii_case(&reference))
+            && !found.iter().any(|existing| existing.id == record.id)
+        {
+            found.push(record);
+        }
+    }
+    found
 }
 
 /// What an agent is sent when someone mentions it in the team chat.

@@ -727,7 +727,12 @@ pub(crate) fn render_buffer_header(
                         };
                     border.border_color(border_color)
                 })
-                .when(is_sticky && opaque_window, |s| s.shadow_md())
+                // No drop shadow on a light theme: on white it is a grey smear,
+                // and the border already says where the edge is.
+                .when(
+                    is_sticky && opaque_window && !cx.theme().appearance().is_light(),
+                    |s| s.shadow_md(),
+                )
                 .when(show_header_background, |s| {
                     s.bg(colors.editor_subheader_background)
                 })

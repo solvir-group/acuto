@@ -573,7 +573,7 @@ impl Member {
                         this.bg(cx.theme().colors().background)
                             .border_1()
                             .border_color(cx.theme().colors().border)
-                            .shadow_lg()
+                            .when(!cx.theme().appearance().is_light(), |this| this.shadow_lg())
                             .overflow_hidden()
                     })
                     .child(

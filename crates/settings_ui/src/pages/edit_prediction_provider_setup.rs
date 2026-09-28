@@ -85,10 +85,12 @@ pub(crate) fn render_edit_prediction_setup_page(
         Some(render_ollama_provider(settings_window, window, cx).into_any_element()),
         Some(
             render_api_key_provider(
-                IconName::AiOpenAiCompat,
-                "OpenAI Compatible API",
+                IconName::AcutoMark,
+                "Acuto AI",
                 ApiKeyDocs::Custom {
-                    message: "The API key sent as Authorization: Bearer {key}.".into(),
+                    message: "Suggestions use your own NVIDIA API key, which is free: create one \
+                              at build.nvidia.com/settings/api-keys and paste it here."
+                        .into(),
                 },
                 open_ai_compatible_api_token(cx),
                 |cx| open_ai_compatible_api_url(cx),

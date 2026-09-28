@@ -47,7 +47,14 @@ impl ElevationIndex {
             ElevationIndex::EditorSurface => vec![],
 
             ElevationIndex::ElevatedSurface => vec![
-                BoxShadow::new(px(0.), px(2.), hsla(0., 0., 0., 0.12)).blur_radius(px(3.)),
+                // Every menu, tooltip and popover. Half strength on a light
+                // theme, where the same darkness reads as a smudge, not depth.
+                BoxShadow::new(
+                    px(0.),
+                    px(2.),
+                    hsla(0., 0., 0., if is_light { 0.06 } else { 0.12 }),
+                )
+                .blur_radius(px(3.)),
                 BoxShadow::new(
                     px(0.),
                     px(1.),

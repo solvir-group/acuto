@@ -964,9 +964,11 @@ mod remote_button {
         in_progress_operation: Option<RemoteOperationKind>,
         menu_handle: PopoverMenuHandle<ContextMenu>,
     ) -> SplitButton {
+        // "Push", not "Publish": it runs a push, and a new branch getting its
+        // first push is still a push to anyone who knows git.
         split_button(
             id,
-            "Publish",
+            "Push",
             0,
             0,
             Some(IconName::ExpandUp),
@@ -978,7 +980,7 @@ mod remote_button {
             },
             move |_window, cx| {
                 git_action_tooltip(
-                    "Publish branch to remote",
+                    "Push branch to remote",
                     &git::Push,
                     "git push --set-upstream",
                     keybinding_target.clone(),

@@ -96,6 +96,14 @@ jobs:
         shell: pwsh
         run: |
           Set-Content -Path crates/zed/RELEASE_CHANNEL -Value "stable" -NoNewline
+          # The app reports its version from this crate, and the updater
+          # compares it with the newest release's tag. Left behind the tag, an
+          # installed copy would see itself as out of date on every launch.
+          $manifest = "crates/zed/Cargo.toml"
+          $pattern = [regex]'(?m)^version = "[^"]*"'
+          $toml = Get-Content $manifest -Raw
+          $toml = $pattern.Replace($toml, "version = ""$env:RELEASE_VERSION""", 1)
+          Set-Content -Path $manifest -Value $toml -NoNewline
           ./script/bundle-windows.ps1 -Architecture x86_64
 
       - name: Keep the installer with the run

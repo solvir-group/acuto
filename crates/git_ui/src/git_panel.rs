@@ -6312,11 +6312,7 @@ impl GitPanel {
                     .style(ButtonStyle::Tinted(TintColor::Accent))
                     .size(ButtonSize::Default)
                     .disabled(!can_commit || self.modal_open)
-                    .child(
-                        Label::new(title)
-                            .color(label_color)
-                            .mr_0p5(),
-                    )
+                    .child(Label::new(title).color(label_color).mr_0p5())
                     .on_click({
                         let git_panel = cx.weak_entity();
                         move |_, window, cx| {

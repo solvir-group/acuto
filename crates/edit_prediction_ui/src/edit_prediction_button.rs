@@ -279,7 +279,7 @@ impl Render for EditPredictionButton {
                         })
                         .anchor(Anchor::BottomRight)
                         .trigger(
-                            IconButton::new("openai-compatible-api-icon", IconName::AiOpenAiCompat)
+                            IconButton::new("openai-compatible-api-icon", IconName::AcutoMark)
                                 .shape(IconButtonShape::Square)
                                 .tab_index(0isize)
                                 .aria_label("Edit Prediction")
@@ -1115,6 +1115,55 @@ impl EditPredictionButton {
                     EditPredictionProvider::None | EditPredictionProvider::Zed
                 );
 
+            // Acuto AI runs on the user's own key. Without one every request is
+            // refused and nothing says so, which reads as the feature being
+            // broken; this says what is missing and where to get it free.
+            let needs_api_key = provider == EditPredictionProvider::OpenAiCompatibleApi && {
+                let url = edit_prediction::open_ai_compatible::open_ai_compatible_api_url(cx);
+                edit_prediction::open_ai_compatible::open_ai_compatible_api_token(cx)
+                    .read(cx)
+                    .key(&url)
+                    .is_none()
+            };
+            if needs_api_key {
+                menu = menu
+                    .custom_row(|_window, _cx| {
+                        v_flex()
+                            .max_w_64()
+                            .gap_0p5()
+                            .child(Label::new("Acuto AI needs an API key"))
+                            .child(
+                                Label::new(
+                                    "Suggestions run on your own NVIDIA key, which is free. \
+                                     Create one, then paste it into Acuto AI's settings.",
+                                )
+                                .color(Color::Muted)
+                                .size(LabelSize::Small),
+                            )
+                            .into_any_element()
+                    })
+                    .entry("Get a Free Key", None, |window, cx| {
+                        window.dispatch_action(
+                            OpenBrowser {
+                                url: "https://build.nvidia.com/settings/api-keys".into(),
+                            }
+                            .boxed_clone(),
+                            cx,
+                        );
+                    })
+                    .entry("Add Your Key…", None, |window, cx| {
+                        window.dispatch_action(
+                            OpenSettingsAt {
+                                path: "edit_predictions.providers".to_string(),
+                                target: None,
+                            }
+                            .boxed_clone(),
+                            cx,
+                        );
+                    })
+                    .separator();
+            }
+
             if needs_sign_in {
                 menu = menu
                     .custom_row(move |_window, cx| {
@@ -1264,16 +1313,12 @@ impl EditPredictionButton {
                                     .color(Color::Warning)
                                     .into_any_element()
                             },
-                            |_window, cx| {
-                                cx.open_url(&zed_urls::account_url(cx))
-                            },
+                            |_window, cx| cx.open_url(&zed_urls::account_url(cx)),
                         )
                         .entry(
                             "Check your payment status to continue using this feature.",
                             None,
-                            |_window, cx| {
-                                cx.open_url(&zed_urls::account_url(cx))
-                            },
+                            |_window, cx| cx.open_url(&zed_urls::account_url(cx)),
                         )
                         .separator();
                 }

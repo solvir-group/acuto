@@ -138,7 +138,9 @@ impl DiffHunkDelegate for UnstagedDiffDelegate {
             .rounded_b_lg()
             .bg(cx.theme().colors().editor_background)
             .block_mouse_except_scroll()
-            .shadow_md()
+            // No drop shadow on a light theme: every hunk has these controls,
+            // and on white a shadow under each is a row of grey smears.
+            .when(!cx.theme().appearance().is_light(), |this| this.shadow_md())
             .child(
                 Button::new(("stage", row as u64), "Stage")
                     .alpha(if status.is_pending() { 0.66 } else { 1.0 })

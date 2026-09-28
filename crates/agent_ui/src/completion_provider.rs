@@ -1241,9 +1241,9 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
 
             Some(PromptContextType::Ticket) => {
                 let search = search_tickets(query, &workspace, cx);
-                cx.background_spawn(async move {
-                    search.await.into_iter().map(Match::Ticket).collect()
-                })
+                cx.background_spawn(
+                    async move { search.await.into_iter().map(Match::Ticket).collect() },
+                )
             }
 
             Some(PromptContextType::Diagnostics) => Task::ready(Vec::new()),
@@ -1252,6 +1252,12 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
 
             None if query.is_empty() => {
                 let recent_task = self.recent_context_picker_entries(&workspace, cx);
+                // The newest open tickets, right under `@`. Behind a "Tickets"
+                // entry only, they were one click too far for anyone to find.
+                let tickets_task = self
+                    .source
+                    .supports_context(PromptContextType::Ticket, cx)
+                    .then(|| search_tickets(String::new(), &workspace, cx));
                 let entries = self
                     .available_context_picker_entries(&workspace, cx)
                     .into_iter()
@@ -1274,6 +1280,9 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
 
                 cx.spawn(async move |_cx| {
                     let mut matches = recent_task.await;
+                    if let Some(tickets_task) = tickets_task {
+                        matches.extend(tickets_task.await.into_iter().take(3).map(Match::Ticket));
+                    }
                     matches.extend(entries);
 
                     if let Some(branch_diff_task) = branch_diff_task {
@@ -1290,6 +1299,12 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
 
                 let search_files_task =
                     search_files(query.clone(), cancellation_flag, &workspace, cx);
+                // Tickets are searched alongside files, so `@login` finds the
+                // "fix login" ticket as readily as login.rs.
+                let search_tickets_task = self
+                    .source
+                    .supports_context(PromptContextType::Ticket, cx)
+                    .then(|| search_tickets(query.clone(), &workspace, cx));
 
                 let entries = self.available_context_picker_entries(&workspace, cx);
                 let entry_candidates = entries
@@ -1313,6 +1328,15 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                         .into_iter()
                         .map(Match::File)
                         .collect::<Vec<_>>();
+                    if let Some(search_tickets_task) = search_tickets_task {
+                        matches.extend(
+                            search_tickets_task
+                                .await
+                                .into_iter()
+                                .take(5)
+                                .map(Match::Ticket),
+                        );
+                    }
 
                     let entry_matches = fuzzy::match_strings(
                         &entry_candidates,
@@ -3536,7 +3560,6 @@ mod tests {
     }
 }
 
-
 /// Open tickets in the repository's team notes whose title or id contains the
 /// query, newest first.
 ///
@@ -3564,9 +3587,7 @@ fn search_tickets(
             tickets.extend(
                 team_notes::parse(&contents)
                     .into_iter()
-                    .filter(|record| {
-                        record.kind == team_notes::Kind::Ticket && !record.is_closed()
-                    })
+                    .filter(|record| record.kind == team_notes::Kind::Ticket && !record.is_closed())
                     .filter(|record| {
                         query.is_empty()
                             || record.headline().to_lowercase().contains(&query)

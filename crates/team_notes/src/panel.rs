@@ -1,6 +1,6 @@
 //! The panel: notes on lines, tickets for work, both carried by the repository.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, rc::Rc, sync::Arc};
 
 use editor::{Editor, EditorEvent, MultiBufferOffset};
 use fs::Fs;
@@ -18,9 +18,16 @@ use workspace::{
 };
 
 use crate::{
-    Anchor, Kind, Message, NoteThread, Status, author_name, notes_file, resolve_anchor,
-    team_roster,
+    Anchor, Kind, Message, NOTES_PATH, NoteThread, Status, author_name,
+    chat_completions::ChatCompletionProvider, notes_file, resolve_anchor, team_roster,
 };
+
+/// The widest the chat composer grows. A message box as wide as a maximised
+/// window sends the caret on a long trip for every line.
+const CHAT_COMPOSER_MAX_WIDTH: f32 = 440.;
+
+/// What the chat box says before you type.
+const CHAT_PLACEHOLDER: &str = "Message the team \u{2014} @ to mention, # for a ticket";
 
 actions!(
     team_notes,
@@ -129,6 +136,10 @@ pub struct TeamNotesPanel {
     /// would sit dimmed until some unrelated event happened to repaint.
     _composer_edits: Option<Subscription>,
     _reload: Option<Task<()>>,
+    /// The repository the records belong to: the one holding the file you are
+    /// working in. See [`Self::preferred_root`].
+    root: Option<PathBuf>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl TeamNotesPanel {
@@ -145,13 +156,49 @@ impl TeamNotesPanel {
     pub fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
         let project = workspace.project().clone();
         let fs = project.read(cx).fs().clone();
-        // Taken before `project` moves into the struct, so the roster can be
-        // fetched by the same task that resolves the author name.
-        let root = project
-            .read(cx)
-            .visible_worktrees(cx)
-            .next()
+        // The repository of the file in front, as `preferred_root` would pick
+        // later; read from `workspace` directly because this runs while the
+        // workspace is being updated and cannot be read through its handle.
+        let active_worktree = workspace
+            .active_item(cx)
+            .and_then(|item| item.project_path(cx))
+            .and_then(|path| project.read(cx).worktree_for_id(path.worktree_id, cx))
+            .filter(|worktree| worktree.read(cx).is_visible());
+        let root = active_worktree
+            .or_else(|| project.read(cx).visible_worktrees(cx).next())
             .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
+
+        // Follows the repository you are in. A panel that read the first folder
+        // once, when the window opened, showed an empty chat for a folder opened
+        // later and the wrong repository's chat in a window with two.
+        let mut subscriptions = vec![cx.subscribe(&project, |this, _, event, cx| {
+            match event {
+                project::Event::WorktreeAdded(_)
+                | project::Event::WorktreeRemoved(_)
+                | project::Event::WorktreeOrderChanged => this.refresh_root(cx),
+                // A teammate's messages arrive with a pull; the worktree reports
+                // the notes file changing, which is the cue to read it again.
+                project::Event::WorktreeUpdatedEntries(_, changes) => {
+                    if changes
+                        .iter()
+                        .any(|(path, _, _)| path.as_unix_str() == NOTES_PATH)
+                    {
+                        this.reload(cx);
+                    }
+                }
+                _ => {}
+            }
+        })];
+        if let Some(workspace_entity) = workspace.weak_handle().upgrade() {
+            subscriptions.push(cx.subscribe(
+                &workspace_entity,
+                |this, _, event: &workspace::Event, cx| {
+                    if matches!(event, workspace::Event::ActiveItemChanged) {
+                        this.refresh_root(cx);
+                    }
+                },
+            ));
+        }
 
         let mut this = Self {
             workspace: workspace.weak_handle(),
@@ -167,12 +214,98 @@ impl TeamNotesPanel {
             team: Vec::new(),
             _composer_edits: None,
             _reload: None,
+            root,
+            _subscriptions: subscriptions,
         };
 
+        this.load_team(cx);
+        this.reload(cx);
+        this
+    }
+
+    pub(crate) fn records(&self) -> &[NoteThread] {
+        &self.records
+    }
+
+    pub(crate) fn team(&self) -> &[Arc<str>] {
+        &self.team
+    }
+
+    /// The repository the records should come from.
+    ///
+    /// The worktree holding the active file; failing that the one already in
+    /// use, as long as it is still open; failing that the first. Only a file
+    /// moves it, so clicking into this panel -- which has no file -- does not
+    /// flip a two-repository window back to the first repository.
+    fn preferred_root(&self, cx: &App) -> Option<PathBuf> {
+        let project = self.project.read(cx);
+        let active_worktree = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).active_item(cx))
+            .and_then(|item| item.project_path(cx))
+            .and_then(|path| project.worktree_for_id(path.worktree_id, cx))
+            .filter(|worktree| worktree.read(cx).is_visible());
+        if let Some(worktree) = active_worktree {
+            return Some(worktree.read(cx).abs_path().to_path_buf());
+        }
+        let still_open = self.root.as_ref().is_some_and(|root| {
+            project
+                .visible_worktrees(cx)
+                .any(|worktree| worktree.read(cx).abs_path().as_ref() == root.as_path())
+        });
+        if still_open {
+            return self.root.clone();
+        }
+        project
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+    }
+
+    fn refresh_root(&mut self, cx: &mut Context<Self>) {
+        let root = self.preferred_root(cx);
+        if root == self.root {
+            return;
+        }
+        // Held while something is being written: it belongs to the repository
+        // it was started in, and switching now would send it to another one.
+        // The switch happens once it has been sent or dropped.
+        let still_open = self.root.as_ref().is_some_and(|root| {
+            self.project
+                .read(cx)
+                .visible_worktrees(cx)
+                .any(|worktree| worktree.read(cx).abs_path().as_ref() == root.as_path())
+        });
+        let writing = !self.draft_is_empty(cx)
+            || self
+                .replying_to
+                .as_ref()
+                .is_some_and(|(_, composer)| !composer.read(cx).text(cx).trim().is_empty());
+        if writing && still_open {
+            return;
+        }
+        log::info!(
+            "team notes: now showing {}",
+            root.as_deref()
+                .map(|root| root.display().to_string())
+                .unwrap_or_else(|| "no repository".into())
+        );
+        self.root = root;
+        self.records.clear();
+        self.team.clear();
+        self.load_team(cx);
+        self.reload(cx);
+        cx.notify();
+    }
+
+    /// Who you are and who else works on this repository.
+    fn load_team(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
         cx.spawn(async move |this, cx| {
             let executor = cx.background_executor().clone();
             let author = author_name(&executor).await;
-            let mut team = match root {
+            let mut team = match root.clone() {
                 Some(root) => team_roster(root, &executor).await,
                 None => Vec::new(),
             };
@@ -186,15 +319,16 @@ impl TeamNotesPanel {
             }
             this.update(cx, |this, cx| {
                 this.author = author;
-                this.team = team;
+                // Only for the repository still showing: a slow roster for the
+                // previous one would otherwise land on this one.
+                if this.root == root {
+                    this.team = team;
+                }
                 cx.notify();
             })
             .ok();
         })
         .detach();
-
-        this.reload(cx);
-        this
     }
 
     /// The worktree the file belongs to.
@@ -202,9 +336,8 @@ impl TeamNotesPanel {
     /// The first visible worktree. A window with several of them keeps its
     /// records with the first, because they have to live in exactly one
     /// repository and splitting them would make "where is this" unanswerable.
-    fn worktree_root(&self, cx: &App) -> Option<PathBuf> {
-        let worktree = self.project.read(cx).visible_worktrees(cx).next()?;
-        Some(worktree.read(cx).abs_path().to_path_buf())
+    fn worktree_root(&self, _cx: &App) -> Option<PathBuf> {
+        self.root.clone()
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -214,11 +347,29 @@ impl TeamNotesPanel {
         let fs = self.fs.clone();
 
         self._reload = Some(cx.spawn(async move |this, cx| {
-            let contents = fs.load(&notes_file(&root)).await.unwrap_or_default();
+            let path = notes_file(&root);
+            // Missing is empty: a repository with no notes yet. A file that is
+            // there but cannot be read -- mid-checkout, locked by another
+            // program -- keeps what is showing. Treating that as empty would
+            // write the empty list back on the next change and delete every
+            // note in the repository.
+            let contents = match fs.load(&path).await {
+                Ok(contents) => contents,
+                Err(error) => {
+                    if fs.is_file(&path).await {
+                        log::warn!("team notes: could not read {}: {error:#}", path.display());
+                        return;
+                    }
+                    String::new()
+                }
+            };
             let records = crate::parse(&contents);
             this.update(cx, |this, cx| {
-                this.records = records;
-                cx.notify();
+                // Dropped if the repository changed while this was reading.
+                if this.root.as_deref() == Some(root.as_path()) {
+                    this.records = records;
+                    cx.notify();
+                }
             })
             .ok();
         }));
@@ -254,9 +405,11 @@ impl TeamNotesPanel {
         cx: &mut Context<Self>,
     ) {
         let placeholder = placeholder.to_string();
+        let panel = cx.weak_entity();
         let composer = cx.new(|cx| {
             let mut editor = Editor::auto_height(1, 8, window, cx);
             editor.set_placeholder_text(placeholder.as_str(), window, cx);
+            enable_suggestions(&mut editor, panel);
             editor
         });
         composer.focus_handle(cx).focus(window, cx);
@@ -455,8 +608,19 @@ impl TeamNotesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Tickets named with `#ref` go with the message, so "@claude do #e8e265"
+        // hands over the ticket and not just the six characters naming it.
+        let referenced: Vec<NoteThread> = crate::referenced_records(said, &self.records)
+            .into_iter()
+            .filter(|ticket| ticket.id != record.id)
+            .cloned()
+            .collect();
         for agent in crate::mentioned_agents(said) {
-            let prompt = crate::prompt_for_agent(record, said);
+            let mut prompt = crate::prompt_for_agent(record, said);
+            for ticket in &referenced {
+                prompt.push_str("\n\n");
+                prompt.push_str(&crate::brief_for_agent(ticket));
+            }
             match cx.build_action(
                 "agent::AskAgent",
                 Some(serde_json::json!({ "agent": agent, "prompt": prompt })),
@@ -494,9 +658,11 @@ impl TeamNotesPanel {
     }
 
     fn start_reply(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = cx.weak_entity();
         let composer = cx.new(|cx| {
             let mut editor = Editor::auto_height(1, 8, window, cx);
             editor.set_placeholder_text("Reply…", window, cx);
+            enable_suggestions(&mut editor, panel);
             editor
         });
         composer.focus_handle(cx).focus(window, cx);
@@ -528,9 +694,7 @@ impl TeamNotesPanel {
         if let Some(record) = records.iter_mut().find(|record| record.id == id) {
             let finished = record.is_closed();
             match record.kind {
-                Kind::Ticket => {
-                    record.status = if finished { Status::Open } else { Status::Done }
-                }
+                Kind::Ticket => record.status = if finished { Status::Open } else { Status::Done },
                 Kind::Note | Kind::Message => record.resolved = !finished,
             }
         }
@@ -565,10 +729,22 @@ impl TeamNotesPanel {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let Some(project_path) = self
-            .project
-            .read(cx)
-            .find_project_path(std::path::Path::new(&file), cx)
+        // In this repository. Looking the relative path up across the whole
+        // project found the first worktree with a file of that name, which in
+        // a window with two repositories was often the other one.
+        let project = self.project.read(cx);
+        let in_this_repository = self.root.as_ref().and_then(|root| {
+            let worktree = project
+                .visible_worktrees(cx)
+                .find(|worktree| worktree.read(cx).abs_path().as_ref() == root.as_path())?;
+            let path = util::rel_path::RelPath::from_unix_str(&file).ok()?.into_arc();
+            Some(project::ProjectPath {
+                worktree_id: worktree.read(cx).id(),
+                path,
+            })
+        });
+        let Some(project_path) = in_this_repository
+            .or_else(|| project.find_project_path(std::path::Path::new(&file), cx))
         else {
             return;
         };
@@ -719,9 +895,7 @@ impl TeamNotesPanel {
                             .tooltip(Tooltip::text("Go to this line"))
                             .on_click(cx.listener({
                                 let id = id.clone();
-                                move |this, _, window, cx| {
-                                    this.jump_to(id.clone(), window, cx)
-                                }
+                                move |this, _, window, cx| this.jump_to(id.clone(), window, cx)
                             })),
                         )
                     }),
@@ -806,6 +980,16 @@ impl TeamNotesPanel {
 }
 
 /// The row `offset` falls on, and that row's text.
+/// `#ticket` and `@name` suggestions while typing.
+///
+/// Forced on for these editors: Acuto turns suggestions-while-typing off for
+/// code, and a chat where `#` offers nothing is one where tickets cannot be
+/// named at all.
+fn enable_suggestions(editor: &mut Editor, panel: WeakEntity<TeamNotesPanel>) {
+    editor.set_completion_provider(Some(Rc::new(ChatCompletionProvider::new(panel))));
+    editor.set_show_completions_on_input(Some(true));
+}
+
 fn row_and_line_at(text: &str, offset: usize) -> (u32, String) {
     let mut row = 0u32;
     let mut consumed = 0usize;
@@ -840,15 +1024,19 @@ impl TeamNotesPanel {
             .child(
                 h_flex()
                     .flex_none()
-                    .children(self.team.iter().take(STACK).enumerate().map(
-                        |(index, member)| {
-                            div()
-                                // Overlapped rather than spaced: a stack reads
-                                // as one group, a row reads as a list.
-                                .when(index > 0, |this| this.ml(px(-8.)))
-                                .child(initials_avatar(member, px(24.), Some(ring), cx))
-                        },
-                    )),
+                    .children(
+                        self.team
+                            .iter()
+                            .take(STACK)
+                            .enumerate()
+                            .map(|(index, member)| {
+                                div()
+                                    // Overlapped rather than spaced: a stack reads
+                                    // as one group, a row reads as a list.
+                                    .when(index > 0, |this| this.ml(px(-8.)))
+                                    .child(initials_avatar(member, px(24.), Some(ring), cx))
+                            }),
+                    ),
             )
             .child(
                 v_flex()
@@ -1001,7 +1189,9 @@ impl TeamNotesPanel {
                             .gap_0p5()
                             .when_some(bubble.stamp, |this, stamp| {
                                 this.child(
-                                    Label::new(stamp).size(LabelSize::XSmall).color(Color::Muted),
+                                    Label::new(stamp)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
                                 )
                             })
                             .child(
@@ -1052,16 +1242,12 @@ impl TeamNotesPanel {
                                                     } else {
                                                         received_background
                                                     })
-                                                    .child({
-                                                        let label =
-                                                            Label::new(bubble.message.body.clone())
-                                                                .size(LabelSize::Small);
-                                                        if bubble.mine {
-                                                            label.color(Color::Custom(on_sent))
-                                                        } else {
-                                                            label
-                                                        }
-                                                    }),
+                                                    .child(self.render_message_body(
+                                                        &bubble.message.body,
+                                                        bubble.mine.then_some(on_sent),
+                                                        index,
+                                                        cx,
+                                                    )),
                                             ),
                                     ),
                             )
@@ -1084,6 +1270,87 @@ impl TeamNotesPanel {
             .into_any_element()
     }
 
+    /// A message's text, with each `#ref` naming a ticket drawn as a chip.
+    ///
+    /// Clicking a chip opens the tickets, so a reference can be followed rather
+    /// than copied into a search box.
+    fn render_message_body(
+        &self,
+        body: &str,
+        text_color: Option<gpui::Hsla>,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let color = |label: Label| match text_color {
+            Some(color) => label.color(Color::Custom(color)),
+            None => label,
+        };
+        if crate::referenced_records(body, &self.records).is_empty() {
+            return color(Label::new(body.to_string()).size(LabelSize::Small)).into_any_element();
+        }
+
+        // Line by line, and within a line only the references are replaced,
+        // so a pasted snippet or a list keeps its line breaks and spacing.
+        let mut lines = Vec::new();
+        let mut chip_index = 0;
+        for line in body.split('\n') {
+            let mut pieces = Vec::new();
+            let mut cursor = 0;
+            for span in crate::ref_spans(line) {
+                let ticket = crate::referenced_records(&line[span.clone()], &self.records)
+                    .into_iter()
+                    .next();
+                let Some(ticket) = ticket else {
+                    continue;
+                };
+                if span.start > cursor {
+                    pieces.push(
+                        color(Label::new(line[cursor..span.start].to_string()).size(LabelSize::Small))
+                            .into_any_element(),
+                    );
+                }
+                cursor = span.end;
+                chip_index += 1;
+                pieces.push(
+                    h_flex()
+                        .id(("ticket-ref", index * 1000 + chip_index))
+                        .px_1()
+                        .rounded_sm()
+                        .bg(cx.theme().colors().element_background)
+                        .border_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .child(
+                            Label::new(format!(
+                                "#{} {}",
+                                crate::short_ref(&ticket.id),
+                                ticket.headline()
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Default),
+                        )
+                        .tooltip(Tooltip::text(format!("Ticket · {}", ticket.status.label())))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.filter = Filter::Tickets;
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+            if cursor < line.len() || pieces.is_empty() {
+                // An empty line keeps its height with a single space.
+                let rest = if cursor < line.len() { &line[cursor..] } else { " " };
+                pieces.push(
+                    color(Label::new(rest.to_string()).size(LabelSize::Small)).into_any_element(),
+                );
+            }
+            lines.push(h_flex().flex_wrap().items_center().children(pieces));
+        }
+
+        v_flex().children(lines).into_any_element()
+    }
+
     /// One pill: attach on the left, what you are typing in the middle, send on
     /// the right.
     ///
@@ -1104,9 +1371,10 @@ impl TeamNotesPanel {
         let accent = cx.theme().players().local().cursor;
         let on_accent = gpui::hsla(0., 0., 1., 1.);
 
-        div()
+        h_flex()
             .flex_none()
             .w_full()
+            .justify_center()
             .px_2()
             .pt_1()
             .pb_2()
@@ -1114,6 +1382,7 @@ impl TeamNotesPanel {
                 h_flex()
                     .key_context("TeamNotesComposer")
                     .w_full()
+                    .max_w(px(CHAT_COMPOSER_MAX_WIDTH))
                     .items_end()
                     .gap_1()
                     .p_1()
@@ -1165,16 +1434,17 @@ impl TeamNotesPanel {
                             .map(|this| match self.drafting.as_ref() {
                                 Some((Draft::Message, composer)) => this.child(composer.clone()),
                                 _ => this.child(
-                                    Label::new("Type your message")
+                                    Label::new(CHAT_PLACEHOLDER)
                                         .size(LabelSize::Small)
-                                        .color(Color::Muted),
+                                        .color(Color::Muted)
+                                        .truncate(),
                                 ),
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if !matches!(this.drafting, Some((Draft::Message, _))) {
                                     this.open_composer(
                                         Draft::Message,
-                                        "Type your message",
+                                        CHAT_PLACEHOLDER,
                                         window,
                                         cx,
                                     );
@@ -1198,18 +1468,16 @@ impl TeamNotesPanel {
                                     .hover(|style| style.opacity(0.85))
                             })
                             .when(!ready, |this| this.bg(gpui::Hsla { a: 0.25, ..accent }))
-                            .child(
-                                Icon::new(IconName::Send)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Custom(if ready {
-                                        on_accent
-                                    } else {
-                                        gpui::Hsla {
-                                            a: 0.5,
-                                            ..on_accent
-                                        }
-                                    })),
-                            )
+                            .child(Icon::new(IconName::Send).size(IconSize::XSmall).color(
+                                Color::Custom(if ready {
+                                    on_accent
+                                } else {
+                                    gpui::Hsla {
+                                        a: 0.5,
+                                        ..on_accent
+                                    }
+                                }),
+                            ))
                             // The keybinding lives in the tooltip rather than
                             // in a hint line under the box: a line that appears
                             // when you focus the composer shifts the whole
@@ -1229,8 +1497,9 @@ impl TeamNotesPanel {
     /// before each message.
     fn send_chat_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.submit_draft(window, cx);
+        self.refresh_root(cx);
         if self.drafting.is_none() {
-            self.open_composer(Draft::Message, "Type your message", window, cx);
+            self.open_composer(Draft::Message, CHAT_PLACEHOLDER, window, cx);
         }
     }
 
@@ -1240,7 +1509,7 @@ impl TeamNotesPanel {
     /// cannot: say which file you mean without alt-tabbing to find out.
     fn attach_current_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.drafting, Some((Draft::Message, _))) {
-            self.open_composer(Draft::Message, "Type your message", window, cx);
+            self.open_composer(Draft::Message, CHAT_PLACEHOLDER, window, cx);
         }
         let Some(path) = self.active_file_path(cx) else {
             return;
@@ -1858,7 +2127,11 @@ fn last_used_editor(workspace: &Workspace, cx: &App) -> Option<Entity<Editor>> {
                 .read(cx)
                 .as_singleton()
                 .is_some_and(|buffer| buffer.read(cx).file().is_some());
-            if has_file && best.as_ref().is_none_or(|(time, _)| entry.timestamp > *time) {
+            if has_file
+                && best
+                    .as_ref()
+                    .is_none_or(|(time, _)| entry.timestamp > *time)
+            {
                 best = Some((entry.timestamp, editor));
             }
         }

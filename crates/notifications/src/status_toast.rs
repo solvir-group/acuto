@@ -93,7 +93,15 @@ impl Render for StatusToast {
             })
             .flex_none()
             .bg(cx.theme().colors().surface_background)
-            .shadow_lg()
+            .map(|this| {
+                // A lighter lift on a light theme: the toast still has to float
+                // over the content, but a large dark blur on white is a smudge.
+                if cx.theme().appearance().is_light() {
+                    this.shadow_sm()
+                } else {
+                    this.shadow_lg()
+                }
+            })
             .when_some(self.icon.clone(), |this, icon| this.child(icon))
             .child(Label::new(self.text.clone()).color(Color::Default))
             .when_some(self.action.as_ref(), |this, action| {

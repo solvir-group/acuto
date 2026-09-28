@@ -672,6 +672,8 @@ pub struct ThreadView {
     dismissed_skill_loading_issues: HashSet<SkillLoadingIssue>,
     pub(crate) thread_search_bar: Option<Entity<super::thread_search_bar::ThreadSearchBar>>,
     pub(crate) thread_search_visible: bool,
+    /// The account the agent's own tool is signed in as, once it is known.
+    signed_in_as: Option<SharedString>,
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -1078,7 +1080,24 @@ impl ThreadView {
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
             thread_search_visible: false,
+            signed_in_as: None,
         };
+
+        {
+            let agent_id = this.agent_id.to_string();
+            let lookup = cx.background_spawn(async move {
+                crate::conversation_view::claude_brand::saved_account(&agent_id)
+            });
+            cx.spawn(async move |this, cx| {
+                let account = lookup.await;
+                this.update(cx, |this, cx| {
+                    this.signed_in_as = account.map(Into::into);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
 
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
@@ -3231,12 +3250,15 @@ impl ThreadView {
                     .border_b_0()
                     .border_color(cx.theme().colors().border)
                     .rounded_t_md()
-                    .when(opaque_window, |this| {
-                        this.shadow(vec![
-                            gpui::BoxShadow::new(px(1.), px(-1.), gpui::black().opacity(0.12))
-                                .blur_radius(px(2.)),
-                        ])
-                    })
+                    .when(
+                        opaque_window && !cx.theme().appearance().is_light(),
+                        |this| {
+                            this.shadow(vec![
+                                gpui::BoxShadow::new(px(1.), px(-1.), gpui::black().opacity(0.12))
+                                    .blur_radius(px(2.)),
+                            ])
+                        },
+                    )
                     .when_some(awaiting_permission, |this, element| this.child(element))
                     .when(
                         has_awaiting_permission
@@ -4420,6 +4442,43 @@ impl ThreadView {
         )
     }
 
+    /// Which account the agent is using, and a way to use another.
+    ///
+    /// Agents sign in with their own tools and keep the login, so a thread can
+    /// start already signed in with no word from Acuto about who as. This says.
+    fn render_signed_in_line(&self, agent_name: &str, cx: &mut Context<Self>) -> AnyElement {
+        let text = match &self.signed_in_as {
+            Some(account) => format!("Signed in as {account}"),
+            None => format!("Using this PC's {agent_name} sign-in"),
+        };
+        let can_switch = self
+            .server_view
+            .upgrade()
+            .is_some_and(|view| view.read(cx).can_switch_account());
+
+        h_flex()
+            .gap_1()
+            .child(Label::new(text).size(LabelSize::Small).color(Color::Muted))
+            .when(can_switch, |this| {
+                this.child(
+                    Label::new("\u{00b7}")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Button::new("switch-agent-account", "Switch account")
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            if let Some(view) = this.server_view.upgrade() {
+                                view.update(cx, |view, cx| view.show_sign_in(cx));
+                            }
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
     pub(crate) fn render_message_editor(
         &mut self,
         window: &mut Window,
@@ -4462,7 +4521,10 @@ impl ThreadView {
                         .size_full()
                         .items_center()
                         .when_some(self.brand(cx), |this, brand| {
-                            this.flex_col().gap_2().child(agent_greeting(brand, cx))
+                            this.flex_col()
+                                .gap_2()
+                                .child(agent_greeting(brand, cx))
+                                .child(self.render_signed_in_line(brand.name, cx))
                         })
                 }
             })
@@ -4488,27 +4550,16 @@ impl ThreadView {
                     // saturation a tinted input reads as a warning; at a third
                     // it reads as whose box this is, which is the thing worth
                     // knowing before you press enter with several agents open.
-                    .map(|this| {
-                        if cx.theme().appearance().is_light() {
-                            // White with a hairline you only just see and no
-                            // shadow: enough to show where the box is, nothing
-                            // more. Taken from the theme's border so it can be
-                            // tuned without a rebuild. The radius is the send
-                            // disc's plus the box's padding, so the two curves
-                            // run parallel in the corner.
-                            this.rounded(px(18.))
-                                .border_color(cx.theme().colors().border)
-                                .bg(cx.theme().colors().editor_background)
-                        } else {
-                            // Not editor_background: the composer should read as a
-                            // raised surface on the panel, not a black hole punched
-                            // into it.
-                            let this = this.rounded_lg().bg(cx.theme().colors().element_background);
-                            match self.brand(cx) {
-                                Some(brand) => this.border_color(brand.accent.opacity(0.35)),
-                                None => this.border_color(cx.theme().colors().border),
-                            }
-                        }
+                    // One shape for every theme. Light themes had their own
+                    // rounder, white box; it drifted from the dark one and read
+                    // as a different app. Not editor_background: the composer
+                    // should read as a raised surface on the panel, not a hole
+                    // punched into it.
+                    .rounded_lg()
+                    .bg(cx.theme().colors().element_background)
+                    .map(|this| match self.brand(cx) {
+                        Some(brand) => this.border_color(brand.accent.opacity(0.35)),
+                        None => this.border_color(cx.theme().colors().border),
                     })
                     // Tight padding: the composer should not take more vertical
                     // space than the text it holds plus its controls.
@@ -4556,7 +4607,7 @@ impl ThreadView {
                             .gap_1()
                             .child(
                                 h_flex()
-                                    .min_w_0()
+                                    .flex_none()
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
                                     // How full the context window is, as a ring.
@@ -4582,19 +4633,32 @@ impl ThreadView {
                             .child(
                                 h_flex()
                                     .min_w_0()
+                                    .flex_shrink_1()
                                     .gap_1()
-                                    .when(self.permissions_are_relaxed(cx), |this| {
-                                        this.child(relaxed_permissions_warning())
-                                    })
-                                    .when(is_native, |this| {
-                                        this.children(self.profile_selector.clone())
-                                    })
-                                    .map(|this| match self.config_options_view.clone() {
-                                        Some(config_view) => this.child(config_view),
-                                        None => this
-                                            .children(self.mode_selector.clone())
-                                            .children(self.model_selector.clone()),
-                                    })
+                                    // The selectors give way first when the panel is
+                                    // narrow: they clip inside their own row, so the
+                                    // box shrinks with the panel instead of its
+                                    // controls spilling out past the border. Send and
+                                    // the review toggle stay whole.
+                                    .child(
+                                        h_flex()
+                                            .min_w_0()
+                                            .flex_shrink_1()
+                                            .overflow_hidden()
+                                            .gap_1()
+                                            .when(self.permissions_are_relaxed(cx), |this| {
+                                                this.child(relaxed_permissions_warning())
+                                            })
+                                            .when(is_native, |this| {
+                                                this.children(self.profile_selector.clone())
+                                            })
+                                            .map(|this| match self.config_options_view.clone() {
+                                                Some(config_view) => this.child(config_view),
+                                                None => this
+                                                    .children(self.mode_selector.clone())
+                                                    .children(self.model_selector.clone()),
+                                            }),
+                                    )
                                     .when(self.supports_review_mode(), |this| {
                                         let reviewing =
                                             AgentSettings::get_global(cx).review_changes;
@@ -4602,17 +4666,23 @@ impl ThreadView {
                                             IconButton::new("toggle-review-changes", IconName::Diff)
                                                 .icon_size(IconSize::Small)
                                                 .toggle_state(reviewing)
+                                                // Green when on, grey when off. The
+                                                // theme's accent was used before, and
+                                                // on Frosted, Paper and Noir the accent
+                                                // is ink or grey -- on and off looked
+                                                // the same. Every theme has a distinct
+                                                // success colour.
                                                 .icon_color(if reviewing {
-                                                    Color::Accent
+                                                    Color::Success
                                                 } else {
                                                     Color::Muted
                                                 })
                                                 .tooltip(move |_window, cx| {
                                                     Tooltip::simple(
                                                         if reviewing {
-                                                            "Review Changes: on \u{2014} edits open as diffs to accept"
+                                                            "Review Changes: on \u{2014} each turn's edits open as a diff to keep or reject"
                                                         } else {
-                                                            "Review Changes: off \u{2014} edits apply as the agent makes them"
+                                                            "Review Changes: off \u{2014} edits are kept without opening a diff"
                                                         },
                                                         cx,
                                                     )
@@ -6485,9 +6555,10 @@ impl ThreadView {
                                     .bg(cx.theme().colors().element_background)
                                     .border_color(cx.theme().colors().border_transparent)
                                     .when(is_indented, |this| {
-                                        this.py_1().px_2().when(opaque_window, |this| {
-                                            this.shadow_sm()
-                                        })
+                                        this.py_1().px_2().when(
+                                            opaque_window && !cx.theme().appearance().is_light(),
+                                            |this| this.shadow_sm(),
+                                        )
                                     })
                                     .map(|this| {
                                         let border = cx.theme().colors().border;

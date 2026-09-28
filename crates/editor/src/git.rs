@@ -3100,7 +3100,9 @@ pub fn render_diff_hunk_controls(
         .bg(cx.theme().colors().editor_background)
         .gap_1()
         .block_mouse_except_scroll()
-        .shadow_md()
+        // No drop shadow on a light theme: every hunk has these controls, and
+        // on white a shadow under each is a row of grey smears.
+        .when(!cx.theme().appearance().is_light(), |this| this.shadow_md())
         .when(show_stage_restore, |el| {
             el.child(if status.has_secondary_hunk() {
                 Button::new(("stage", row as u64), "Stage")

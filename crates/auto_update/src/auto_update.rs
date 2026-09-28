@@ -34,6 +34,10 @@ use workspace::Workspace;
 
 const SHOULD_SHOW_UPDATE_NOTIFICATION_KEY: &str = "auto-updater-should-show-updated-notification";
 
+/// Where Acuto's releases are published. Updates come from here rather than
+/// from Zed's release server, which only knows about Zed.
+const ACUTO_RELEASES_REPO: &str = "solvir-group/acuto";
+
 #[derive(Debug)]
 struct MissingDependencyError(String);
 
@@ -188,6 +192,10 @@ pub struct AutoUpdater {
 pub struct ReleaseAsset {
     pub version: String,
     pub url: String,
+    /// The installer's SHA-256, as hex. When present, a download that does
+    /// not match it is thrown away rather than run.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 struct MacOsUnmounter<'a> {
@@ -346,14 +354,11 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
             let mut current_version = auto_updater.current_version.clone();
             current_version.pre = semver::Prerelease::EMPTY;
             current_version.build = semver::BuildMetadata::EMPTY;
-            let release_channel = release_channel.dev_name();
-            let path = format!("/releases/{release_channel}/{current_version}");
-            auto_updater.client.http_client().build_url(&path)
+            format!("https://github.com/{ACUTO_RELEASES_REPO}/releases/tag/v{current_version}")
         }
-        ReleaseChannel::Nightly => {
-            "https://github.com/zed-industries/zed/commits/nightly/".to_string()
+        ReleaseChannel::Nightly | ReleaseChannel::Dev => {
+            format!("https://github.com/{ACUTO_RELEASES_REPO}/commits/main/")
         }
-        ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
     };
     Some(url)
 }
@@ -749,8 +754,7 @@ impl AutoUpdater {
             cx.notify();
         });
 
-        let fetched_release_data =
-            Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?;
+        let fetched_release_data = Self::latest_acuto_release(&client).await?;
         let fetched_version = fetched_release_data.clone().version;
         let app_commit_sha = Ok(cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full())));
         let newer_version = Self::check_if_fetched_version_is_newer(
@@ -854,6 +858,41 @@ impl AutoUpdater {
         Ok(())
     }
 
+    /// The newest published Acuto release and its installer for this machine.
+    ///
+    /// The version is the release's tag without its `v`, so tagging `v0.1.2`
+    /// is all a release needs for installed copies to find it.
+    async fn latest_acuto_release(client: &Arc<HttpClientWithUrl>) -> Result<ReleaseAsset> {
+        anyhow::ensure!(
+            OS == "windows",
+            "Acuto only publishes automatic updates for Windows"
+        );
+        let asset_name = format!("Acuto-{ARCH}.exe");
+        let http: Arc<dyn HttpClient> = client.clone();
+        let release =
+            http_client::github::latest_github_release(ACUTO_RELEASES_REPO, true, false, http)
+                .await
+                .context("checking GitHub for a newer release")?;
+        let asset = release
+            .assets
+            .iter()
+            .find(|asset| asset.name == asset_name)
+            .with_context(|| format!("release {} has no {asset_name}", release.tag_name))?;
+        // Required, not optional: the installer is run silently, so it must be
+        // the exact file that was published. GitHub records a SHA-256 for
+        // every release asset; without one there is nothing to check against.
+        let sha256 = asset
+            .digest
+            .clone()
+            .filter(|digest| !digest.is_empty())
+            .with_context(|| format!("release {} publishes no checksum", release.tag_name))?;
+        Ok(ReleaseAsset {
+            version: release.tag_name.trim_start_matches('v').to_string(),
+            url: asset.browser_download_url.clone(),
+            sha256: Some(sha256),
+        })
+    }
+
     fn check_if_fetched_version_is_newer(
         release_channel: ReleaseChannel,
         app_commit_sha: Result<Option<String>>,
@@ -913,7 +952,7 @@ impl AutoUpdater {
         let filename = match OS {
             "macos" => anyhow::Ok("Zed.dmg"),
             "linux" => Ok("zed.tar.gz"),
-            "windows" => Ok("Zed.exe"),
+            "windows" => Ok("Acuto.exe"),
             unsupported_os => anyhow::bail!("not supported: {unsupported_os}"),
         }?;
 
@@ -1087,6 +1126,7 @@ async fn download_release(
     let mut downloaded_bytes: u64 = 0;
     let mut last_reported_percent: Option<u8> = None;
     let mut buffer = [0u8; 8192];
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
     let body = response.body_mut();
     loop {
         let bytes_read = body.read(&mut buffer).await?;
@@ -1094,6 +1134,7 @@ async fn download_release(
             break;
         }
         target_file.write_all(&buffer[..bytes_read]).await?;
+        sha2::Digest::update(&mut hasher, &buffer[..bytes_read]);
         downloaded_bytes += bytes_read as u64;
 
         if let Some(total_bytes) = total_bytes {
@@ -1107,6 +1148,22 @@ async fn download_release(
         }
     }
     target_file.flush().await?;
+    drop(target_file);
+
+    if let Some(expected) = release.sha256.as_deref() {
+        let actual = format!("{:x}", sha2::Digest::finalize(hasher));
+        if !actual.eq_ignore_ascii_case(expected.trim()) {
+            if let Err(error) = smol::fs::remove_file(target_path).await {
+                log::warn!("could not delete the mismatched download: {error}");
+            }
+            anyhow::bail!(
+                "the downloaded update does not match its published checksum \
+                 (expected {expected}, got {actual}); it was deleted, not installed"
+            );
+        }
+        log::info!("downloaded update matches its published SHA-256");
+    }
+
     if total_bytes.is_some() && last_reported_percent != Some(100) {
         on_progress(Some(1.0));
     }
@@ -1525,6 +1582,7 @@ mod tests {
         let release = ReleaseAsset {
             version: "1.0.0".to_string(),
             url: "https://test.example/download".to_string(),
+            sha256: None,
         };
 
         let reported = Rc::new(std::cell::RefCell::new(Vec::<f32>::new()));
@@ -1585,6 +1643,7 @@ mod tests {
         let release = ReleaseAsset {
             version: "1.0.0".to_string(),
             url: "https://test.example/download".to_string(),
+            sha256: None,
         };
 
         let reported = Rc::new(std::cell::RefCell::new(Vec::<Option<f32>>::new()));
