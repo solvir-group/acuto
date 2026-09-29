@@ -130,16 +130,18 @@ impl AgentDiffPane {
     }
 
     fn update_excerpts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let changed_buffers = self
+        // Files with changes to answer, and files whose changes were accepted
+        // in this review: an accepted line stops being highlighted but stays
+        // on screen, so what was agreed to can still be read.
+        let mut sorted_buffers = self
             .thread
             .read(cx)
             .action_log()
             .read(cx)
-            .changed_buffers(cx);
+            .review_buffers(cx);
 
         // Sort edited files alphabetically for consistency with Git diff view
-        let mut sorted_buffers: Vec<_> = changed_buffers.collect();
-        sorted_buffers.sort_by(|(buffer_a, _), (buffer_b, _)| {
+        sorted_buffers.sort_by(|(buffer_a, _, _), (buffer_b, _, _)| {
             let path_a = buffer_a.read(cx).file().map(|f| f.path().clone());
             let path_b = buffer_b.read(cx).file().map(|f| f.path().clone());
             path_a.cmp(&path_b)
@@ -153,7 +155,7 @@ impl AgentDiffPane {
             .map(|excerpt| excerpt.context.start.buffer_id)
             .collect::<HashSet<_>>();
 
-        for (buffer, diff_handle) in sorted_buffers {
+        for (buffer, diff_handle, accepted) in sorted_buffers {
             if buffer.read(cx).file().is_none() {
                 continue;
             }
@@ -163,7 +165,7 @@ impl AgentDiffPane {
 
             let snapshot = buffer.read(cx).snapshot();
 
-            let diff_hunk_ranges = diff_handle
+            let mut diff_hunk_ranges = diff_handle
                 .read(cx)
                 .snapshot(cx)
                 .hunks_intersecting_range(
@@ -172,6 +174,8 @@ impl AgentDiffPane {
                 )
                 .map(|diff_hunk| diff_hunk.buffer_range.to_point(&snapshot))
                 .collect::<Vec<_>>();
+            diff_hunk_ranges.extend(accepted.iter().map(|range| range.to_point(&snapshot)));
+            diff_hunk_ranges.sort_by_key(|range| (range.start, range.end));
 
             let was_empty = self.multibuffer.read(cx).is_empty();
             let is_excerpt_newly_added = self.editor.update(cx, |editor, cx| {

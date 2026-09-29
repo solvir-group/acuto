@@ -5736,25 +5736,28 @@ impl ThreadView {
             let brand = self.brand(cx);
             let colors = cx.theme().colors();
             let is_disabled = is_editor_empty && !is_generating;
-            // A disc rather than the theme's square button: a round send
-            // control is what every chat box has taught people to look for.
-            // On a light theme it is solid ink with a white arrow; on a dark
-            // one it keeps the agent's colour at two intensities, so the glyph
-            // and its fill are one hue rather than two colour systems.
-            let (background, foreground) = if is_disabled {
-                (colors.element_background, colors.icon_muted)
-            } else if cx.theme().appearance().is_light() {
-                (colors.text, gpui::white())
-            } else if let Some(brand) = brand {
-                (brand.accent.opacity(0.18), brand.accent)
-            } else {
-                (colors.text_accent.opacity(0.18), colors.text_accent)
+            // A rounded square in the agent's own colour: solid once there is
+            // something to send, a pale wash of it until then. An agent whose
+            // colour is near white gets a dark arrow, so it stays legible.
+            let (background, foreground) = match brand {
+                Some(brand) if is_disabled => (brand.accent.opacity(0.16), brand.accent),
+                Some(brand) => {
+                    let arrow = if brand.accent.l > 0.7 {
+                        gpui::black()
+                    } else {
+                        gpui::white()
+                    };
+                    (brand.accent, arrow)
+                }
+                None if is_disabled => (colors.element_background, colors.icon_muted),
+                None if cx.theme().appearance().is_light() => (colors.text, gpui::white()),
+                None => (colors.text_accent.opacity(0.18), colors.text_accent),
             };
             div()
                 .id("send-message")
                 .flex_none()
                 .size(px(26.))
-                .rounded_full()
+                .rounded_md()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -6506,6 +6509,11 @@ impl ThreadView {
                 } else {
                     self.agent_id.clone()
                 };
+                // A sent prompt is a message bubble: as wide as its text, up
+                // to four fifths of the thread, against the right edge. While
+                // it is being edited it takes the full width to write in.
+                let bubble_width = (!editing && !is_indented)
+                    .then(|| user_bubble_width(&editor.read(cx).text(cx), window, cx));
 
                 v_flex()
                     .id(("user_message", entry_ix))
@@ -6542,6 +6550,9 @@ impl ThreadView {
                     .child(
                         div()
                             .relative()
+                            .when_some(bubble_width, |this, width| {
+                                this.self_end().w(width).max_w(relative(0.8))
+                            })
                             .child(
                                 div()
                                     .py_1p5()
@@ -7618,10 +7629,12 @@ impl ThreadView {
                 sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
             }
         } else if v2_empty_state {
-            EditorMode::Full {
-                scale_ui_elements_with_buffer_font_size: false,
-                show_active_line_background: false,
-                sizing_behavior: SizingBehavior::Default,
+            // Grows with the prompt like the composer under a thread does. A
+            // full-size editor here kept its resting height and scrolled, so
+            // a long first prompt could not be read back before sending.
+            EditorMode::AutoHeight {
+                min_lines: AgentSettings::get_global(cx).message_editor_min_lines,
+                max_lines: Some(AgentSettings::get_global(cx).set_message_editor_max_lines()),
             }
         } else {
             EditorMode::AutoHeight {
@@ -13130,6 +13143,41 @@ fn strip_leading_command(text: &str, command_name: &str) -> String {
         .and_then(|rest| rest.strip_prefix(command_name))
         .map(|rest| rest.trim_start().to_string())
         .unwrap_or_else(|| trimmed.to_string())
+}
+
+
+/// How wide a sent prompt's bubble is: its longest line as the composer draws
+/// it, plus the bubble's padding and border. Capped by the caller.
+fn user_bubble_width(text: &str, window: &mut Window, cx: &App) -> Pixels {
+    /// `px_2p5` either side, the one-pixel border, and room for the caret.
+    const CHROME: f32 = 10. * 2. + 2. + 4.;
+    let settings = theme_settings::ThemeSettings::get_global(cx);
+    let font_size = settings.agent_buffer_font_size(cx);
+    let font = gpui::Font {
+        family: settings.agent_ui_font_family().clone(),
+        features: settings.ui_font.features.clone(),
+        fallbacks: settings.ui_font.fallbacks.clone(),
+        weight: settings.ui_font.weight,
+        style: gpui::FontStyle::Normal,
+    };
+    let widest = text
+        .lines()
+        .map(|line| {
+            let run = gpui::TextRun {
+                len: line.len(),
+                font: font.clone(),
+                color: cx.theme().colors().text,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            window
+                .text_system()
+                .shape_line(SharedString::from(line.to_string()), font_size, &[run], None)
+                .width
+        })
+        .fold(px(0.), |widest, width| widest.max(width));
+    widest + px(CHROME)
 }
 
 #[cfg(test)]

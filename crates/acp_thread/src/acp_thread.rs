@@ -3357,13 +3357,17 @@ impl AcpThread {
                     }
                 });
 
-                // A buffer with unsaved edits is left alone: reloading it would
-                // throw them away.
                 if writes && finished {
-                    let reload = buffer.update(cx, |buffer, cx| {
-                        (!buffer.is_dirty()).then(|| buffer.reload(cx))
-                    });
-                    if let Some(reload) = reload {
+                    let dirty = buffer.read_with(cx, |buffer, _| buffer.is_dirty());
+                    if dirty {
+                        // Reloading would throw the unsaved edits away, and
+                        // skipping the reload left the agent's write on disk,
+                        // unseen, until the next save overwrote it.
+                        merge_agent_write(&project, &buffer, &action_log, cx)
+                            .await
+                            .log_err();
+                    } else {
+                        let reload = buffer.update(cx, |buffer, cx| buffer.reload(cx));
                         reload.await.ok();
                     }
                     log::info!("agent diff: {path:?} written by the agent");
@@ -3801,14 +3805,7 @@ impl AcpThread {
         push_user_message: bool,
         cx: &mut Context<Self>,
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
-        // Every open file as it stands now, before the agent can touch any of
-        // them. Review measures the agent's changes against this, so it does
-        // not matter whether a write reaches the disk before or after the
-        // agent announces it.
-        let open_buffers = self.project.read(cx).opened_buffers(cx);
-        self.action_log.update(cx, |action_log, cx| {
-            action_log.begin_agent_turn(open_buffers, cx)
-        });
+        let saved = self.begin_agent_turn(cx);
         let block = ContentBlock::new_combined(
             message.clone(),
             self.project.read(cx).languages().clone(),
@@ -3824,6 +3821,7 @@ impl AcpThread {
             .map(|client_user_message_ids| client_user_message_ids.new_id());
 
         self.run_turn(cx, async move |this, cx| {
+            saved.await;
             if push_user_message {
                 this.update(cx, |this, cx| {
                     this.push_entry(
@@ -3877,12 +3875,10 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
         // A retried turn edits files like any other, so it needs the same
-        // starting snapshot; without it its edits never reach review.
-        let open_buffers = self.project.read(cx).opened_buffers(cx);
-        self.action_log.update(cx, |action_log, cx| {
-            action_log.begin_agent_turn(open_buffers, cx)
-        });
+        // starting point; without it its edits never reach review.
+        let saved = self.begin_agent_turn(cx);
         self.run_turn(cx, async move |this, cx| {
+            saved.await;
             this.update(cx, |this, cx| {
                 this.connection
                     .retry(&this.session_id, cx)
@@ -3890,6 +3886,46 @@ impl AcpThread {
             })?
             .context("retrying a session is not supported")?
             .await
+        })
+    }
+
+    /// Gets every open file ready for an agent turn: unsaved edits are written
+    /// to disk, then each file is snapshotted as the text review measures the
+    /// agent's changes against.
+    ///
+    /// Agents read and write files on disk. A file with unsaved edits is one
+    /// the agent cannot see as you do, and one its writes cannot reach without
+    /// throwing those edits away. A file that changed on disk under unsaved
+    /// edits is left alone: saving it would overwrite that change.
+    ///
+    /// The returned task finishes once the saves have, and the prompt waits
+    /// for it, so the agent never reads a file mid-save.
+    fn begin_agent_turn(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let open_buffers = self.project.read(cx).opened_buffers(cx);
+        let to_save = open_buffers
+            .iter()
+            .filter(|buffer| {
+                let buffer = buffer.read(cx);
+                buffer.is_dirty()
+                    && !buffer.has_conflict()
+                    && buffer.file().is_some_and(|file| file.disk_state().exists())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let saves = to_save
+            .into_iter()
+            .map(|buffer| {
+                self.project
+                    .update(cx, |project, cx| project.save_buffer(buffer, cx))
+            })
+            .collect::<Vec<_>>();
+        self.action_log.update(cx, |action_log, cx| {
+            action_log.begin_agent_turn(open_buffers, cx)
+        });
+        cx.background_spawn(async move {
+            for saved in futures::future::join_all(saves).await {
+                saved.log_err();
+            }
         })
     }
 
@@ -4933,6 +4969,88 @@ fn markdown_for_raw_output(
             )
         })),
     }
+}
+
+
+/// Brings an agent's write on disk into a buffer that has unsaved edits.
+///
+/// The agent's change is the difference between the file as the buffer last
+/// saved it and the file the agent left behind. That is applied on top of the
+/// unsaved edits, which a reload would have discarded. Where the two touch the
+/// same text the unsaved edits win and the agent's change there is dropped,
+/// with a warning: losing what someone typed is worse than losing a hunk the
+/// agent can redo.
+async fn merge_agent_write(
+    project: &Entity<Project>,
+    buffer: &Entity<Buffer>,
+    action_log: &Entity<ActionLog>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let (fs, abs_path) = cx.update(|cx| {
+        let fs = project.read(cx).fs().clone();
+        let abs_path = buffer
+            .read(cx)
+            .file()
+            .and_then(|file| file.as_local())
+            .map(|file| file.abs_path(cx));
+        (fs, abs_path)
+    });
+    let abs_path = abs_path.context("the agent wrote a file that is not local")?;
+    let mut disk_text = fs.load(&abs_path).await?;
+    text::LineEnding::normalize(&mut disk_text);
+
+    cx.update(|cx| {
+        let (applied, dropped) = buffer.update(cx, |buffer, cx| {
+            let saved_version = buffer.saved_version().clone();
+            let saved_text = buffer.rope_for_version(&saved_version).to_string();
+            if saved_text == disk_text {
+                return (0, 0);
+            }
+            let unsaved = buffer
+                .edits_since::<usize>(&saved_version)
+                .collect::<Vec<_>>();
+            let mut edits = Vec::new();
+            let mut dropped = 0;
+            for (range, new_text) in text_diff(&saved_text, &disk_text) {
+                let touches_unsaved = unsaved
+                    .iter()
+                    .any(|edit| edit.old.start <= range.end && range.start <= edit.old.end);
+                if touches_unsaved {
+                    dropped += 1;
+                    continue;
+                }
+                let shift = unsaved
+                    .iter()
+                    .filter(|edit| edit.old.end < range.start)
+                    .map(|edit| edit.new.len() as isize - edit.old.len() as isize)
+                    .sum::<isize>();
+                let start = (range.start as isize + shift) as usize;
+                let end = (range.end as isize + shift) as usize;
+                edits.push((start..end, new_text));
+            }
+            let applied = edits.len();
+            if applied > 0 {
+                buffer.start_transaction();
+                buffer.edit(edits, None, cx);
+                buffer.end_transaction_with_source(BufferEditSource::Agent, cx);
+            }
+            (applied, dropped)
+        });
+        if applied > 0 {
+            action_log.update(cx, |action_log, cx| {
+                action_log.buffer_edited(buffer.clone(), cx)
+            });
+        }
+        if dropped > 0 {
+            log::warn!(
+                "agent diff: {dropped} of the agent's changes to {abs_path:?} overlapped unsaved edits and were not applied"
+            );
+        }
+        log::info!(
+            "agent diff: merged {applied} agent change(s) into {abs_path:?}, which had unsaved edits"
+        );
+    });
+    Ok(())
 }
 
 #[cfg(test)]

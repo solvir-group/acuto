@@ -219,23 +219,17 @@ impl ActionLog {
                     diff
                 });
                 let (diff_update_tx, diff_update_rx) = mpsc::unbounded();
-                let diff_base;
-                let unreviewed_edits;
-                if is_created {
-                    diff_base = Rope::default();
-                    unreviewed_edits = Patch::new(vec![Edit {
-                        old: 0..1,
-                        new: 0..text_snapshot.max_point().row + 1,
-                    }])
+                let diff_base = if is_created {
+                    Rope::default()
                 } else {
-                    diff_base = buffer.read(cx).as_rope().clone();
-                    unreviewed_edits = Patch::default();
-                }
-                TrackedBuffer {
+                    buffer.read(cx).as_rope().clone()
+                };
+                let mut tracked_buffer = TrackedBuffer {
                     buffer: buffer.clone(),
                     agent_writes_to_disk: false,
                     diff_base,
-                    unreviewed_edits,
+                    unreviewed_edits: Patch::default(),
+                    accepted: Vec::new(),
                     snapshot: text_snapshot,
                     status,
                     version: buffer.read(cx).version(),
@@ -251,7 +245,9 @@ impl ActionLog {
                         }
                     }),
                     _subscription: cx.subscribe(&buffer, Self::handle_buffer_event),
-                }
+                };
+                tracked_buffer.refresh();
+                tracked_buffer
             });
         tracked_buffer.version = buffer.read(cx).version();
         tracked_buffer
@@ -298,7 +294,23 @@ impl ActionLog {
             self.buffer_edited(buffer, cx);
             return;
         }
-        tracked_buffer.schedule_diff_update(ChangeAuthor::User, cx);
+        tracked_buffer.observe(ChangeAuthor::User, cx);
+        cx.notify();
+    }
+
+    /// Takes in any change to the buffer the log has not seen yet, the way the
+    /// buffer's own edit event would.
+    ///
+    /// Answering a change is always measured against the text the log last
+    /// saw. A change still waiting on its event would otherwise sit under the
+    /// answer: accepted or rejected as part of something it was not.
+    fn catch_up(&mut self, buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
+        let Some(tracked_buffer) = self.tracked_buffers.get(buffer) else {
+            return;
+        };
+        if tracked_buffer.snapshot.version() != &buffer.read(cx).version() {
+            self.handle_buffer_edited(buffer.clone(), cx);
+        }
     }
 
     fn handle_buffer_file_changed(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
@@ -336,255 +348,41 @@ impl ActionLog {
         }
     }
 
+    /// Keeps the buffer's diff drawn against the log's base.
+    ///
+    /// Only the drawing happens here. The base, the snapshot and the list of
+    /// unanswered changes are all updated on the spot, in the order things
+    /// happen: when this task used to write them back after an await, an
+    /// answer given while it was running was overwritten by the older base it
+    /// had started from, and the accept or reject simply did not happen.
     async fn maintain_diff(
         this: WeakEntity<Self>,
         buffer: Entity<Buffer>,
-        mut buffer_updates: mpsc::UnboundedReceiver<(ChangeAuthor, text::BufferSnapshot)>,
+        mut updates: mpsc::UnboundedReceiver<(Arc<str>, text::BufferSnapshot)>,
         cx: &mut AsyncApp,
     ) -> Result<()> {
-        let git_diff = this
-            .update(cx, |this, cx| {
-                this.project.update(cx, |project, cx| {
-                    project.open_uncommitted_diff(buffer.clone(), cx)
-                })
-            })?
-            .await
-            .ok();
-        let (mut git_diff_updates_tx, mut git_diff_updates_rx) = watch::channel(());
-        let _diff_subscription = if let Some(git_diff) = git_diff.as_ref() {
-            cx.update(|cx| {
-                Some(cx.subscribe(git_diff, move |_, event, _cx| {
-                    if matches!(event, buffer_diff::BufferDiffEvent::BaseTextChanged) {
-                        git_diff_updates_tx.send(()).ok();
-                    }
-                }))
-            })
-        } else {
-            None
-        };
-
-        loop {
-            futures::select_biased! {
-                buffer_update = buffer_updates.next() => {
-                    if let Some((author, buffer_snapshot)) = buffer_update {
-                        Self::track_edits(&this, &buffer, author, buffer_snapshot, cx).await?;
-                    } else {
-                        break;
-                    }
-                }
-                _ = git_diff_updates_rx.changed().fuse() => {
-                    if let Some(git_diff) = git_diff.as_ref() {
-                        Self::keep_committed_edits(&this, &buffer, git_diff, cx).await?;
-                    }
-                }
+        while let Some(mut update) = updates.next().await {
+            // Only the newest matters; anything queued behind it is already
+            // out of date.
+            while let Ok(Some(newer)) = updates.try_next() {
+                update = newer;
             }
-        }
-
-        Ok(())
-    }
-
-    async fn track_edits(
-        this: &WeakEntity<ActionLog>,
-        buffer: &Entity<Buffer>,
-        author: ChangeAuthor,
-        buffer_snapshot: text::BufferSnapshot,
-        cx: &mut AsyncApp,
-    ) -> Result<()> {
-        let rebase = this.update(cx, |this, cx| {
-            let tracked_buffer = this
-                .tracked_buffers
-                .get_mut(buffer)
-                .context("buffer not tracked")?;
-
-            let rebase = cx.background_spawn({
-                let mut base_text = tracked_buffer.diff_base.clone();
-                let old_snapshot = tracked_buffer.snapshot.clone();
-                let new_snapshot = buffer_snapshot.clone();
-                let unreviewed_edits = tracked_buffer.unreviewed_edits.clone();
-                let edits = diff_snapshots(&old_snapshot, &new_snapshot);
-                async move {
-                    if let ChangeAuthor::User = author {
-                        apply_non_conflicting_edits(
-                            &unreviewed_edits,
-                            edits,
-                            &mut base_text,
-                            new_snapshot.as_rope(),
-                        );
-                    }
-
-                    (Arc::from(base_text.to_string().as_str()), base_text)
-                }
-            });
-
-            anyhow::Ok(rebase)
-        })??;
-        let (new_base_text, new_diff_base) = rebase.await;
-
-        Self::update_diff(
-            this,
-            buffer,
-            buffer_snapshot,
-            new_base_text,
-            new_diff_base,
-            cx,
-        )
-        .await
-    }
-
-    async fn keep_committed_edits(
-        this: &WeakEntity<ActionLog>,
-        buffer: &Entity<Buffer>,
-        git_diff: &Entity<BufferDiff>,
-        cx: &mut AsyncApp,
-    ) -> Result<()> {
-        let buffer_snapshot = this.read_with(cx, |this, _cx| {
-            let tracked_buffer = this
-                .tracked_buffers
-                .get(buffer)
-                .context("buffer not tracked")?;
-            anyhow::Ok(tracked_buffer.snapshot.clone())
-        })??;
-        let (new_base_text, new_diff_base) = this
-            .read_with(cx, |this, cx| {
-                let tracked_buffer = this
-                    .tracked_buffers
-                    .get(buffer)
-                    .context("buffer not tracked")?;
-                let old_unreviewed_edits = tracked_buffer.unreviewed_edits.clone();
-                let agent_diff_base = tracked_buffer.diff_base.clone();
-                let git_diff_base = git_diff.read(cx).base_text(cx).as_rope().clone();
-                let buffer_text = tracked_buffer.snapshot.as_rope().clone();
-                anyhow::Ok(cx.background_spawn(async move {
-                    if buffer_text.len() == git_diff_base.len()
-                        && buffer_text.chars_at(0).eq(git_diff_base.chars_at(0))
-                    {
-                        return (Arc::<str>::from(git_diff_base.to_string()), git_diff_base);
-                    }
-                    let mut old_unreviewed_edits = old_unreviewed_edits.into_iter().peekable();
-                    let committed_edits = language::line_diff(
-                        &agent_diff_base.to_string(),
-                        &git_diff_base.to_string(),
-                    )
-                    .into_iter()
-                    .map(|(old, new)| Edit { old, new });
-
-                    let mut new_agent_diff_base = agent_diff_base.clone();
-                    let mut row_delta = 0i32;
-                    for committed in committed_edits {
-                        while let Some(unreviewed) = old_unreviewed_edits.peek() {
-                            // If the committed edit matches the unreviewed
-                            // edit, assume the user wants to keep it.
-                            if committed.old == unreviewed.old {
-                                let unreviewed_new =
-                                    buffer_text.slice_rows(unreviewed.new.clone()).to_string();
-                                let committed_new =
-                                    git_diff_base.slice_rows(committed.new.clone()).to_string();
-                                if unreviewed_new == committed_new {
-                                    let old_byte_start =
-                                        new_agent_diff_base.point_to_offset(Point::new(
-                                            (unreviewed.old.start as i32 + row_delta) as u32,
-                                            0,
-                                        ));
-                                    let old_byte_end =
-                                        new_agent_diff_base.point_to_offset(cmp::min(
-                                            Point::new(
-                                                (unreviewed.old.end as i32 + row_delta) as u32,
-                                                0,
-                                            ),
-                                            new_agent_diff_base.max_point(),
-                                        ));
-                                    new_agent_diff_base
-                                        .replace(old_byte_start..old_byte_end, &unreviewed_new);
-                                    row_delta +=
-                                        unreviewed.new_len() as i32 - unreviewed.old_len() as i32;
-                                }
-                            } else if unreviewed.old.start >= committed.old.end {
-                                break;
-                            }
-
-                            old_unreviewed_edits.next().unwrap();
-                        }
-                    }
-
-                    (
-                        Arc::from(new_agent_diff_base.to_string().as_str()),
-                        new_agent_diff_base,
-                    )
-                }))
-            })??
-            .await;
-
-        Self::update_diff(
-            this,
-            buffer,
-            buffer_snapshot,
-            new_base_text,
-            new_diff_base,
-            cx,
-        )
-        .await
-    }
-
-    async fn update_diff(
-        this: &WeakEntity<ActionLog>,
-        buffer: &Entity<Buffer>,
-        buffer_snapshot: text::BufferSnapshot,
-        new_base_text: Arc<str>,
-        new_diff_base: Rope,
-        cx: &mut AsyncApp,
-    ) -> Result<()> {
-        let diff = this.read_with(cx, |this, _cx| {
-            let tracked_buffer = this
-                .tracked_buffers
-                .get(buffer)
-                .context("buffer not tracked")?;
-            anyhow::Ok(tracked_buffer.diff.clone())
-        })??;
-        diff.update(cx, |diff, cx| {
-            diff.set_base_text(Some(new_base_text), buffer_snapshot.clone(), cx)
-        })
-        .await;
-        let diff_snapshot = diff.update(cx, |diff, cx| diff.snapshot(cx));
-
-        let unreviewed_edits = cx
-            .background_spawn({
-                let buffer_snapshot = buffer_snapshot.clone();
-                let new_diff_base = new_diff_base.clone();
-                async move {
-                    let mut unreviewed_edits = Patch::default();
-                    for hunk in diff_snapshot.hunks_intersecting_range(
-                        Anchor::min_for_buffer(buffer_snapshot.remote_id())
-                            ..Anchor::max_for_buffer(buffer_snapshot.remote_id()),
-                        &buffer_snapshot,
-                    ) {
-                        let old_range = new_diff_base
-                            .offset_to_point(hunk.diff_base_byte_range.start)
-                            ..new_diff_base.offset_to_point(hunk.diff_base_byte_range.end);
-                        let new_range = hunk.range.start..hunk.range.end;
-                        unreviewed_edits.push(point_to_row_edit(
-                            Edit {
-                                old: old_range,
-                                new: new_range,
-                            },
-                            &new_diff_base,
-                            buffer_snapshot.as_rope(),
-                        ));
-                    }
-                    unreviewed_edits
-                }
+            let (base_text, buffer_snapshot) = update;
+            let diff = this.read_with(cx, |this, _cx| {
+                this.tracked_buffers
+                    .get(&buffer)
+                    .map(|tracked_buffer| tracked_buffer.diff.clone())
+            })?;
+            let Some(diff) = diff else {
+                break;
+            };
+            diff.update(cx, |diff, cx| {
+                diff.set_base_text(Some(base_text), buffer_snapshot, cx)
             })
             .await;
-        this.update(cx, |this, cx| {
-            let tracked_buffer = this
-                .tracked_buffers
-                .get_mut(buffer)
-                .context("buffer not tracked")?;
-            tracked_buffer.diff_base = new_diff_base;
-            tracked_buffer.snapshot = buffer_snapshot;
-            tracked_buffer.unreviewed_edits = unreviewed_edits;
-            cx.notify();
-            anyhow::Ok(())
-        })?
+            this.update(cx, |_this, cx| cx.notify())?;
+        }
+        Ok(())
     }
 
     /// Track a buffer as read by agent, so we can notify the model about user edits.
@@ -641,6 +439,14 @@ impl ActionLog {
     ) {
         self.agent_turn_active = true;
         self.agent_edited_this_turn = false;
+        // Lines accepted in the last review stay on screen for reference until
+        // the agent starts on something new.
+        for tracked_buffer in self.tracked_buffers.values_mut() {
+            if !tracked_buffer.accepted.is_empty() {
+                tracked_buffer.accepted.clear();
+                cx.notify();
+            }
+        }
         self.turn_start_snapshots = open_buffers
             .into_iter()
             .map(|buffer| {
@@ -716,7 +522,7 @@ impl ActionLog {
         } else {
             "its current text"
         };
-        tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+        tracked_buffer.observe(ChangeAuthor::Agent, cx);
         log::info!(
             "agent review: tracking {} against {base_from}",
             buffer_display_path(buffer, cx)
@@ -773,7 +579,8 @@ impl ActionLog {
         }
 
         tracked_buffer.version = new_version;
-        tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+        tracked_buffer.observe(ChangeAuthor::Agent, cx);
+        cx.notify();
     }
 
     pub fn will_delete_buffer(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
@@ -790,7 +597,7 @@ impl ActionLog {
                 tracked_buffer.status = TrackedBufferStatus::Deleted;
                 if !has_linked_action_log {
                     buffer.update(cx, |buffer, cx| buffer.set_text("", cx));
-                    tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+                    tracked_buffer.observe(ChangeAuthor::Agent, cx);
                 }
             }
 
@@ -801,50 +608,54 @@ impl ActionLog {
             linked_action_log.update(cx, |log, cx| log.will_delete_buffer(buffer.clone(), cx));
         }
 
-        if has_linked_action_log && let Some(tracked_buffer) = self.tracked_buffers.get(&buffer) {
-            tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+        if has_linked_action_log
+            && let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer)
+        {
+            tracked_buffer.observe(ChangeAuthor::Agent, cx);
         }
 
         cx.notify();
     }
 
-    /// The agent's changes to this buffer that the given rows touch, a line at
-    /// a time.
+    /// The agent's changes to this buffer that the given ranges cover, a line
+    /// at a time.
     ///
-    /// Computed here against the log's own base text rather than read off the
-    /// buffer's diff. The diff keeps its own copy of the base and recomputes in
-    /// the background, so while an update is in flight its hunks are measured
-    /// against text this code does not hold -- and applying those offsets to
-    /// the log's base corrupts it.
+    /// Computed with the same diff that draws the hunks, against the log's own
+    /// base and the text it last saw, so the line a click lands on is the line
+    /// that is answered.
     ///
-    /// Split per line for the same reason review is: a run of rewritten lines
-    /// answered as one block cannot be answered in part.
-    ///
-    /// Matched by row rather than exact position, because a line is the unit
-    /// being answered and a click lands somewhere inside the one it means.
-    fn reviewed_changes(
-        tracked_buffer: &TrackedBuffer,
-        buffer: &Buffer,
-        ranges: &[Range<Point>],
-    ) -> Vec<ReviewedChange> {
+    /// A range ending at the start of a row does not cover that row: a hunk's
+    /// range runs to the start of the line after it, and reading that as
+    /// including the next line made every Keep and Reject take two lines.
+    fn reviewed_changes(tracked_buffer: &TrackedBuffer, ranges: &[Range<Point>]) -> Vec<ReviewedChange> {
         let base_text = tracked_buffer.diff_base.to_string();
-        let new_text = buffer.as_rope().to_string();
-        language::line_diff(&base_text, &new_text)
+        let buffer_text = tracked_buffer.snapshot.text();
+        buffer_diff::line_changes(&base_text, &buffer_text, true)
             .into_iter()
-            .flat_map(|(base_rows, buffer_rows)| {
-                buffer_diff::split_change_per_line(base_rows, buffer_rows)
-            })
             .filter(|(_, buffer_rows)| {
                 ranges.iter().any(|range| {
-                    // `buffer_rows` is half-open, so the last row it covers is
-                    // one before its end; treating the end as inclusive made a
-                    // change match the row after itself, and rejecting one line
-                    // took the line above it too. An empty change sits between
-                    // two rows, and `max` keeps it named by either side.
-                    let last_row = buffer_rows.end.saturating_sub(1).max(buffer_rows.start);
-                    range.start.row <= last_row && buffer_rows.start <= range.end.row
+                    let covered = rows_covered(range);
+                    if buffer_rows.is_empty() {
+                        // A deletion sits just above the row it is reported at.
+                        covered.contains(&buffer_rows.start)
+                    } else {
+                        buffer_rows.start < covered.end && covered.start < buffer_rows.end
+                    }
                 })
             })
+            .map(|(base_rows, buffer_rows)| ReviewedChange {
+                base_rows,
+                buffer_rows,
+            })
+            .collect()
+    }
+
+    /// The buffer's changes the log has not had answered, one per line.
+    fn all_changes(tracked_buffer: &TrackedBuffer) -> Vec<ReviewedChange> {
+        let base_text = tracked_buffer.diff_base.to_string();
+        let buffer_text = tracked_buffer.snapshot.text();
+        buffer_diff::line_changes(&base_text, &buffer_text, true)
+            .into_iter()
             .map(|(base_rows, buffer_rows)| ReviewedChange {
                 base_rows,
                 buffer_rows,
@@ -875,16 +686,12 @@ impl ActionLog {
         telemetry: Option<ActionLogTelemetry>,
         cx: &mut Context<Self>,
     ) {
+        self.catch_up(&buffer, cx);
         let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
             return;
         };
 
         let mut metrics = ActionLogMetrics::for_buffer(buffer.read(cx));
-        log::info!(
-            "agent review: keep in {} ({} unreviewed hunk(s))",
-            buffer_display_path(&buffer, cx),
-            tracked_buffer.unreviewed_edits.edits().len()
-        );
         match tracked_buffer.status {
             TrackedBufferStatus::Deleted => {
                 metrics.add_edits(tracked_buffer.unreviewed_edits.edits());
@@ -892,21 +699,19 @@ impl ActionLog {
                 cx.notify();
             }
             _ => {
-                let buffer = buffer.read(cx);
-                // Taken from the diff's own hunks rather than from
-                // `unreviewed_edits`, which is a `Patch` and therefore merges
-                // edits that touch: four rewritten lines in a row become one
-                // edit spanning all four, and accepting any of them accepted
-                // the rest unseen. The hunks stay as they were computed.
-                let ranges = buffer_ranges
-                    .into_iter()
-                    .map(|range| range.start.to_point(buffer)..range.end.to_point(buffer))
-                    .collect::<Vec<_>>();
-                let accepted = Self::reviewed_changes(tracked_buffer, buffer, &ranges);
+                let ranges = {
+                    let snapshot = &tracked_buffer.snapshot;
+                    buffer_ranges
+                        .into_iter()
+                        .map(|range| range.start.to_point(snapshot)..range.end.to_point(snapshot))
+                        .collect::<Vec<_>>()
+                };
+                let accepted = Self::reviewed_changes(tracked_buffer, &ranges);
+                tracked_buffer.remember_accepted(&accepted);
                 // Latest first, so each replacement leaves the rows of the ones
                 // before it where they were.
                 for change in accepted.iter().rev() {
-                    let replacement = change.buffer_text(buffer);
+                    let replacement = change.buffer_text(&tracked_buffer.snapshot);
                     let range = change.base_bytes(&tracked_buffer.diff_base);
                     tracked_buffer.diff_base.replace(range, &replacement);
                 }
@@ -915,13 +720,18 @@ impl ActionLog {
                     .map(|change| change.as_edit())
                     .collect::<Vec<_>>();
                 metrics.add_edits(&reviewed);
-                log::info!("agent review: accepted {} line change(s)", accepted.len());
-                if tracked_buffer.diff_base.to_string() == buffer.as_rope().to_string()
+                log::info!(
+                    "agent review: accepted {} line change(s) in {}",
+                    accepted.len(),
+                    buffer_display_path(&buffer, cx)
+                );
+                if tracked_buffer.diff_base == *tracked_buffer.snapshot.as_rope()
                     && let TrackedBufferStatus::Created { .. } = &mut tracked_buffer.status
                 {
                     tracked_buffer.status = TrackedBufferStatus::Modified;
                 }
-                tracked_buffer.schedule_diff_update(ChangeAuthor::User, cx);
+                tracked_buffer.refresh();
+                cx.notify();
             }
         }
         if let Some(telemetry) = telemetry {
@@ -936,6 +746,7 @@ impl ActionLog {
         telemetry: Option<ActionLogTelemetry>,
         cx: &mut Context<Self>,
     ) -> (Task<Result<()>>, Option<PerBufferUndo>) {
+        self.catch_up(&buffer, cx);
         let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
             return (Task::ready(Ok(())), None);
         };
@@ -947,17 +758,26 @@ impl ActionLog {
         // ranges as rows. Deleting a file the agent created is only right when
         // the whole thing is being turned down; rejecting one line of it has to
         // remove that line, like rejecting one line of any other file.
+        //
+        // And only while none of it has been accepted: a file whose base holds
+        // lines the user kept is no longer the agent's alone, and turning down
+        // the rest of it must not take the kept lines with it. Deleting there
+        // is what made a file vanish after part of it had been accepted.
         let (ranges, rejects_whole_file, change_count) = {
-            let snapshot = buffer.read(cx);
+            let snapshot = &tracked_buffer.snapshot;
             let ranges = buffer_ranges
                 .into_iter()
                 .map(|range| range.start.to_point(snapshot)..range.end.to_point(snapshot))
                 .collect::<Vec<_>>();
-            let selected = Self::reviewed_changes(tracked_buffer, snapshot, &ranges);
-            let everything = [Point::zero()..snapshot.max_point()];
-            let all = Self::reviewed_changes(tracked_buffer, snapshot, &everything);
+            let selected = Self::reviewed_changes(tracked_buffer, &ranges);
+            let all = Self::all_changes(tracked_buffer);
             let count = selected.len();
-            (ranges, count >= all.len(), count)
+            let nothing_accepted = tracked_buffer.diff_base.len() == 0;
+            (
+                ranges,
+                nothing_accepted && !all.is_empty() && count == all.len(),
+                count,
+            )
         };
 
         log::info!(
@@ -1065,7 +885,7 @@ impl ActionLog {
                 // The same hunks the panel offers, reverted one by one. Going
                 // through `unreviewed_edits` would revert whole runs of
                 // touching lines at once, because a `Patch` merges them.
-                let rejected = Self::reviewed_changes(tracked_buffer, buffer.read(cx), &ranges);
+                let rejected = Self::reviewed_changes(tracked_buffer, &ranges);
                 log::info!("agent review: reverting {} line change(s)", rejected.len());
                 let base = tracked_buffer.diff_base.clone();
                 let edits_to_restore = buffer.update(cx, |buffer, cx| {
@@ -1085,6 +905,10 @@ impl ActionLog {
                     buffer.edit(edits_to_revert, None, cx);
                     edits_for_undo
                 });
+                // Taken in now rather than when the edit event arrives, so an
+                // answer given straight after this one sees the reverted text.
+                // The reverted lines equal the base, so they leave review.
+                tracked_buffer.observe(ChangeAuthor::User, cx);
 
                 let reviewed = rejected
                     .iter()
@@ -1200,9 +1024,13 @@ impl ActionLog {
                     if let TrackedBufferStatus::Created { .. } = &mut tracked_buffer.status {
                         tracked_buffer.status = TrackedBufferStatus::Modified;
                     }
-                    tracked_buffer.unreviewed_edits.clear();
+                    if tracked_buffer.snapshot.version() != &buffer.read(cx).version() {
+                        tracked_buffer.observe(ChangeAuthor::User, cx);
+                    }
+                    let accepted = Self::all_changes(tracked_buffer);
+                    tracked_buffer.remember_accepted(&accepted);
                     tracked_buffer.diff_base = tracked_buffer.snapshot.as_rope().clone();
-                    tracked_buffer.schedule_diff_update(ChangeAuthor::User, cx);
+                    tracked_buffer.refresh();
                     true
                 }
             }
@@ -1321,6 +1149,20 @@ impl ActionLog {
             .iter()
             .filter(|(_, tracked)| tracked.has_edits(cx))
             .map(|(buffer, tracked)| (buffer.clone(), tracked.diff.clone()))
+    }
+
+    /// Every buffer the review shows: those with changes still to answer, and
+    /// those whose changes were accepted in this review, which stay on screen
+    /// for reference. Each comes with the lines accepted in it.
+    pub fn review_buffers(
+        &self,
+        cx: &App,
+    ) -> Vec<(Entity<Buffer>, Entity<BufferDiff>, Vec<Range<Anchor>>)> {
+        self.tracked_buffers
+            .iter()
+            .filter(|(_, tracked)| tracked.has_edits(cx) || !tracked.accepted.is_empty())
+            .map(|(buffer, tracked)| (buffer.clone(), tracked.diff.clone(), tracked.accepted.clone()))
+            .collect()
     }
 
     /// Returns the total number of lines added and removed across all unreviewed buffers.
@@ -1565,12 +1407,17 @@ pub struct TrackedBuffer {
     /// reload is recorded as the agent's edit instead.
     agent_writes_to_disk: bool,
     diff_base: Rope,
+    /// The changes from `diff_base` to `snapshot` still to be answered, as row
+    /// ranges. Always recomputed from those two, never kept separately.
     unreviewed_edits: Patch<u32>,
+    /// Lines accepted in this review. They are no longer changes, so they are
+    /// no longer highlighted, but they stay in the review pane for reference.
+    accepted: Vec<Range<Anchor>>,
     status: TrackedBufferStatus,
     version: clock::Global,
     diff: Entity<BufferDiff>,
     snapshot: text::BufferSnapshot,
-    diff_update: mpsc::UnboundedSender<(ChangeAuthor, text::BufferSnapshot)>,
+    diff_update: mpsc::UnboundedSender<(Arc<str>, text::BufferSnapshot)>,
     _open_lsp_handle: OpenLspBufferHandle,
     _maintain_diff: Task<()>,
     _subscription: Subscription,
@@ -1587,20 +1434,66 @@ impl TrackedBuffer {
         self.diff_base.len()
     }
 
-    fn has_edits(&self, cx: &App) -> bool {
-        self.diff
-            .read(cx)
-            .snapshot(cx)
-            .hunks(self.buffer.read(cx))
-            .next()
-            .is_some()
+    fn has_edits(&self, _cx: &App) -> bool {
+        !self.unreviewed_edits.is_empty()
     }
 
-    fn schedule_diff_update(&self, author: ChangeAuthor, cx: &App) {
+    /// Takes in the buffer as it is now.
+    ///
+    /// A change the user made is folded into the base wherever it does not
+    /// touch a change still under review, so it is never mistaken for the
+    /// agent's. A change the agent made stays out of the base: it is what is
+    /// being reviewed.
+    fn observe(&mut self, author: ChangeAuthor, cx: &App) {
+        let new_snapshot = self.buffer.read(cx).text_snapshot();
+        if let ChangeAuthor::User = author {
+            let edits = diff_snapshots(&self.snapshot, &new_snapshot);
+            apply_non_conflicting_edits(
+                &self.unreviewed_edits,
+                edits,
+                &mut self.diff_base,
+                new_snapshot.as_rope(),
+            );
+        }
+        self.snapshot = new_snapshot;
+        self.refresh();
+    }
+
+    /// Recomputes what is left to answer and redraws the diff.
+    fn refresh(&mut self) {
+        let base_text = self.diff_base.to_string();
+        let buffer_text = self.snapshot.text();
+        self.unreviewed_edits = Patch::new(
+            buffer_diff::line_changes(&base_text, &buffer_text, false)
+                .into_iter()
+                .map(|(old, new)| Edit { old, new })
+                .collect(),
+        );
         self.diff_update
-            .unbounded_send((author, self.buffer.read(cx).text_snapshot()))
+            .unbounded_send((Arc::from(base_text), self.snapshot.clone()))
             .ok();
     }
+
+    /// Records accepted lines so the review pane keeps showing them.
+    fn remember_accepted(&mut self, changes: &[ReviewedChange]) {
+        let snapshot = &self.snapshot;
+        for change in changes {
+            let bytes = change.buffer_bytes(snapshot);
+            self.accepted
+                .push(snapshot.anchor_before(bytes.start)..snapshot.anchor_after(bytes.end));
+        }
+    }
+}
+
+/// The rows a range covers. A range ending at the very start of a row stops
+/// before it, and an empty range covers the row it sits on.
+fn rows_covered(range: &Range<Point>) -> Range<u32> {
+    let end = if range.end.column == 0 && range.end.row > range.start.row {
+        range.end.row
+    } else {
+        range.end.row + 1
+    };
+    range.start.row..end
 }
 
 fn buffer_display_path(buffer: &Entity<Buffer>, cx: &App) -> String {
@@ -1633,13 +1526,13 @@ impl ReviewedChange {
             ))
     }
 
-    fn buffer_bytes(&self, buffer: &Buffer) -> Range<usize> {
+    fn buffer_bytes(&self, buffer: &text::BufferSnapshot) -> Range<usize> {
         let max = buffer.max_point();
         buffer.point_to_offset(cmp::min(Point::new(self.buffer_rows.start, 0), max))
             ..buffer.point_to_offset(cmp::min(Point::new(self.buffer_rows.end, 0), max))
     }
 
-    fn buffer_text(&self, buffer: &Buffer) -> String {
+    fn buffer_text(&self, buffer: &text::BufferSnapshot) -> String {
         buffer.text_for_range(self.buffer_bytes(buffer)).collect()
     }
 

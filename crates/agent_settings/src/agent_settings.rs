@@ -292,7 +292,9 @@ impl AgentSettings {
         /// is what you want, since most prompts are a sentence -- also capped
         /// how much of a long prompt you could see, so shrinking the resting
         /// size made writing a paragraph worse.
-        const MAX: usize = 12;
+        /// High enough that a long prompt is read whole before it is sent;
+        /// past it the composer scrolls rather than pushing the thread away.
+        const MAX: usize = 40;
 
         self.message_editor_min_lines.max(MAX)
     }

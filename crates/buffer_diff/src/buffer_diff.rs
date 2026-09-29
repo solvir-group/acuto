@@ -1280,6 +1280,34 @@ fn coalesce_touching_edits(edits: Vec<Edit<Point>>) -> Vec<Edit<Point>> {
     coalesced
 }
 
+/// The changes from `base` to `buffer`, as row ranges on each side, found
+/// exactly the way [`compute_hunks`] finds a diff's hunks.
+///
+/// Agent review answers the hunks it shows. Working out which lines a click
+/// meant with a different diff algorithm than the one that drew them let the
+/// two disagree -- a line accepted in the view was not the line accepted in
+/// the text -- so review uses this, and it has to stay in step with
+/// `compute_hunks`.
+pub fn line_changes(base: &str, buffer: &str, per_line: bool) -> Vec<(Range<u32>, Range<u32>)> {
+    // `compute_hunks` shows an emptied buffer as one deletion. As rows that is
+    // every base line replaced by the buffer's single empty line.
+    if buffer == "\n" && base.ends_with('\n') && base.len() > 1 {
+        return vec![(0..lines(base).count() as u32, 0..1)];
+    }
+    let input = InternedInput::new(lines(base), lines(buffer));
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    diff.postprocess_lines(&input);
+    let mut changes = Vec::new();
+    for hunk in diff.hunks() {
+        if per_line {
+            changes.extend(split_change_per_line(hunk.before, hunk.after));
+        } else {
+            changes.push((hunk.before, hunk.after));
+        }
+    }
+    changes
+}
+
 pub fn split_change_per_line(
     before: Range<u32>,
     after: Range<u32>,
