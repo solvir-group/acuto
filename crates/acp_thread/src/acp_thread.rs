@@ -380,6 +380,26 @@ impl AssistantMessageChunk {
     }
 }
 
+/// How a block of editor state attached to a prompt begins. Agents see it; the
+/// thread never shows it as something the user wrote.
+pub const EDITOR_CONTEXT_OPEN_TAG: &str = "<editor_context>";
+
+pub fn is_editor_context_block(block: &acp::ContentBlock) -> bool {
+    matches!(block, acp::ContentBlock::Text(text) if text.text.starts_with(EDITOR_CONTEXT_OPEN_TAG))
+}
+
+/// Puts the editor context after the user's own blocks, never before: agents
+/// recognise slash commands and similar by the start of the prompt.
+fn prompt_with_editor_context(
+    mut message: Vec<acp::ContentBlock>,
+    editor_context: Option<String>,
+) -> Vec<acp::ContentBlock> {
+    if let Some(editor_context) = editor_context {
+        message.push(acp::ContentBlock::Text(acp::TextContent::new(editor_context)));
+    }
+    message
+}
+
 fn can_merge_message_chunks(
     existing: Option<&acp::MessageId>,
     incoming: Option<&acp::MessageId>,
@@ -2552,6 +2572,12 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) -> Result<(), acp::Error> {
         match update {
+            acp::SessionUpdate::UserMessageChunk(acp::ContentChunk { content, .. })
+                if is_editor_context_block(&content) =>
+            {
+                // Sent to the agent alongside the user's words but never shown
+                // as part of them, including when the agent replays history.
+            }
             acp::SessionUpdate::UserMessageChunk(acp::ContentChunk {
                 content,
                 message_id,
@@ -3784,7 +3810,18 @@ impl AcpThread {
         message: Vec<acp::ContentBlock>,
         cx: &mut Context<Self>,
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
-        self.send_inner(message, true, cx)
+        self.send_inner(message, None, true, cx)
+    }
+
+    /// Sends `message`, with a snapshot of the user's editor state attached for
+    /// the agent but left out of the message the user sees in the thread.
+    pub fn send_with_editor_context(
+        &mut self,
+        message: Vec<acp::ContentBlock>,
+        editor_context: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
+        self.send_inner(message, editor_context, true, cx)
     }
 
     /// Sends a prompt without displaying a user-message bubble for it.
@@ -3796,12 +3833,13 @@ impl AcpThread {
         message: Vec<acp::ContentBlock>,
         cx: &mut Context<Self>,
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
-        self.send_inner(message, false, cx)
+        self.send_inner(message, None, false, cx)
     }
 
     fn send_inner(
         &mut self,
         message: Vec<acp::ContentBlock>,
+        editor_context: Option<String>,
         push_user_message: bool,
         cx: &mut Context<Self>,
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
@@ -3812,7 +3850,10 @@ impl AcpThread {
             self.project.read(cx).path_style(cx),
             cx,
         );
-        let request = acp::PromptRequest::new(self.session_id.clone(), message.clone());
+        let request = acp::PromptRequest::new(
+            self.session_id.clone(),
+            prompt_with_editor_context(message.clone(), editor_context),
+        );
         let git_store = self.project.read(cx).git_store().clone();
 
         let client_user_message_ids = self.connection.client_user_message_ids(cx);
@@ -5803,6 +5844,64 @@ mod tests {
             } else {
                 panic!("Expected UserMessage at index 2");
             }
+        });
+    }
+
+    #[test]
+    fn editor_context_goes_after_the_users_own_blocks() {
+        let context = format!("{EDITOR_CONTEXT_OPEN_TAG}\nActive file: /a.rs\n</editor_context>");
+        let prompt =
+            prompt_with_editor_context(vec!["/review this".into()], Some(context.clone()));
+
+        assert_eq!(prompt.len(), 2);
+        assert_eq!(prompt[0], acp::ContentBlock::from("/review this"));
+        assert_eq!(prompt[1], acp::ContentBlock::from(context));
+        assert!(!is_editor_context_block(&prompt[0]));
+        assert!(is_editor_context_block(&prompt[1]));
+
+        let prompt = prompt_with_editor_context(vec!["hello".into()], None);
+        assert_eq!(prompt, vec![acp::ContentBlock::from("hello")]);
+    }
+
+    #[gpui::test]
+    async fn test_replayed_editor_context_is_not_shown_as_user_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            for chunk in [
+                "Fix the bug".to_string(),
+                format!("{EDITOR_CONTEXT_OPEN_TAG}\nActive file: /a.rs\n</editor_context>"),
+            ] {
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::UserMessageChunk(
+                            acp::ContentChunk::new(chunk.into()).message_id("msg_user_1"),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            }
+        });
+
+        thread.update(cx, |thread, cx| {
+            assert_eq!(thread.entries.len(), 1);
+            let AgentThreadEntry::UserMessage(user_message) = &thread.entries[0] else {
+                panic!("expected a user message");
+            };
+            assert_eq!(user_message.content.to_markdown(cx), "Fix the bug");
+            assert_eq!(user_message.chunks.len(), 1);
         });
     }
 

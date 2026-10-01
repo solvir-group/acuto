@@ -14,6 +14,7 @@ mod context_server_configuration;
 pub mod crew_panel;
 pub(crate) mod conversation_view;
 mod diagnostics;
+mod editor_context;
 pub mod draft_prompt_store;
 mod entry_view_state;
 mod external_source_prompt;
@@ -632,6 +633,7 @@ pub fn init(
     terminal_fix::init(cx);
     crew_panel::init(cx);
     conversation_view::claude_brand::RemoteControlStatus::init(cx);
+    ide_control_mcp::set_diagnostics_provider(editor_context::diagnostics_report, cx);
 
     cx.set_global(agent_skills::SkillsUpdatedHook(std::rc::Rc::new(|cx| {
         let workspaces: Vec<_> = workspace::AppState::global(cx)
@@ -1036,6 +1038,7 @@ mod tests {
             inline_assistant_use_streaming_tools: false,
             commit_message_model: None,
             commit_message_include_project_rules: true,
+            include_editor_context: true,
             commit_message_instructions: None,
             thread_summary_model: None,
             compaction_model: None,

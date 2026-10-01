@@ -1764,6 +1764,17 @@ impl ThreadView {
         self.send_content(contents_task, false, window, cx);
     }
 
+    fn editor_context_for_send(&self, is_native_command: bool, cx: &mut App) -> Option<String> {
+        if is_native_command
+            || self.is_subagent()
+            || !AgentSettings::get_global(cx).include_editor_context
+        {
+            return None;
+        }
+        let workspace = self.workspace.upgrade()?;
+        crate::editor_context::gather(&workspace, cx).render()
+    }
+
     pub fn send_content(
         &mut self,
         contents_task: Task<anyhow::Result<Option<(Vec<acp::ContentBlock>, Vec<Entity<Buffer>>)>>>,
@@ -1776,6 +1787,9 @@ impl ThreadView {
         let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();
         let is_first_message = self.thread.read(cx).entries().is_empty();
         let thread = self.thread.downgrade();
+        // Taken now rather than once the mentions resolve, so it shows what
+        // the user was looking at when they pressed send.
+        let editor_context = self.editor_context_for_send(is_native_command, cx);
 
         self.is_loading_contents = true;
 
@@ -1865,7 +1879,9 @@ impl ThreadView {
                 if is_native_command {
                     thread.send_command(contents, cx)
                 } else {
-                    thread.send(contents, cx)
+                    let editor_context =
+                        editor_context.filter(|_| !starts_with_slash_command(&contents));
+                    thread.send_with_editor_context(contents, editor_context, cx)
                 }
             })?;
 
@@ -13180,6 +13196,16 @@ fn user_bubble_width(text: &str, window: &mut Window, cx: &App) -> Pixels {
     widest + px(CHROME)
 }
 
+
+/// Agents read a slash command from the start of the prompt and its arguments
+/// from the rest, so nothing may be added to a prompt that is one.
+fn starts_with_slash_command(contents: &[acp::ContentBlock]) -> bool {
+    matches!(
+        contents.first(),
+        Some(acp::ContentBlock::Text(text)) if text.text.trim_start().starts_with('/')
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13188,6 +13214,14 @@ mod tests {
     use std::path::Path;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn editor_context_is_withheld_from_slash_commands() {
+        assert!(starts_with_slash_command(&["/review main".into()]));
+        assert!(starts_with_slash_command(&["  /compact".into()]));
+        assert!(!starts_with_slash_command(&["fix the /tmp path".into()]));
+        assert!(!starts_with_slash_command(&[]));
+    }
 
     fn native_command(name: &str) -> acp::AvailableCommand {
         acp::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(

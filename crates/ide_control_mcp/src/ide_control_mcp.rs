@@ -32,11 +32,13 @@
 //!   input, git history and remotes, installing, starting agents.
 
 use std::io::Read as _;
+use std::path::PathBuf;
+use std::rc::Rc;
 
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt as _, StreamExt as _};
-use gpui::{App, Global};
+use gpui::{App, Global, Task};
 use serde_json::{Value, json};
 
 /// Cap on how many action names one listing returns.
@@ -234,6 +236,24 @@ pub fn init(cx: &mut App) {
             cx.set_global(GlobalEndpoint(None));
         }
     }
+}
+
+type DiagnosticsProvider = Rc<dyn Fn(Option<PathBuf>, &mut App) -> Task<Result<String, String>>>;
+
+struct GlobalDiagnosticsProvider(DiagnosticsProvider);
+
+impl Global for GlobalDiagnosticsProvider {}
+
+/// Supplies the answer to `get_diagnostics`.
+///
+/// Diagnostics live in projects and workspaces, which this crate stays clear
+/// of so that every agent crate can depend on it cheaply; whoever owns them
+/// registers the provider.
+pub fn set_diagnostics_provider(
+    provider: impl Fn(Option<PathBuf>, &mut App) -> Task<Result<String, String>> + 'static,
+    cx: &mut App,
+) {
+    cx.set_global(GlobalDiagnosticsProvider(Rc::new(provider)));
 }
 
 /// One tool call, and the channel its answer goes back on.
@@ -447,6 +467,24 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "get_diagnostics",
+            "description": "Get the editor's current language-server diagnostics (errors, \
+                            warnings and info). Pass an absolute `path` for one file; omit it \
+                            for every file the language servers have reported problems in. \
+                            Faster than a full build for checking whether code compiles, \
+                            and it reflects unsaved edits in the editor.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path of a file in the open project. \
+                                        Omit for all files with diagnostics."
+                    }
+                }
+            }
+        },
+        {
             "name": "update_ide_setting",
             "description": "Read or change an appearance or editing setting in the user's \
                             settings file (theme, fonts, panels, wrapping and the like). \
@@ -514,6 +552,7 @@ fn respond_empty(request: tiny_http::Request) {
 async fn execute(name: &str, arguments: Value, cx: &mut gpui::AsyncApp) -> Result<String, String> {
     match name {
         "run_ide_action" => run_ide_action(arguments, cx),
+        "get_diagnostics" => get_diagnostics(arguments, cx).await,
         "update_ide_setting" => update_ide_setting(arguments),
         other => Err(format!("unknown tool `{other}`")),
     }
@@ -582,6 +621,34 @@ fn run_ide_action(arguments: Value, cx: &mut gpui::AsyncApp) -> Result<String, S
 
         Ok(format!("Ran `{action_name}`."))
     })
+}
+
+async fn get_diagnostics(arguments: Value, cx: &mut gpui::AsyncApp) -> Result<String, String> {
+    let path = match arguments.get("path") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(path)) => {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "`path` must be absolute; got `{}`.",
+                    path.display()
+                ));
+            }
+            Some(path)
+        }
+        Some(other) => return Err(format!("`path` must be a string; got {other}.")),
+    };
+
+    let task = cx.update(|cx| {
+        let provider = cx
+            .try_global::<GlobalDiagnosticsProvider>()
+            .map(|provider| provider.0.clone())?;
+        Some(provider(path, cx))
+    });
+    match task {
+        Some(task) => task.await,
+        None => Err("Diagnostics are not available in this editor build.".into()),
+    }
 }
 
 fn update_ide_setting(arguments: Value) -> Result<String, String> {
@@ -767,11 +834,18 @@ mod tests {
     }
 
     #[test]
-    fn lists_the_two_tools_with_schemas() {
+    fn lists_the_tools_with_schemas() {
         let tools = tool_definitions();
         let tools = tools.as_array().expect("tool definitions are an array");
 
-        assert_eq!(tools.len(), 2);
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["run_ide_action", "get_diagnostics", "update_ide_setting"]
+        );
         for tool in tools {
             assert!(tool["name"].is_string());
             assert!(tool["description"].is_string());

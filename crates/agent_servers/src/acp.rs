@@ -58,6 +58,100 @@ pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 /// one-shot command actually reports.
 pub const CLAUDE_TERMINAL_AUTH_METHOD_ID: &str = "claude-anthropic-login";
 
+/// The thinking budget Anthropic's own editor extension launches Claude Code
+/// with (`--max-thinking-tokens 31999`).
+///
+/// The adapter only sets a budget when `MAX_THINKING_TOKENS` is in its
+/// environment, and nothing puts it there, so sessions here used to start with
+/// whatever the CLI falls back to instead of the budget the extension uses.
+pub const CLAUDE_THINKING_BUDGET_TOKENS: u64 = 31_999;
+
+/// Lets a user who already tunes the budget through the adapter's own variable
+/// keep doing so; an explicit option would silently override it.
+const CLAUDE_THINKING_BUDGET_ENV_VAR: &str = "MAX_THINKING_TOKENS";
+
+/// Added after Claude Code's own system prompt, never in place of it. The
+/// adapter keeps the `claude_code` preset and forwards only `append`, which is
+/// what the official extension does for its editor-specific instructions.
+pub const CLAUDE_SYSTEM_PROMPT_APPEND: &str = "\
+# Acuto editor context
+
+You are running inside the Acuto code editor, connected over the Agent Client Protocol. \
+The user reads your replies in the editor's agent panel, which renders GitHub-flavored markdown.
+
+The editor may end a user message with an `<editor_context>` block. The editor attaches it \
+automatically. It is a snapshot of the user's editor state at the moment they sent the \
+message: the active file and the lines visible in it, the current selection, LSP diagnostics \
+in open files, and the files they have open. It may or may not be relevant to the request. \
+Use it to resolve references like \"this function\", \"the selected code\" or \"the error \
+here\", but do not describe the block back to the user. It is a snapshot, so read the file \
+before editing rather than trusting line numbers from it after the file may have changed.
+
+When the `acuto-ide-control` MCP server is available, its `get_diagnostics` tool returns the \
+editor's current LSP diagnostics for any file, which is faster and more precise than running \
+a full build to find errors.";
+
+/// The `_meta` Claude Code sessions are created, loaded and resumed with.
+///
+/// Every value here is also the adapter's default today, except the thinking
+/// budget and the prompt append. They are stated explicitly anyway, so that a
+/// change of default in a future adapter release cannot quietly change what
+/// sessions in this editor get. The model is deliberately absent: pinning
+/// one here would override the user's own `/model` choice and Claude Code
+/// settings, and the CLI's default is already its strongest model.
+pub fn claude_session_meta(user_sets_thinking_budget: bool) -> acp::Meta {
+    let mut options = serde_json::Map::from_iter([
+        (
+            "settingSources".to_string(),
+            serde_json::json!(["user", "project", "local"]),
+        ),
+        (
+            "tools".to_string(),
+            serde_json::json!({ "type": "preset", "preset": "claude_code" }),
+        ),
+    ]);
+    if !user_sets_thinking_budget {
+        options.insert(
+            "thinking".to_string(),
+            serde_json::json!({ "type": "enabled", "budgetTokens": CLAUDE_THINKING_BUDGET_TOKENS }),
+        );
+    }
+
+    acp::Meta::from_iter([
+        (
+            // `type` and `preset` are pinned by the adapter regardless; they
+            // are sent so the intent is visible in the ACP log.
+            "systemPrompt".to_string(),
+            serde_json::json!({
+                "type": "preset",
+                "preset": "claude_code",
+                "append": CLAUDE_SYSTEM_PROMPT_APPEND,
+            }),
+        ),
+        (
+            "claudeCode".to_string(),
+            serde_json::json!({ "options": options }),
+        ),
+    ])
+}
+
+/// The `_meta` to send with every session request for `agent_id`, if any.
+///
+/// Only Claude gets one: the keys are the Claude adapter's, and other agents
+/// have no use for them.
+fn session_meta_for_agent(
+    agent_id: &AgentId,
+    launch_env: Option<&HashMap<String, String>>,
+) -> Option<acp::Meta> {
+    if agent_id.0.as_ref() != CLAUDE_AGENT_ID {
+        return None;
+    }
+    let user_sets_thinking_budget = launch_env
+        .is_some_and(|env| env.contains_key(CLAUDE_THINKING_BUDGET_ENV_VAR))
+        || std::env::var_os(CLAUDE_THINKING_BUDGET_ENV_VAR).is_some();
+    Some(claude_session_meta(user_sets_thinking_budget))
+}
+
 /// Where the Claude CLI is, if it is anywhere.
 ///
 /// Checked in order: the `CLAUDE_CODE_PATH` override, then the per-user install
@@ -443,6 +537,7 @@ pub struct AcpConnection {
     agent_capabilities: acp::AgentCapabilities,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
+    session_meta: Option<acp::Meta>,
     child: Option<Child>,
     session_list: Option<Rc<AcpSessionList>>,
     debug_log: AcpDebugLog,
@@ -859,6 +954,7 @@ impl AcpConnection {
                 .cloned()
         });
         let original_command = command.clone();
+        let session_meta = session_meta_for_agent(&agent_id, command.env.as_ref());
         let (path, args, env) = project
             .read_with(cx, |project, cx| {
                 project.remote_client().and_then(|client| {
@@ -1165,6 +1261,7 @@ impl AcpConnection {
             agent_capabilities: response.agent_capabilities,
             request_elicitations,
             defaults,
+            session_meta,
             session_list,
             debug_log,
             _settings_subscription: settings_subscription,
@@ -1207,6 +1304,7 @@ impl AcpConnection {
             agent_capabilities,
             request_elicitations,
             defaults,
+            session_meta: None,
             child: None,
             session_list: None,
             debug_log: AcpDebugLog::default(),
@@ -1506,30 +1604,42 @@ struct SessionDirectories {
 }
 
 impl SessionDirectories {
-    fn into_new_session_request(self, mcp_servers: Vec<acp::McpServer>) -> acp::NewSessionRequest {
+    // Load and resume carry the same `_meta` as new: the Claude adapter
+    // rebuilds a session from whatever options the reopening request carries,
+    // so leaving them off would reopen old threads with weaker settings.
+    fn into_new_session_request(
+        self,
+        mcp_servers: Vec<acp::McpServer>,
+        meta: Option<acp::Meta>,
+    ) -> acp::NewSessionRequest {
         acp::NewSessionRequest::new(self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
 
     fn into_load_session_request(
         self,
         session_id: acp::SessionId,
         mcp_servers: Vec<acp::McpServer>,
+        meta: Option<acp::Meta>,
     ) -> acp::LoadSessionRequest {
         acp::LoadSessionRequest::new(session_id, self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
 
     fn into_resume_session_request(
         self,
         session_id: acp::SessionId,
         mcp_servers: Vec<acp::McpServer>,
+        meta: Option<acp::Meta>,
     ) -> acp::ResumeSessionRequest {
         acp::ResumeSessionRequest::new(session_id, self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
 }
 
@@ -1568,6 +1678,45 @@ fn work_dirs_from_session_info(cwd: PathBuf, additional_directories: Vec<PathBuf
     }
 
     PathList::new(&paths)
+}
+
+/// Records the configuration a session is opened with, so "which settings did
+/// this thread actually get" is answerable from the log. The full request,
+/// `_meta` included, is also visible in `dev: open acp logs`.
+fn log_session_config(agent_id: &AgentId, kind: &str, meta: Option<&acp::Meta>) {
+    match meta {
+        Some(meta) => log::info!(
+            "{agent_id} session/{kind} config: {}",
+            serde_json::Value::Object(meta.clone())
+        ),
+        None => log::info!("{agent_id} session/{kind} config: agent defaults (no _meta)"),
+    }
+}
+
+/// Records the model, effort and mode the agent says the session ended up
+/// with, which is what the user's settings and the agent's defaults resolved to.
+fn log_reported_config(
+    agent_id: &AgentId,
+    session_id: &acp::SessionId,
+    config_options: Option<&[acp::SessionConfigOption]>,
+) {
+    let Some(config_options) = config_options else {
+        return;
+    };
+    let values = config_options
+        .iter()
+        .filter_map(|option| match &option.kind {
+            acp::SessionConfigKind::Select(select) => {
+                Some(format!("{}={}", option.id, select.current_value))
+            }
+            acp::SessionConfigKind::Boolean(boolean) => {
+                Some(format!("{}={}", option.id, boolean.current_value))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    log::info!("{agent_id} session {session_id} reported config: {values}");
 }
 
 fn emit_load_error_to_all_sessions(
@@ -1678,13 +1827,17 @@ impl AgentConnection for AcpConnection {
             cx,
         );
 
+        let session_meta = self.session_meta.clone();
+        log_session_config(&self.id, "new", session_meta.as_ref());
+
         cx.spawn(async move |cx| {
             let response = self
                 .connection
-                .send_request(directories.into_new_session_request(mcp_servers))
+                .send_request(directories.into_new_session_request(mcp_servers, session_meta))
                 .block_task()
             .await
             .map_err(map_acp_error)?;
+            log_reported_config(&self.id, &response.session_id, response.config_options.as_deref());
 
             let (modes, config_options) = config_state(response.modes, response.config_options);
 
@@ -1812,6 +1965,8 @@ impl AgentConnection for AcpConnection {
             self.agent_capabilities.mcp_capabilities.http,
             cx,
         );
+        let session_meta = self.session_meta.clone();
+        log_session_config(&self.id, "load", session_meta.as_ref());
         self.open_or_create_session(
             session_id,
             project,
@@ -1820,9 +1975,11 @@ impl AgentConnection for AcpConnection {
             move |connection, session_id, directories| {
                 Box::pin(async move {
                     let response = connection
-                        .send_request(
-                            directories.into_load_session_request(session_id.clone(), mcp_servers),
-                        )
+                        .send_request(directories.into_load_session_request(
+                            session_id.clone(),
+                            mcp_servers,
+                            session_meta,
+                        ))
                         .block_task()
                         .await
                         .map_err(map_acp_error)?;
@@ -1860,6 +2017,8 @@ impl AgentConnection for AcpConnection {
             self.agent_capabilities.mcp_capabilities.http,
             cx,
         );
+        let session_meta = self.session_meta.clone();
+        log_session_config(&self.id, "resume", session_meta.as_ref());
         self.open_or_create_session(
             session_id,
             project,
@@ -1868,10 +2027,11 @@ impl AgentConnection for AcpConnection {
             move |connection, session_id, directories| {
                 Box::pin(async move {
                     let response = connection
-                        .send_request(
-                            directories
-                                .into_resume_session_request(session_id.clone(), mcp_servers),
-                        )
+                        .send_request(directories.into_resume_session_request(
+                            session_id.clone(),
+                            mcp_servers,
+                            session_meta,
+                        ))
                         .block_task()
                         .await
                         .map_err(map_acp_error)?;
@@ -3366,12 +3526,15 @@ mod tests {
         );
 
         let session_id = acp::SessionId::new("session-1");
-        let new_session_request = directories.clone().into_new_session_request(Vec::new());
-        let load_session_request = directories
+        let new_session_request = directories
             .clone()
-            .into_load_session_request(session_id.clone(), Vec::new());
+            .into_new_session_request(Vec::new(), None);
+        let load_session_request =
+            directories
+                .clone()
+                .into_load_session_request(session_id.clone(), Vec::new(), None);
         let resume_session_request =
-            directories.into_resume_session_request(session_id, Vec::new());
+            directories.into_resume_session_request(session_id, Vec::new(), None);
 
         assert_eq!(
             new_session_request.cwd,
@@ -3392,6 +3555,110 @@ mod tests {
             resume_session_request.additional_directories,
             new_session_request.additional_directories
         );
+    }
+
+    #[test]
+    fn claude_session_config_is_exactly_the_intended_one() {
+        let meta = serde_json::Value::Object(claude_session_meta(false));
+
+        // Exact equality, so that adding, dropping or changing any key -- a
+        // pinned model, a disallowed tool, a replaced prompt -- fails here.
+        assert_eq!(
+            meta,
+            serde_json::json!({
+                "systemPrompt": {
+                    "type": "preset",
+                    "preset": "claude_code",
+                    "append": CLAUDE_SYSTEM_PROMPT_APPEND,
+                },
+                "claudeCode": {
+                    "options": {
+                        "settingSources": ["user", "project", "local"],
+                        "tools": { "type": "preset", "preset": "claude_code" },
+                        "thinking": { "type": "enabled", "budgetTokens": 31_999 },
+                    }
+                }
+            })
+        );
+
+        let options = &meta["claudeCode"]["options"];
+        // The adapter spreads these options over its own, so a `systemPrompt`
+        // here would replace Claude Code's prompt instead of extending it.
+        assert!(options.get("systemPrompt").is_none());
+        // Left to the CLI, which picks its strongest model and honours the
+        // user's own `/model` and settings.
+        assert!(options.get("model").is_none());
+        assert!(options.get("effort").is_none());
+        assert!(options.get("disallowedTools").is_none());
+        assert!(options.get("allowedTools").is_none());
+        assert!(options.get("maxTurns").is_none());
+    }
+
+    #[test]
+    fn claude_thinking_budget_defers_to_max_thinking_tokens() {
+        let meta = claude_session_meta(true);
+        assert!(meta["claudeCode"]["options"].get("thinking").is_none());
+
+        let launch_env = HashMap::from_iter([(
+            CLAUDE_THINKING_BUDGET_ENV_VAR.to_string(),
+            "8000".to_string(),
+        )]);
+        let meta = session_meta_for_agent(&AgentId::new(CLAUDE_AGENT_ID), Some(&launch_env))
+            .expect("claude sessions carry _meta");
+        assert!(meta["claudeCode"]["options"].get("thinking").is_none());
+        assert_eq!(
+            meta["claudeCode"]["options"]["settingSources"],
+            serde_json::json!(["user", "project", "local"])
+        );
+    }
+
+    #[test]
+    fn non_claude_agents_get_no_session_meta() {
+        for agent_id in [
+            crate::CODEX_ID,
+            crate::GEMINI_ID,
+            crate::CURSOR_ID,
+            crate::COPILOT_ID,
+            "my-custom-agent",
+        ] {
+            assert!(
+                session_meta_for_agent(&AgentId::new(agent_id), None).is_none(),
+                "{agent_id} should not receive Claude's _meta"
+            );
+        }
+    }
+
+    #[test]
+    fn session_meta_is_sent_with_new_load_and_resume() {
+        let directories = SessionDirectories {
+            cwd: std::path::PathBuf::from("/workspace"),
+            additional_directories: Vec::new(),
+        };
+        let meta = claude_session_meta(false);
+        let session_id = acp::SessionId::new("session-1");
+
+        let requests = [
+            serde_json::to_value(
+                directories
+                    .clone()
+                    .into_new_session_request(Vec::new(), Some(meta.clone())),
+            ),
+            serde_json::to_value(directories.clone().into_load_session_request(
+                session_id.clone(),
+                Vec::new(),
+                Some(meta.clone()),
+            )),
+            serde_json::to_value(directories.into_resume_session_request(
+                session_id,
+                Vec::new(),
+                Some(meta.clone()),
+            )),
+        ];
+        for request in requests {
+            let request = request.expect("session requests serialize");
+            assert_eq!(request["_meta"], serde_json::Value::Object(meta.clone()));
+            assert_eq!(request["cwd"], serde_json::json!("/workspace"));
+        }
     }
 
     #[test]

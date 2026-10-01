@@ -1130,6 +1130,11 @@
     // Whether to include project rules files (AGENTS.md, CLAUDE.md, .rules, etc.)
     // in the prompt when generating git commit messages.
     "commit_message_include_project_rules": true,
+    // Whether to attach a snapshot of the editor's state to each message sent
+    // to an agent: the active file and its visible lines, the selection,
+    // diagnostics in open files and the list of open files. Bounded in size so
+    // it never crowds out the conversation.
+    "include_editor_context": true,
     // Whether the agent is enabled.
     "enabled": true,
     // Whether to show the agent panel button in the status bar.

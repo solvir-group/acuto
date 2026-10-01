@@ -360,9 +360,7 @@ fn keep_edits_in_ranges(
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
-    let diff_hunks_in_ranges = editor
-        .diff_hunks_in_ranges(&ranges, buffer_snapshot)
-        .collect::<Vec<_>>();
+    let diff_hunks_in_ranges = hunks_answered_by(editor, buffer_snapshot, &ranges);
 
     update_editor_selection(editor, buffer_snapshot, &diff_hunks_in_ranges, window, cx);
 
@@ -400,9 +398,7 @@ fn reject_edits_in_ranges(
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
-    let diff_hunks_in_ranges = editor
-        .diff_hunks_in_ranges(&ranges, buffer_snapshot)
-        .collect::<Vec<_>>();
+    let diff_hunks_in_ranges = hunks_answered_by(editor, buffer_snapshot, &ranges);
 
     update_editor_selection(editor, buffer_snapshot, &diff_hunks_in_ranges, window, cx);
 
@@ -450,6 +446,71 @@ fn reject_edits_in_ranges(
     }
 }
 
+/// The hunks a Keep or Reject over the given ranges answers.
+///
+/// `diff_hunks_in_ranges` reaches one row past each range, so that a cursor on
+/// a deleted line, which sits just above its hunk, still finds it. Review offers
+/// a hunk per line, so that extra row is usually the next changed line: Keep or
+/// Reject on one line answered the line under it too, and on a short diff all
+/// of it -- a new file rejected that way was deleted outright. A hunk is
+/// answered only when a range covers its rows; reaching past the range is kept
+/// for a range that covers no hunk at all.
+fn hunks_answered_by(
+    editor: &Editor,
+    buffer_snapshot: &MultiBufferSnapshot,
+    ranges: &[Range<editor::Anchor>],
+) -> Vec<multi_buffer::MultiBufferDiffHunk> {
+    let mut answered: Vec<multi_buffer::MultiBufferDiffHunk> = Vec::new();
+    for range in ranges {
+        let candidates = editor
+            .diff_hunks_in_ranges(std::slice::from_ref(range), buffer_snapshot)
+            .collect::<Vec<_>>();
+        let range = range.start.to_point(buffer_snapshot)..range.end.to_point(buffer_snapshot);
+        // A range ending at the very start of a row stops before that row, the
+        // way a hunk's own range ends at the start of the line after it.
+        let covered_end = if range.end.column == 0 && range.end.row > range.start.row {
+            range.end.row
+        } else {
+            range.end.row + 1
+        };
+        let covered = range.start.row..covered_end;
+        let covers = |hunk: &multi_buffer::MultiBufferDiffHunk| {
+            let rows = hunk.row_range.start.0..hunk.row_range.end.0;
+            if rows.is_empty() {
+                covered.contains(&rows.start)
+            } else {
+                rows.start < covered.end && covered.start < rows.end
+            }
+        };
+        let mut matched = candidates
+            .iter()
+            .filter(|hunk| covers(hunk))
+            .cloned()
+            .collect::<Vec<_>>();
+        if matched.is_empty() {
+            let next_start = candidates
+                .iter()
+                .map(|hunk| hunk.row_range.start.0)
+                .filter(|start| *start >= covered.end)
+                .min();
+            matched.extend(
+                candidates
+                    .into_iter()
+                    .filter(|hunk| Some(hunk.row_range.start.0) == next_start),
+            );
+        }
+        for hunk in matched {
+            let already_answered = answered.iter().any(|other| {
+                other.buffer_id == hunk.buffer_id && other.buffer_range == hunk.buffer_range
+            });
+            if !already_answered {
+                answered.push(hunk);
+            }
+        }
+    }
+    answered
+}
+
 fn update_editor_selection(
     editor: &mut Editor,
     buffer_snapshot: &MultiBufferSnapshot,
@@ -469,6 +530,14 @@ fn update_editor_selection(
         return;
     }
 
+    // Skipped by identity rather than by position: with a hunk per line the
+    // next hunk starts where the answered one ends, and skipping a fixed count
+    // stepped over it.
+    let is_answered = |hunk: &multi_buffer::MultiBufferDiffHunk| {
+        diff_hunks.iter().any(|answered| {
+            answered.buffer_id == hunk.buffer_id && answered.buffer_range == hunk.buffer_range
+        })
+    };
     let target_hunk = {
         diff_hunks
             .last()
@@ -479,7 +548,7 @@ fn update_editor_selection(
                         &[last_kept_hunk_end..editor::Anchor::Max],
                         buffer_snapshot,
                     )
-                    .nth(1)
+                    .find(|hunk| !is_answered(hunk))
             })
             .or_else(|| {
                 let first_kept_hunk = diff_hunks.first()?;
@@ -489,7 +558,7 @@ fn update_editor_selection(
                         &[editor::Anchor::Min..first_kept_hunk_start],
                         buffer_snapshot,
                     )
-                    .next()
+                    .find(|hunk| !is_answered(hunk))
             })
     };
 

@@ -257,6 +257,12 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub commit_message_include_project_rules: Option<bool>,
+    /// Whether to attach a snapshot of the editor's state to each message sent
+    /// to an agent: the active file and its visible lines, the selection,
+    /// diagnostics in open files and the list of open files.
+    ///
+    /// Default: true
+    pub include_editor_context: Option<bool>,
     /// Custom instructions to include in the prompt when generating git commit messages.
     /// Applied in addition to any project rules files (such as `.rules` or `AGENTS.md`).
     pub commit_message_instructions: Option<String>,

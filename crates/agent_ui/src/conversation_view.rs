@@ -5310,6 +5310,78 @@ Paste the code back here:";
         );
     }
 
+    /// A thread in the side panel opens the review when its turn ends, the
+    /// same as a thread in a tab.
+    #[gpui::test]
+    async fn test_panel_thread_opens_review_at_turn_end(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "test1.txt": "old content 1" }))
+            .await;
+
+        cx.update(|cx| {
+            cx.update_flags(true, vec!["agent-v2".to_string()]);
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            <dyn Fs>::set_global(fs.clone(), cx);
+        });
+
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let multi_workspace_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace_handle
+            .read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace_handle.into(), cx);
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| crate::AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.focus_panel::<crate::AgentPanel>(window, cx);
+            panel
+        });
+        cx.run_until_parked();
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new("tool1", "Edit file 1")
+                .kind(acp::ToolKind::Edit)
+                .status(acp::ToolCallStatus::Completed)
+                .content(vec![acp::ToolCallContent::Diff(
+                    acp::Diff::new("/project/test1.txt", "new content 1")
+                        .old_text("old content 1"),
+                )]),
+        )]);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(
+                Rc::new(StubAgentServer::new(connection)),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let conversation_view = panel
+            .read_with(cx, |panel, _cx| panel.active_conversation_view().cloned())
+            .expect("the panel should be showing the new thread");
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Edit the file", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let review_panels = workspace.read_with(cx, |workspace, cx| {
+            workspace.items_of_type::<AgentDiffPane>(cx).count()
+        });
+        assert_eq!(
+            review_panels, 1,
+            "a panel thread's turn ending with an edit should open the review"
+        );
+    }
+
     #[gpui::test]
     async fn test_no_notification_when_sidebar_open_but_different_thread_focused(
         cx: &mut TestAppContext,
