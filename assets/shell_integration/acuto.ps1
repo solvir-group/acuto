@@ -3,13 +3,14 @@
 # Emits OSC 133 semantic prompt markers and OSC 7 working-directory reports.
 # See acuto.zsh for the rationale.
 #
-# Passed via `-EncodedCommand` rather than written to a .ps1 and dot-sourced.
+# Passed in an environment variable and built into a script block, rather than
+# written to a .ps1 and dot-sourced.
 # ExecutionPolicy governs script *files*, so a restrictive policy — the default
 # on Windows for anything not signed — would block a file but not an inline
 # command. Windows is a first-class target here, so the integration cannot be
 # the one thing that silently fails on it.
 #
-# Encoded rather than passed as a plain `-Command` argument because PowerShell
+# Not passed as a plain `-Command` argument, because PowerShell
 # re-parses that argument and strips the script's own double quotes, leaving
 # something that cannot parse at all.
 #

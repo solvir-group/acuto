@@ -32,6 +32,59 @@ pub struct GithubReleaseAsset {
     pub digest: Option<String>,
 }
 
+/// Every release of a repository, newest first as GitHub lists them, with the
+/// `sha256:` prefix stripped from asset digests.
+pub async fn github_releases(
+    repo_name_with_owner: &str,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<Vec<GithubRelease>> {
+    let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/releases");
+
+    let request = github_api_request(&url)?;
+
+    let mut response = http
+        .send(request)
+        .await
+        .context("error fetching latest release")?;
+
+    let mut body = Vec::new();
+    response
+        .body_mut()
+        .read_to_end(&mut body)
+        .await
+        .context("error reading latest release")?;
+
+    if response.status().is_client_error() {
+        let text = String::from_utf8_lossy(body.as_slice());
+        bail!(
+            "status error {}, response: {text:?}",
+            response.status().as_u16()
+        );
+    }
+
+    let mut releases = match serde_json::from_slice::<Vec<GithubRelease>>(body.as_slice()) {
+        Ok(releases) => releases,
+
+        Err(err) => {
+            log::error!("Error deserializing: {err:?}");
+            log::error!(
+                "GitHub API response text: {:?}",
+                String::from_utf8_lossy(body.as_slice())
+            );
+            anyhow::bail!("error deserializing latest release: {err:?}");
+        }
+    };
+
+    for asset in releases.iter_mut().flat_map(|release| release.assets.iter_mut()) {
+        if let Some(digest) = &mut asset.digest
+            && let Some(stripped) = digest.strip_prefix("sha256:")
+        {
+            *digest = stripped.to_owned();
+        }
+    }
+    Ok(releases)
+}
+
 pub async fn latest_github_release(
     repo_name_with_owner: &str,
     require_assets: bool,

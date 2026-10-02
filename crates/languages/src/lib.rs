@@ -110,6 +110,13 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             adapters: vec![css_lsp_adapter],
             ..Default::default()
         },
+        // Built in rather than installed: an extension has to be downloaded
+        // and its grammar compiled before the first .html file highlights.
+        LanguageInfo {
+            name: "html",
+            adapters: vec![],
+            ..Default::default()
+        },
         LanguageInfo {
             name: "diff",
             adapters: vec![],

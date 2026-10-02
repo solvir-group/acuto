@@ -4144,10 +4144,15 @@ mod tests {
         cx.executor().allow_parking();
 
         let shell = crate::shell_integration::IntegrationShell::PowerShell;
-        let args = crate::shell_integration::powershell_args_for_test(shell.script());
+        let args = crate::shell_integration::powershell_args_for_test();
+        let environment = HashMap::from_iter([
+            crate::shell_integration::powershell_env_for_test(shell.script()),
+            ("ACUTO_TERM".to_string(), "true".to_string()),
+        ]);
 
         let (terminal, _completion_rx) =
-            build_test_terminal_with_arguments(cx, "powershell.exe".to_string(), args).await;
+            build_test_terminal_with_arguments(cx, "powershell.exe".to_string(), args, environment)
+                .await;
 
         // Waits for `AtPrompt` rather than for any marker at all: `A` arrives
         // before `B`, so a loop that stops at the first marker races the one
@@ -4199,13 +4204,14 @@ mod tests {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let (program, args) =
             ShellBuilder::new(&Shell::System, false).build(Some(command.to_owned()), &args);
-        build_test_terminal_with_arguments(cx, program, args).await
+        build_test_terminal_with_arguments(cx, program, args, HashMap::default()).await
     }
 
     async fn build_test_terminal_with_arguments(
         cx: &mut TestAppContext,
         program: String,
         args: Vec<String>,
+        environment: HashMap<String, String>,
     ) -> (Entity<Terminal>, Receiver<Option<ExitStatus>>) {
         let (completion_tx, completion_rx) = async_channel::unbounded();
         let builder = cx
@@ -4218,7 +4224,7 @@ mod tests {
                         args,
                         title_override: None,
                     },
-                    HashMap::default(),
+                    environment,
                     SettingsCursorShape::default(),
                     AlternateScroll::On,
                     None,
@@ -4699,8 +4705,13 @@ mod tests {
         cx.executor().allow_parking();
 
         let (terminal, completion_rx) =
-            build_test_terminal_with_arguments(cx, "sleep".to_string(), vec!["1".to_string()])
-                .await;
+            build_test_terminal_with_arguments(
+                cx,
+                "sleep".to_string(),
+                vec!["1".to_string()],
+                HashMap::default(),
+            )
+            .await;
 
         assert_foreground_process_command_eventually(&terminal, "sleep", cx).await;
 

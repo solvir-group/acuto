@@ -869,27 +869,33 @@ impl AutoUpdater {
         );
         let asset_name = format!("Acuto-{ARCH}.exe");
         let http: Arc<dyn HttpClient> = client.clone();
-        let release =
-            http_client::github::latest_github_release(ACUTO_RELEASES_REPO, true, false, http)
-                .await
-                .context("checking GitHub for a newer release")?;
-        let asset = release
-            .assets
+        let releases = http_client::github::github_releases(ACUTO_RELEASES_REPO, http)
+            .await
+            .context("checking GitHub for a newer release")?;
+        // The highest version that can actually be installed, not the first one
+        // GitHub lists: two tags built at once publish in whichever order they
+        // finish, and a release still uploading has no installer or checksum
+        // yet. Anything that cannot be installed is skipped, so one bad
+        // release never blocks the update behind it.
+        let (version, asset) = releases
             .iter()
-            .find(|asset| asset.name == asset_name)
-            .with_context(|| format!("release {} has no {asset_name}", release.tag_name))?;
-        // Required, not optional: the installer is run silently, so it must be
-        // the exact file that was published. GitHub records a SHA-256 for
-        // every release asset; without one there is nothing to check against.
-        let sha256 = asset
-            .digest
-            .clone()
-            .filter(|digest| !digest.is_empty())
-            .with_context(|| format!("release {} publishes no checksum", release.tag_name))?;
+            .filter(|release| !release.pre_release)
+            .filter_map(|release| {
+                let version = release.tag_name.trim_start_matches('v').parse::<Version>().ok()?;
+                let asset = release.assets.iter().find(|asset| asset.name == asset_name)?;
+                // Required, not optional: the installer is run silently, so it
+                // must be the exact file that was published. GitHub records a
+                // SHA-256 for every release asset; without one there is nothing
+                // to check against.
+                asset.digest.as_ref().filter(|digest| !digest.is_empty())?;
+                Some((version, asset))
+            })
+            .max_by(|(left, _), (right, _)| left.cmp(right))
+            .with_context(|| format!("no release publishes a complete {asset_name}"))?;
         Ok(ReleaseAsset {
-            version: release.tag_name.trim_start_matches('v').to_string(),
+            version: version.to_string(),
             url: asset.browser_download_url.clone(),
-            sha256: Some(sha256),
+            sha256: asset.digest.clone(),
         })
     }
 

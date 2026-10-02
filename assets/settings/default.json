@@ -14,7 +14,7 @@
     "light": "Acuto Frosted",
     "dark": "Acuto Noir",
   },
-  "icon_theme": "VS Code",
+  "icon_theme": "Acuto",
   // Which syntax palette colours code, independently of the theme.
   //
   //  - "acuto" — violet keywords and tags, gold types, no orange
@@ -85,7 +85,7 @@
   // The default font size for agent responses in the agent panel. Falls back to the UI font size if unset.
   "agent_ui_font_size": null,
   // The font family for user messages in the agent panel. Falls back to the buffer font family if unset.
-  "agent_buffer_font_family": null,
+  "agent_buffer_font_family": "Acuto Sans",
   // The default font size for user messages in the agent panel.
   "agent_buffer_font_size": 12,
   // The default font size for the commit editor in the git panel and commit modal.
@@ -2353,9 +2353,8 @@
   //
   // If you don't want any of these extensions, add this field to your settings
   // and change the value to `false`.
-  "auto_install_extensions": {
-    "html": true,
-  },
+  // HTML is built in, so nothing needs installing for it.
+  "auto_install_extensions": {},
   // The capabilities granted to extensions.
   //
   // This list can be customized to restrict what extensions are able to do.

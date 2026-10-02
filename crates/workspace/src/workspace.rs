@@ -4691,7 +4691,18 @@ impl Workspace {
             // the panel's name and icon, which needs the context too.
             let panel_item = PanelItem::new(panel, window, cx);
             let item = cx.new(|_| panel_item);
-            self.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            // Beside what is already open, not on top of it: the pane in front
+            // is halved and the panel takes the new half, so what you were
+            // looking at stays on screen. An empty pane just takes it.
+            let active_pane = self.active_pane().clone();
+            let target = if active_pane.read(cx).items_len() == 0 {
+                active_pane
+            } else {
+                self.find_pane_in_direction(SplitDirection::Right, cx)
+                    .filter(|pane| *pane != active_pane)
+                    .unwrap_or_else(|| self.split_pane(active_pane, SplitDirection::Right, window, cx))
+            };
+            self.add_item(target, Box::new(item), None, true, true, window, cx);
         }
         true
     }

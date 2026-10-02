@@ -1194,7 +1194,7 @@ impl TeamNotesPanel {
 
         let sent_background = cx.theme().players().local().cursor;
         let received_background = cx.theme().colors().elevated_surface_background;
-        let on_sent = gpui::hsla(0., 0., 1., 1.);
+        let on_sent = readable_on(sent_background);
         let empty = bubbles.is_empty();
 
         v_flex()
@@ -1423,7 +1423,7 @@ impl TeamNotesPanel {
         // active with an empty box is a button that does nothing when pressed.
         let ready = composing && !self.draft_is_empty(cx);
         let accent = cx.theme().players().local().cursor;
-        let on_accent = gpui::hsla(0., 0., 1., 1.);
+        let on_accent = readable_on(accent);
 
         h_flex()
             .flex_none()
@@ -1620,9 +1620,21 @@ fn initials_avatar(
         .child(
             Label::new(initials(name))
                 .size(LabelSize::XSmall)
-                .color(Color::Custom(gpui::hsla(0., 0., 1., 1.))),
+                .color(Color::Custom(readable_on(background))),
         )
         .into_any_element()
+}
+
+/// Whichever of white and near-black reads against `background`.
+///
+/// The local player's cursor colour is light in several dark themes, and fixed
+/// white text on it was white on white.
+fn readable_on(background: gpui::Hsla) -> gpui::Hsla {
+    if background.l > 0.6 {
+        gpui::hsla(0., 0., 0.08, 1.)
+    } else {
+        gpui::hsla(0., 0., 1., 1.)
+    }
 }
 
 /// `Drew Wycherley` as `DW`, `procoder30001` as `P`.

@@ -1,3 +1,4 @@
+use util::ResultExt as _;
 use crate::{
     Copy, CopyAndTrim, CopyPermalinkToLine, Cut, DisplayPoint, DisplaySnapshot, Editor,
     EvaluateSelectedText, FindAllReferences, GoToDeclaration, GoToDefinition, GoToImplementation,
@@ -344,7 +345,17 @@ pub fn deploy_context_menu(
                     !has_git_repo,
                     "View File History",
                     Box::new(git::FileHistory),
-                );
+                )
+                .separator()
+                // Dispatched by name: the selector lives in a crate that
+                // depends on this one. It used to sit in the status bar, where
+                // a language name is shown on every file all day.
+                .entry("Change Language Mode…", None, |window, cx| {
+                    if let Some(action) = cx.build_action("language_selector::Toggle", None).log_err()
+                    {
+                        window.dispatch_action(action, cx);
+                    }
+                });
             match focus {
                 Some(focus) => builder.context(focus),
                 None => builder,
