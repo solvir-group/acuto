@@ -7,7 +7,7 @@ use gpui::{
     ParentElement, Render, Role, SharedString, Styled, Subscription, WeakEntity, Window,
 };
 use settings::{SettingsContent, update_settings_file};
-use std::{any::TypeId, sync::Arc};
+use std::{any::TypeId, rc::Rc, sync::Arc};
 use theme::CLIENT_SIDE_DECORATION_ROUNDING;
 use ui::{ContextMenu, Divider, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu};
 
@@ -97,7 +97,17 @@ impl SidebarStatus {
     }
 }
 
+/// A checkable entry in the status bar's own right-click menu, for things the
+/// user can choose to show or hide that have no button to carry a "Hide" entry
+/// while hidden.
+struct StatusBarToggle {
+    label: SharedString,
+    is_on: Rc<dyn Fn(&App) -> bool>,
+    toggle: Rc<dyn Fn(&mut Window, &mut App)>,
+}
+
 pub struct StatusBar {
+    toggles: Vec<StatusBarToggle>,
     left_items: Vec<Box<dyn StatusItemViewHandle>>,
     right_items: Vec<Box<dyn StatusItemViewHandle>>,
     active_pane: Entity<Pane>,
@@ -116,7 +126,7 @@ impl Render for StatusBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = SidebarStatus::query(&self.multi_workspace, cx);
 
-        h_flex()
+        let bar = h_flex()
             .id("status-bar")
             .track_focus(&self.focus_handle)
             .key_context("StatusBar")
@@ -182,7 +192,44 @@ impl Render for StatusBar {
                     .border_color(cx.theme().colors().status_bar_background),
             })
             .child(self.render_left_tools(&sidebar, cx))
-            .child(self.render_right_tools(&sidebar, cx))
+            .child(self.render_right_tools(&sidebar, cx));
+
+        if self.toggles.is_empty() {
+            return bar.into_any_element();
+        }
+
+        let entries: Vec<(SharedString, bool, Rc<dyn Fn(&mut Window, &mut App)>)> = self
+            .toggles
+            .iter()
+            .map(|toggle| {
+                (
+                    toggle.label.clone(),
+                    (toggle.is_on)(cx),
+                    toggle.toggle.clone(),
+                )
+            })
+            .collect();
+
+        right_click_menu("status-bar-menu")
+            // Opens upward: the bar sits at the bottom edge of the window.
+            .anchor(Anchor::BottomRight)
+            .attach(Anchor::TopRight)
+            .trigger(move |_, _, _| bar)
+            .menu(move |window, cx| {
+                let entries = entries.clone();
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    entries.into_iter().fold(menu, |menu, (label, is_on, toggle)| {
+                        menu.toggleable_entry(
+                            label,
+                            is_on,
+                            IconPosition::Start,
+                            None,
+                            move |window, cx| toggle(window, cx),
+                        )
+                    })
+                })
+            })
+            .into_any_element()
     }
 }
 
@@ -331,6 +378,7 @@ impl StatusBar {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut this = Self {
+            toggles: Default::default(),
             left_items: Default::default(),
             right_items: Default::default(),
             active_pane: active_pane.clone(),
@@ -342,6 +390,23 @@ impl StatusBar {
         };
         this.update_active_pane_item(window, cx);
         this
+    }
+
+    /// Adds a checkable entry to the menu shown when right-clicking the bar's
+    /// empty space. `is_on` is read each time the bar renders.
+    pub fn add_toggle(
+        &mut self,
+        label: impl Into<SharedString>,
+        is_on: impl Fn(&App) -> bool + 'static,
+        toggle: impl Fn(&mut Window, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggles.push(StatusBarToggle {
+            label: label.into(),
+            is_on: Rc::new(is_on),
+            toggle: Rc::new(toggle),
+        });
+        cx.notify();
     }
 
     pub fn set_multi_workspace(

@@ -39,19 +39,37 @@ pub struct FocusTimer {
     /// second field, so the two can never drift apart.
     elapsed: Duration,
     running: bool,
+    /// Hidden until the user asks for it from the status bar's right-click
+    /// menu. While hidden it does not tick.
+    visible: bool,
     _tick: Option<Task<()>>,
 }
 
 impl FocusTimer {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let mut this = Self {
+    pub fn new(_cx: &mut Context<Self>) -> Self {
+        Self {
             mode: TimerMode::Stopwatch,
             elapsed: Duration::ZERO,
             running: false,
+            visible: false,
             _tick: None,
-        };
-        this.start(cx);
-        this
+        }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn toggle_visible(&mut self, cx: &mut Context<Self>) {
+        self.visible = !self.visible;
+        if self.visible {
+            self.elapsed = Duration::ZERO;
+            self.start(cx);
+        } else {
+            self.running = false;
+            self._tick = None;
+        }
+        cx.notify();
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
@@ -148,6 +166,9 @@ impl FocusTimer {
 
 impl Render for FocusTimer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.visible {
+            return div().into_any_element();
+        }
         let entity = cx.entity();
         let label = self.label();
         let running = self.running;
@@ -245,6 +266,7 @@ impl Render for FocusTimer {
                         })
                 })
             })
+            .into_any_element()
     }
 }
 

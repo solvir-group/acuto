@@ -6088,9 +6088,50 @@ impl GitPanel {
         )
     }
 
+    /// Whether the only useful remote action is pushing: commits to send, or a
+    /// branch with no upstream yet.
+    fn is_push_only(branch: &Branch) -> bool {
+        match branch.upstream.as_ref() {
+            Some(Upstream {
+                tracking: UpstreamTracking::Tracked(UpstreamTrackingStatus { ahead, behind }),
+                ..
+            }) => *ahead > 0 && *behind == 0,
+            Some(Upstream {
+                tracking: UpstreamTracking::Gone,
+                ..
+            })
+            | None => true,
+        }
+    }
+
     pub(crate) fn render_remote_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.render_remote_button_where(|_| true, cx)
+    }
+
+    /// The push button lives beside the latest commit, as in VS Code, so the
+    /// repository footer only renders the remote button for other states
+    /// (fetch, pull). `in_commit_bar` selects which of the two is being drawn.
+    fn render_remote_button_in(
+        &self,
+        in_commit_bar: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        self.render_remote_button_where(
+            |branch| Self::is_push_only(branch) == in_commit_bar,
+            cx,
+        )
+    }
+
+    fn render_remote_button_where(
+        &self,
+        should_render: impl Fn(&Branch) -> bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let branch = self.active_repository.as_ref()?.read(cx).branch.clone();
         if !self.can_push_and_pull(cx) {
+            return None;
+        }
+        if branch.as_ref().is_some_and(|branch| !should_render(branch)) {
             return None;
         }
         Some(
@@ -6448,6 +6489,7 @@ impl GitPanel {
                 .child(
                     h_flex()
                         .gap_0p5()
+                        .children(self.render_remote_button_in(true, cx))
                         .when(commit.has_parent, |this| {
                             let has_unstaged = self.has_unstaged_changes();
                             this.child(
@@ -9115,7 +9157,7 @@ impl RenderOnce for PanelRepoFooter {
                     .child(div().child(branch_selector).min_w_0()),
             )
             .children(if let Some(git_panel) = self.git_panel {
-                git_panel.update(cx, |git_panel, cx| git_panel.render_remote_button(cx))
+                git_panel.update(cx, |git_panel, cx| git_panel.render_remote_button_in(false, cx))
             } else {
                 None
             })

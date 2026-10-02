@@ -661,7 +661,16 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_right_item(layout_presets, window, cx);
             status_bar.add_right_item(live_server, window, cx);
             status_bar.add_right_item(auto_style, window, cx);
-            status_bar.add_right_item(focus_timer, window, cx);
+            status_bar.add_right_item(focus_timer.clone(), window, cx);
+            status_bar.add_toggle(
+                "Show Timer",
+                {
+                    let focus_timer = focus_timer.clone();
+                    move |cx| focus_timer.read(cx).is_visible()
+                },
+                move |_, cx| focus_timer.update(cx, |timer, cx| timer.toggle_visible(cx)),
+                cx,
+            );
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);
