@@ -136,29 +136,47 @@ impl AgentTool for SemanticSearchTool {
             let index: Entity<CodebaseIndex> = cx
                 .update(|cx| codebase_index::index_for_project(&project, cx))
                 .ok_or_else(|| SemanticSearchToolOutput::Error {
-                    error: "Semantic search is not configured: no embedding endpoint is set. \
-                            Use the `grep` tool instead."
+                    error: "Semantic search is not configured: no embedding endpoint, or no \
+                            API key for a remote one (ACUTO_EMBEDDING_API_KEY or \
+                            NVIDIA_API_KEY). Use the `grep` tool instead."
                         .into(),
                 })?;
 
             // Built on first use rather than at startup: indexing costs real
             // money per token, so it happens when the capability is actually
-            // asked for, and the cost is reported in the result.
-            let indexed_now = index.read_with(cx, |index, _| index.is_empty());
+            // asked for. Brought up to date on every search after that, which
+            // only embeds the chunks that changed -- the rest are reused by
+            // digest -- so results never come from code that is gone.
+            let (is_empty, is_indexing, root) = index.read_with(cx, |index, _| {
+                (
+                    index.is_empty(),
+                    index.is_indexing(),
+                    index.worktree_root().to_path_buf(),
+                )
+            });
 
-            if indexed_now {
+            if is_indexing {
+                if is_empty {
+                    return Err(SemanticSearchToolOutput::Error {
+                        error: "The codebase index is still being built. Use the `grep` \
+                                tool for now, or try again shortly."
+                            .into(),
+                    });
+                }
+            } else {
                 let files = cx
-                    .update(|cx| codebase_index::collect_project_files(&project, cx))
-                    .into_iter()
-                    .map(|(_root, relative, text)| (relative, text))
-                    .collect::<Vec<_>>();
+                    .update(|cx| codebase_index::collect_project_files(&project, &root, cx))
+                    .await;
 
                 let rebuild = index.update(cx, |index, cx| index.rebuild(files, cx));
 
                 if let Err(error) = rebuild.await {
-                    return Err(SemanticSearchToolOutput::Error {
-                        error: format!("Could not build the codebase index: {error:#}"),
-                    });
+                    if is_empty {
+                        return Err(SemanticSearchToolOutput::Error {
+                            error: format!("Could not build the codebase index: {error:#}"),
+                        });
+                    }
+                    log::warn!("could not refresh the codebase index: {error:#}");
                 }
             }
 

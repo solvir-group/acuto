@@ -33,7 +33,7 @@ use std::{
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::AsyncReadExt as _;
-use gpui::{App, AppContext, Context, Entity, Task};
+use gpui::{App, AppContext, Context, Entity, Task, TaskExt as _};
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -73,15 +73,41 @@ impl EmbeddingConfig {
         if api_url.trim().is_empty() || model.trim().is_empty() {
             return None;
         }
+        let api_key: Option<Arc<str>> = std::env::var("ACUTO_EMBEDDING_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .map(Into::into);
+        // Without a key a remote provider refuses every request, and only
+        // after the code in it has already been sent. A server on this machine
+        // may need none.
+        if api_key.is_none() && !is_loopback_url(&api_url) {
+            return None;
+        }
         Some(Self {
             api_url: api_url.into(),
             model: model.into(),
-            api_key: std::env::var("ACUTO_EMBEDDING_API_KEY")
-                .ok()
-                .filter(|key| !key.trim().is_empty())
-                .map(Into::into),
+            api_key,
         })
     }
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = match authority.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => authority.rsplit_once(':').map_or(authority, |(host, _)| host),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 /// One indexed window of a file.
@@ -153,6 +179,21 @@ pub fn chunk_text(path: &Path, text: &str) -> Vec<(Chunk, String)> {
 struct EmbeddingRequest<'a> {
     model: &'a str,
     input: &'a [String],
+    /// NVIDIA's retrieval models embed queries and documents differently and
+    /// refuse a request that does not say which this is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_type: Option<&'static str>,
+    /// NVIDIA refuses an input past the model's length instead of cutting it
+    /// unless asked to truncate, and a 40-line chunk of code is often longer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    truncate: Option<&'static str>,
+}
+
+/// What a batch of text is being embedded as.
+#[derive(Clone, Copy)]
+enum InputKind {
+    Query,
+    Passage,
 }
 
 #[derive(Deserialize)]
@@ -189,14 +230,22 @@ async fn embed_batch(
     http_client: Arc<dyn HttpClient>,
     config: &EmbeddingConfig,
     inputs: &[String],
+    kind: InputKind,
 ) -> Result<Vec<Vec<f32>>> {
     if inputs.is_empty() {
         return Ok(Vec::new());
     }
 
+    // Only NVIDIA's API takes these; OpenAI's refuses fields it does not know.
+    let is_nvidia = config.api_url.contains("api.nvidia.com");
     let body = serde_json::to_string(&EmbeddingRequest {
         model: &config.model,
         input: inputs,
+        input_type: is_nvidia.then_some(match kind {
+            InputKind::Query => "query",
+            InputKind::Passage => "passage",
+        }),
+        truncate: is_nvidia.then_some("END"),
     })?;
 
     let mut builder = http_client::Request::builder()
@@ -302,6 +351,11 @@ impl CodebaseIndex {
         self.chunks.is_empty()
     }
 
+    /// The folder this index covers.
+    pub fn worktree_root(&self) -> &Path {
+        &self.worktree_root
+    }
+
     pub fn is_indexing(&self) -> bool {
         self.indexing
     }
@@ -356,27 +410,31 @@ impl CodebaseIndex {
         Ok(true)
     }
 
-    fn save(&self) -> Result<()> {
+    /// Writes the index to disk off the main thread: the vectors run to
+    /// megabytes, and the index is saved after every refresh.
+    fn save(&self, cx: &App) -> Task<Result<()>> {
         let (metadata_path, vector_path) = index_paths(&self.worktree_root);
-        if let Some(parent) = metadata_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let metadata = PersistedIndex {
+            model: self.config.model.to_string(),
+            dimensions: self.dimensions,
+            chunks: self.chunks.clone(),
+        };
+        let vectors = self.vectors.clone();
+        cx.background_spawn(async move {
+            if let Some(parent) = metadata_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&metadata_path, serde_json::to_string(&metadata)?)?;
 
-        std::fs::write(
-            &metadata_path,
-            serde_json::to_string(&PersistedIndex {
-                model: self.config.model.to_string(),
-                dimensions: self.dimensions,
-                chunks: self.chunks.clone(),
-            })?,
-        )?;
-
-        let mut file = std::fs::File::create(&vector_path)?;
-        for value in &self.vectors {
-            file.write_all(&value.to_le_bytes())?;
-        }
-        file.flush()?;
-        Ok(())
+            let mut bytes = Vec::with_capacity(vectors.len() * std::mem::size_of::<f32>());
+            for value in &vectors {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            let mut file = std::fs::File::create(&vector_path)?;
+            file.write_all(&bytes)?;
+            file.flush()?;
+            Ok(())
+        })
     }
 
     /// Embeds a query and returns the closest chunks.
@@ -388,7 +446,7 @@ impl CodebaseIndex {
     ) -> Task<Result<Vec<SearchResult>>> {
         if self.chunks.is_empty() {
             return Task::ready(Err(anyhow!(
-                "the codebase index is empty; run `codebase index: rebuild` first"
+                "the codebase index is empty; it is built the first time semantic search runs"
             )));
         }
 
@@ -402,7 +460,13 @@ impl CodebaseIndex {
         };
 
         cx.background_spawn(async move {
-            let embedded = embed_batch(http_client, &config, std::slice::from_ref(&query)).await?;
+            let embedded = embed_batch(
+                http_client,
+                &config,
+                std::slice::from_ref(&query),
+                InputKind::Query,
+            )
+            .await?;
             let query_vector = embedded
                 .into_iter()
                 .next()
@@ -479,7 +543,8 @@ impl CodebaseIndex {
                         pending_texts.chunks(EMBED_BATCH_SIZE).enumerate()
                     {
                         let embedded =
-                            embed_batch(http_client.clone(), &config, batch).await?;
+                            embed_batch(http_client.clone(), &config, batch, InputKind::Passage)
+                                .await?;
                         for (offset, vector) in embedded.into_iter().enumerate() {
                             if dimensions == 0 {
                                 dimensions = vector.len();
@@ -529,9 +594,7 @@ impl CodebaseIndex {
                         this.chunks = chunks;
                         this.vectors = vectors;
                         this.dimensions = dimensions;
-                        if let Err(error) = this.save() {
-                            log::error!("could not persist the codebase index: {error:#}");
-                        }
+                        this.save(cx).detach_and_log_err(cx);
                         Ok(count)
                     }
                     Err(error) => Err(error),
@@ -606,29 +669,37 @@ fn rank(snapshot: &IndexSnapshot, query: &[f32], limit: usize) -> Vec<SearchResu
 /// Collects indexable file contents from a project's worktrees.
 pub fn collect_project_files(
     project: &Entity<project::Project>,
+    root: &Path,
     cx: &App,
-) -> Vec<(PathBuf, PathBuf, String)> {
-    let mut collected = Vec::new();
-
+) -> Task<Vec<(PathBuf, String)>> {
+    // Only the folder the index is rooted at: its paths are stored relative to
+    // that root, so a file from another folder could be embedded and paid for
+    // but never found again.
+    let mut paths = Vec::new();
     for worktree in project.read(cx).worktrees(cx) {
         let snapshot = worktree.read(cx).snapshot();
-        let root = snapshot.abs_path().to_path_buf();
-
+        if snapshot.abs_path().as_ref() != root {
+            continue;
+        }
         for entry in snapshot.files(false, 0) {
             if entry.size > MAX_FILE_BYTES {
                 continue;
             }
-            let absolute = root.join(entry.path.as_std_path());
-            // Non-UTF8 files read as an error here, which is the intended
-            // filter: binaries have nothing to embed.
-            let Ok(text) = std::fs::read_to_string(&absolute) else {
-                continue;
-            };
-            collected.push((root.clone(), entry.path.as_std_path().to_path_buf(), text));
+            paths.push(entry.path.as_std_path().to_path_buf());
         }
     }
-
-    collected
+    let root = root.to_path_buf();
+    // Read off the main thread: a whole project's files take long enough to
+    // freeze the window.
+    cx.background_spawn(async move {
+        paths
+            .into_iter()
+            .filter_map(|relative| {
+                let text = std::fs::read_to_string(root.join(&relative)).ok()?;
+                Some((relative, text))
+            })
+            .collect()
+    })
 }
 
 /// One index per worktree root, shared by everything that asks for it.

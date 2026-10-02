@@ -298,7 +298,7 @@ impl TerminalView {
             cx.observe_global::<SettingsStore>(Self::settings_changed),
         ];
 
-        Self {
+        let this = Self {
             terminal,
             workspace: workspace_handle,
             project,
@@ -317,29 +317,13 @@ impl TerminalView {
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
             failure_notice: None,
-            history: {
-                let mut history = terminal_completion::HistoryStore::new(
-                    uuid::Uuid::new_v4().to_string(),
-                    terminal_completion::DEFAULT_HISTORY_LIMIT,
-                );
-                // Seeded so the very first prompt already suggests. Nothing is
-                // written back to the shell's file; it belongs to the shell.
-                let program = TerminalSettings::get_global(cx).shell.program();
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|elapsed| elapsed.as_secs() as i64)
-                    .unwrap_or_default();
-                if let Some(kind) = terminal_completion::ShellHistoryKind::from_program(&program) {
-                    let seeded = history.seed_from_shell_history(kind, now);
-                    log::info!("terminal completion: seeded {seeded} commands from {kind:?}");
-                }
-                // Everything installed, not only everything already typed. A
-                // history-only completion is blind to the tool the user just
-                // installed, which is exactly when they need help spelling it.
-                let from_path = history.seed_from_path_commands(now);
-                log::info!("terminal completion: seeded {from_path} commands from PATH");
-                history
-            },
+            // Filled in the background by `load_history`: reading the shell's
+            // history file and every directory on PATH took long enough to
+            // stall the window each time a terminal opened.
+            history: terminal_completion::HistoryStore::new(
+                uuid::Uuid::new_v4().to_string(),
+                terminal_completion::DEFAULT_HISTORY_LIMIT,
+            ),
             suggestion: None,
             suggestion_dismissed_for: None,
             scroll_handle,
@@ -351,7 +335,66 @@ impl TerminalView {
             rename_editor_subscription: None,
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
-        }
+        };
+        this.load_history(cx);
+        this
+    }
+
+    /// Fills command history: commands recorded in earlier sessions, then the
+    /// shell's own history file, then everything on PATH, ranked in that
+    /// order. Done off the main thread and merged under whatever this session
+    /// has already recorded.
+    fn load_history(&self, cx: &mut Context<Self>) {
+        let session_id = self.history.session_id().to_string();
+        let program = TerminalSettings::get_global(cx).shell.program();
+        let database = terminal_completion::TerminalHistoryDb::global(cx);
+        cx.spawn(async move |this, cx| {
+            let saved = database
+                .recent(terminal_completion::DEFAULT_HISTORY_LIMIT)
+                .await
+                .log_err()
+                .unwrap_or_default();
+            database
+                .prune(terminal_completion::DEFAULT_HISTORY_LIMIT)
+                .await
+                .log_err();
+            let seeded = cx
+                .background_spawn(async move {
+                    let mut history = terminal_completion::HistoryStore::new(
+                        session_id,
+                        terminal_completion::DEFAULT_HISTORY_LIMIT,
+                    );
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_secs() as i64)
+                        .unwrap_or_default();
+                    // Everything installed, not only everything already typed.
+                    // A history-only completion is blind to the tool the user
+                    // just installed, which is exactly when they need help
+                    // spelling it. Nothing is written back to the shell's file.
+                    let from_path = history.seed_from_path_commands(now);
+                    if let Some(kind) = terminal_completion::ShellHistoryKind::from_program(&program)
+                    {
+                        let from_shell = history.seed_from_shell_history(kind, now);
+                        log::info!("terminal completion: seeded {from_shell} commands from {kind:?}");
+                    }
+                    log::info!("terminal completion: seeded {from_path} commands from PATH");
+                    for entry in saved {
+                        history.record(entry);
+                    }
+                    history
+                })
+                .await;
+            this.update(cx, |this, _| {
+                let mut seeded = seeded;
+                for entry in this.history.entries().to_vec() {
+                    seeded.record(entry);
+                }
+                this.history = seeded;
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Enable 'embedded' mode where the terminal displays the full content with an optional limit of lines.
@@ -1439,14 +1482,21 @@ impl TerminalView {
 
         let session_id = self.history.session_id().to_string();
         for command in finished {
-            self.history.record(terminal_completion::HistoryEntry {
+            let entry = terminal_completion::HistoryEntry {
                 command: command.command,
                 cwd: command.cwd,
                 exit_code: command.exit_code,
                 started_at: command.started_at,
                 duration_ms: command.duration_ms,
                 session_id: session_id.clone(),
-            });
+            };
+            if self.history.record(entry.clone()) {
+                // Kept for later sessions, or history only ever knew what the
+                // shell's own file had.
+                let database = terminal_completion::TerminalHistoryDb::global(cx);
+                cx.background_spawn(async move { database.record(entry).await })
+                    .detach_and_log_err(cx);
+            }
         }
 
         let previous = self.suggestion.take();

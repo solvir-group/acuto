@@ -259,12 +259,8 @@ impl AgentTool for UpdateIdeSettingTool {
                 });
             }
 
-            let settings_path = paths::settings_file().clone();
-            let text = std::fs::read_to_string(&settings_path).map_err(|error| {
-                IdeControlOutput::Error {
-                    error: format!("Could not read {}: {error}", settings_path.display()),
-                }
-            })?;
+            let (settings_path, text) =
+                read_settings_file().map_err(|error| IdeControlOutput::Error { error })?;
 
             let current: Value = settings_json::parse_json_with_comments(&text).map_err(|error| {
                 IdeControlOutput::Error {
@@ -272,11 +268,21 @@ impl AgentTool for UpdateIdeSettingTool {
                 }
             })?;
 
+            // Read without asking, so anything that looks like a credential --
+            // an API key in a context server's environment -- is withheld.
             let existing = input
                 .key_path
                 .iter()
                 .try_fold(&current, |value, key| value.get(key.as_str()))
-                .cloned();
+                .cloned()
+                .map(|mut value| {
+                    if input.key_path.iter().any(|key| is_secret_key(key)) {
+                        value = Value::String("[redacted]".into());
+                    } else {
+                        redact_secrets(&mut value);
+                    }
+                    value
+                });
 
             let Some(new_value) = input.value.clone() else {
                 return Ok(IdeControlOutput::Success {
@@ -343,11 +349,22 @@ impl AgentTool for UpdateIdeSettingTool {
                 });
             }
 
-            std::fs::write(&settings_path, &updated).map_err(|error| {
-                IdeControlOutput::Error {
-                    error: format!("Could not write {}: {error}", settings_path.display()),
-                }
-            })?;
+            // Written beside the file and moved into place, so a crash or a
+            // full disk mid-write leaves the old settings rather than a
+            // truncated file.
+            let staging =
+                settings_path.with_extension(format!("json.{}.tmp", std::process::id()));
+            settings_path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&staging, &updated))
+                .and_then(|()| std::fs::rename(&staging, &settings_path))
+                .map_err(|error| {
+                    std::fs::remove_file(&staging).ok();
+                    IdeControlOutput::Error {
+                        error: format!("Could not write {}: {error}", settings_path.display()),
+                    }
+                })?;
 
             Ok(IdeControlOutput::Success {
                 message: format!(
@@ -355,6 +372,46 @@ impl AgentTool for UpdateIdeSettingTool {
                 ),
             })
         })
+    }
+}
+
+/// The settings file to edit, and its text.
+///
+/// A symlinked settings file is resolved, so the write lands in the real file
+/// instead of replacing the link. A missing file is an empty one: a fresh
+/// install has none until something is first changed.
+fn read_settings_file() -> Result<(std::path::PathBuf, String), String> {
+    let link = paths::settings_file().clone();
+    let path = std::fs::canonicalize(&link).unwrap_or(link);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok((path, text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok((path, "{\n}\n".to_string()))
+        }
+        Err(error) => Err(format!("Could not read {}: {error}", path.display())),
+    }
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["key", "token", "secret", "password", "passwd", "credential", "auth", "env"]
+        .iter()
+        .any(|word| key.contains(word))
+}
+
+fn redact_secrets(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                if is_secret_key(key) {
+                    *value = Value::String("[redacted]".into());
+                } else {
+                    redact_secrets(value);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_secrets),
+        _ => {}
     }
 }
 

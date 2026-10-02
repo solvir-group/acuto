@@ -129,7 +129,11 @@ impl BlockHistory {
         exit_code: Option<i32>,
         raw_output: &str,
     ) -> BlockId {
-        let (output, redacted) = redact_secrets(raw_output);
+        let (output, output_redacted) = redact_secrets(raw_output);
+        // The command line holds secrets as often as its output does --
+        // `export TOKEN=...`, `curl -H "Authorization: ..."`.
+        let (command, command_redacted) = redact_secrets(&command);
+        let redacted = output_redacted || command_redacted;
         let (output, truncated) = cap_output(output);
 
         let id = BlockId(self.next_id);
@@ -204,7 +208,9 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
         // PEM private keys, on the header alone: the body is the secret and it
         // spans lines, so the header is what marks the region.
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+        // The whole block, not just its first line: the header is not the
+        // secret, the base64 under it is.
+        r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\z)",
         // Named assignments. Deliberately requires a value of some length: a
         // bare `TOKEN=` in a script is not a leak.
         r"(?i)\b[A-Za-z0-9_]*(?:api[_-]?key|secret|token|password|passwd|credential|auth)[A-Za-z0-9_]*\s*[=:]\s*\S{8,}",
@@ -226,7 +232,7 @@ const REDACTION: &str = "[redacted]";
 /// Returns whether anything was replaced. False positives here cost the user a
 /// redacted word in their own scrollback; false negatives cost them a leaked
 /// key, so the patterns lean towards matching.
-fn redact_secrets(output: &str) -> (String, bool) {
+pub fn redact_secrets(output: &str) -> (String, bool) {
     let mut text = output.to_string();
     let mut redacted = false;
     for pattern in SECRET_PATTERNS.iter() {

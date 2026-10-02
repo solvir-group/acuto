@@ -29,7 +29,11 @@ pub enum Event {
     /// `OSC 133;B` is reporting. Events are delivered asynchronously, so by the
     /// time a consumer sees this the grid has usually moved on — for a prompt
     /// marker, past everything the user has since typed.
-    Osc { params: Vec<Vec<u8>>, cursor: Point },
+    ///
+    /// `history_size` is the scrollback length at the same moment. A row's
+    /// `line + history_size` stays fixed as output scrolls it upward, which is
+    /// what lets a consumer find the row again later.
+    Osc { params: Vec<Vec<u8>>, cursor: Point, history_size: usize },
 
     /// Window title change.
     Title(String),
@@ -82,7 +86,7 @@ impl Debug for Event {
             Event::TextAreaSizeRequest(_) => write!(f, "TextAreaSizeRequest"),
             Event::ColorRequest(index, _) => write!(f, "ColorRequest({index})"),
             Event::PtyWrite(text) => write!(f, "PtyWrite({text})"),
-            Event::Osc { params, cursor } => {
+            Event::Osc { params, cursor, .. } => {
                 let rendered: Vec<String> = params
                     .iter()
                     .map(|param| String::from_utf8_lossy(param).into_owned())

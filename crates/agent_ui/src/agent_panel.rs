@@ -4490,6 +4490,16 @@ impl AgentPanel {
         // user actually wrote in stays in history and is only dropped from
         // memory, so closing a tab is never destructive to real work.
         let view = self.conversation_view_for_tab(&id, cx).cloned();
+        // Dropping a thread mid-turn tears down its task without telling the
+        // agent, which keeps working -- writing files that nothing is left
+        // tracking for review. Stopped properly first.
+        if let Some(thread) = view.as_ref().and_then(|view| view.read(cx).root_thread(cx))
+            && thread.read(cx).status() == acp_thread::ThreadStatus::Generating
+        {
+            thread
+                .update(cx, |thread, cx| thread.cancel(cx))
+                .detach();
+        }
         let is_empty_draft = self.ephemeral_draft_thread_id(cx) == Some(id)
             && !view
                 .as_ref()

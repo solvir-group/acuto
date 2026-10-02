@@ -171,9 +171,7 @@ dependencies = [
  "ctor",
  "fs",
  "futures 0.3.32",
- "git",
  "gpui",
- "indoc",
  "language",
  "log",
  "pretty_assertions",
@@ -184,7 +182,6 @@ dependencies = [
  "telemetry",
  "text",
  "util",
- "watch",
  "zlog",
 ]
 
@@ -676,6 +673,7 @@ dependencies = [
  "heapless",
  "html_to_markdown",
  "http_client",
+ "ide_control_mcp",
  "idna",
  "image",
  "indoc",

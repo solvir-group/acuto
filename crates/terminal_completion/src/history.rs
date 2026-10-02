@@ -203,8 +203,12 @@ impl HistoryStore {
             ..entry
         });
 
-        while self.entries.len() > self.limit {
-            self.entries.remove(0);
+        // Evicted in batches: removing from the front one entry at a time
+        // shifts the whole list on every record, which made seeding thousands
+        // of commands quadratic.
+        if self.entries.len() > self.limit + self.limit / 4 {
+            let excess = self.entries.len() - self.limit;
+            self.entries.drain(..excess);
         }
         true
     }

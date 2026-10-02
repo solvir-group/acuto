@@ -1070,6 +1070,7 @@ impl<T: EventListener> Handler for Term<T> {
             // asynchronously, and a prompt marker's whole meaning is where the
             // cursor was when it arrived.
             cursor: self.grid.cursor.point,
+            history_size: self.grid.history_size(),
         });
     }
 

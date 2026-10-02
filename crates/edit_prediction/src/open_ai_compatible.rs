@@ -318,6 +318,7 @@ async fn send_anthropic_messages_request(
     let mut http_request_builder = http_client::Request::builder()
         .method(http_client::Method::POST)
         .uri(settings.api_url.as_ref())
+        .timeout(PREDICTION_TIMEOUT)
         .header("Content-Type", "application/json")
         // Pinned rather than tracking latest: a version bump can change response
         // shapes, and a completion engine that breaks on someone else's release
@@ -446,29 +447,51 @@ async fn send_chat_completion_request(
         ],
     });
 
-    let rejects_reasoning_effort =
-        servers_rejecting_reasoning_effort(|servers| servers.contains(&*settings.api_url));
-    if rejects_reasoning_effort && let Some(fields) = body.as_object_mut() {
-        fields.remove("reasoning_effort");
-    }
+    // Fields not every server accepts. A server that refuses one is
+    // remembered, so only its first request pays for the retry.
+    const OPTIONAL_FIELDS: [&str; 2] = ["reasoning_effort", "chat_template_kwargs"];
+    servers_rejecting_fields(|rejected| {
+        if let Some(fields) = body.as_object_mut() {
+            for field in OPTIONAL_FIELDS {
+                if rejected.contains(&(settings.api_url.to_string(), field.to_string())) {
+                    fields.remove(field);
+                }
+            }
+            if rejected.contains(&(settings.api_url.to_string(), "max_tokens".to_string()))
+                && let Some(max_tokens) = fields.remove("max_tokens")
+            {
+                fields.insert("max_completion_tokens".to_string(), max_tokens);
+            }
+        }
+    });
 
     let (mut status, mut response_body) =
         post_chat_completion(settings, &api_key, &body, http_client).await?;
 
-    // Some servers reject the field outright rather than ignoring it -- OpenAI
-    // does for models that do not reason. Those get the request again without
-    // it, and are remembered, so the switch costs them one round trip once
-    // rather than on every keystroke.
-    if !rejects_reasoning_effort
-        && status == http_client::StatusCode::BAD_REQUEST
-        && response_body.contains("reasoning_effort")
-    {
-        log::info!("fim: server rejects reasoning_effort; retrying without it");
-        servers_rejecting_reasoning_effort(|servers| {
-            servers.insert(settings.api_url.to_string());
+    // Each refusal names one field; a server can refuse several in turn.
+    for _ in 0..OPTIONAL_FIELDS.len() + 1 {
+        if status != http_client::StatusCode::BAD_REQUEST {
+            break;
+        }
+        let Some(fields) = body.as_object_mut() else {
+            break;
+        };
+        let refused = OPTIONAL_FIELDS
+            .into_iter()
+            .chain(["max_tokens"])
+            .find(|field| fields.contains_key(*field) && response_body.contains(field));
+        let Some(refused) = refused else {
+            break;
+        };
+        log::info!("fim: server rejects {refused}; retrying without it");
+        servers_rejecting_fields(|rejected| {
+            rejected.insert((settings.api_url.to_string(), refused.to_string()));
         });
-        if let Some(fields) = body.as_object_mut() {
-            fields.remove("reasoning_effort");
+        if let Some(value) = fields.remove(refused)
+            && refused == "max_tokens"
+        {
+            // OpenAI's newer models take the same limit under a new name.
+            fields.insert("max_completion_tokens".to_string(), value);
         }
         (status, response_body) =
             post_chat_completion(settings, &api_key, &body, http_client).await?;
@@ -512,10 +535,10 @@ async fn send_chat_completion_request(
 
 /// Endpoints that answered a request carrying `reasoning_effort` with an error
 /// about it, for the rest of the session.
-fn servers_rejecting_reasoning_effort<R>(
-    f: impl FnOnce(&mut std::collections::HashSet<String>) -> R,
+fn servers_rejecting_fields<R>(
+    f: impl FnOnce(&mut std::collections::HashSet<(String, String)>) -> R,
 ) -> R {
-    static SERVERS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    static SERVERS: std::sync::Mutex<Option<std::collections::HashSet<(String, String)>>> =
         std::sync::Mutex::new(None);
     // A poisoned lock only means another prediction panicked mid-insert; the
     // set is still a set, so it is used as it stands.

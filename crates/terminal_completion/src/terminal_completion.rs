@@ -30,5 +30,5 @@ pub mod shell_history;
 /// small enough that ranking over it stays instant.
 pub const DEFAULT_HISTORY_LIMIT: usize = 10_000;
 
-pub use history::{HistoryEntry, HistoryStore, Suggestion};
+pub use history::{HistoryEntry, HistoryStore, Suggestion, TerminalHistoryDb};
 pub use shell_history::ShellHistoryKind;

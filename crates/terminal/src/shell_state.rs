@@ -357,8 +357,10 @@ fn percent_decode(input: &str) -> String {
 
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = &input[index + 1..index + 3];
-            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+            // Bytes, not a `&str` slice: the two after `%` may be the start of
+            // a multi-byte character, and slicing there panics.
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+            if let Some(byte) = hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
                 out.push(byte);
                 index += 3;
                 continue;
@@ -377,6 +379,12 @@ mod tests {
 
     fn osc(parts: &[&str]) -> Vec<Vec<u8>> {
         parts.iter().map(|part| part.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn a_percent_before_a_multibyte_character_does_not_panic() {
+        assert_eq!(percent_decode("/%a\u{e9}"), "/%a\u{e9}");
+        assert_eq!(percent_decode("/%20x"), "/ x");
     }
 
     const CURSOR: GridPoint = GridPoint { line: 4, column: 7 };

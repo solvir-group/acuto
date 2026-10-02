@@ -3518,11 +3518,8 @@ impl ThreadView {
                         move |_, _, cx| {
                             action_log.update(cx, |action_log, cx| {
                                 action_log
-                                    .reject_edits_in_ranges(
+                                    .reject_all_edits_in_buffer(
                                         buffer.clone(),
-                                        vec![Anchor::min_max_range_for_buffer(
-                                            buffer.read(cx).remote_id(),
-                                        )],
                                         Some(telemetry.clone()),
                                         cx,
                                     )
@@ -3542,9 +3539,8 @@ impl ThreadView {
                         let telemetry = telemetry.clone();
                         move |_, _, cx| {
                             action_log.update(cx, |action_log, cx| {
-                                action_log.keep_edits_in_range(
+                                action_log.keep_all_edits_in_buffer(
                                     buffer.clone(),
-                                    Anchor::min_max_range_for_buffer(buffer.read(cx).remote_id()),
                                     Some(telemetry.clone()),
                                     cx,
                                 );
@@ -13164,7 +13160,7 @@ fn strip_leading_command(text: &str, command_name: &str) -> String {
 
 /// How wide a sent prompt's bubble is: its longest line as the composer draws
 /// it, plus the bubble's padding and border. Capped by the caller.
-fn user_bubble_width(text: &str, window: &mut Window, cx: &App) -> Pixels {
+fn user_bubble_width(text: &str, window: &Window, cx: &App) -> Pixels {
     /// `px_2p5` either side, the one-pixel border, and room for the caret.
     const CHROME: f32 = 10. * 2. + 2. + 4.;
     let settings = theme_settings::ThemeSettings::get_global(cx);

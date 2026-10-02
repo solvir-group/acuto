@@ -35,6 +35,11 @@ pub struct BufferDiff {
     /// part -- accepting any of it accepts all of it. Agent review sets this;
     /// diffs against git do not.
     line_granularity: bool,
+    /// The changes to draw on the next update, a line at a time, in place of
+    /// computing them. Set by [`BufferDiff::set_base_text_with_line_changes`],
+    /// with the buffer version they describe: against any other version their
+    /// rows are stale, and the diff is computed instead.
+    line_changes: Option<(clock::Global, Arc<[(Range<u32>, Range<u32>)]>)>,
 }
 
 /// Where this diff's base text came from. Only diffs whose base is HEAD
@@ -1256,6 +1261,43 @@ fn compute_hunks(
 
     tree
 }
+/// The hunks `line_changes` describe, or `None` when they cannot describe
+/// these texts: out of either text's range, or out of order. The caller then
+/// computes the diff instead of drawing hunks on the wrong lines.
+fn compute_hunks_from_line_changes(
+    diff_base: &str,
+    diff_base_rope: &Rope,
+    buffer: &text::BufferSnapshot,
+    diff_options: Option<&DiffOptions>,
+    line_changes: &[(Range<u32>, Range<u32>)],
+) -> Option<SumTree<InternalDiffHunk>> {
+    let mut tree = SumTree::new(buffer);
+    let mut sink = HunkSink::new(diff_base, diff_base_rope, buffer, diff_options);
+    let base_line_count = sink.old_line_offsets.len().saturating_sub(1) as u32;
+    let buffer_line_count = buffer.max_point().row + 1;
+    let mut previous: Option<&(Range<u32>, Range<u32>)> = None;
+    for change in line_changes {
+        let (before, after) = change;
+        let in_range = before.start <= before.end
+            && before.end <= base_line_count
+            && after.start <= after.end
+            && after.end <= buffer_line_count;
+        let in_order = previous.is_none_or(|(previous_before, previous_after)| {
+            previous_before.end <= before.start && previous_after.end <= after.start
+        });
+        if !in_range || !in_order {
+            log::error!("line change {before:?} -> {after:?} does not fit the texts");
+            return None;
+        }
+        sink.process_change(before.clone(), after.clone());
+        previous = Some(change);
+    }
+    for hunk in sink.finish() {
+        tree.push(hunk, buffer);
+    }
+    Some(tree)
+}
+
 /// Breaks one run of changed lines into a change per line.
 ///
 /// Replaced lines are paired off in order, which is what a rewrite looks like
@@ -1687,6 +1729,7 @@ impl BufferDiff {
             secondary_diff: None,
             base_kind,
             line_granularity: false,
+            line_changes: None,
         }
     }
 
@@ -1710,6 +1753,7 @@ impl BufferDiff {
             secondary_diff: None,
             base_kind,
             line_granularity: false,
+            line_changes: None,
         }
     }
 
@@ -1750,6 +1794,7 @@ impl BufferDiff {
             secondary_diff: None,
             base_kind,
             line_granularity: false,
+            line_changes: None,
         }
     }
 
@@ -2062,6 +2107,11 @@ impl BufferDiff {
         let base_text_snapshot = base_text_snapshot.clone();
         let base_text_exists = base_text.is_some();
         let line_granularity = self.line_granularity;
+        let line_changes = self
+            .line_changes
+            .as_ref()
+            .filter(|(version, _)| version == buffer_snapshot.version())
+            .map(|(_, line_changes)| line_changes.clone());
         let unchanged_hunks = self.diff_snapshot.as_ref().and_then(|diff_snapshot| {
             if diff_snapshot.base_text_exists == base_text_exists
                 && diff_snapshot.base_text.version() == base_text_snapshot.version()
@@ -2074,7 +2124,19 @@ impl BufferDiff {
         });
 
         cx.background_executor().spawn(async move {
-            let hunks = if let Some(unchanged_hunks) = unchanged_hunks {
+            let drawn = match (&line_changes, &base_text) {
+                (Some(line_changes), Some(base_text)) => compute_hunks_from_line_changes(
+                    base_text,
+                    base_text_snapshot.as_rope(),
+                    &buffer,
+                    diff_options.as_ref(),
+                    line_changes,
+                ),
+                _ => None,
+            };
+            let hunks = if let Some(drawn) = drawn {
+                drawn
+            } else if let Some(unchanged_hunks) = unchanged_hunks {
                 unchanged_hunks
             } else if let Some(base_text) = base_text {
                 compute_hunks(
@@ -2363,6 +2425,27 @@ impl BufferDiff {
             })
             .log_err();
         })
+    }
+
+    /// Like [`BufferDiff::set_base_text`], drawing exactly the given changes
+    /// rather than working them out.
+    ///
+    /// Each change is a pair of row ranges, base then buffer, as
+    /// [`line_changes`] gives them, and they must describe `base_text` against
+    /// `buffer` exactly. Agent review keeps its changes this way so that
+    /// answering one line leaves every other line paired as it was: worked out
+    /// afresh, a file full of identical lines (`}`) can pair them differently
+    /// after each answer, and lines nobody touched turn from added into
+    /// deleted-and-added.
+    pub fn set_base_text_with_line_changes(
+        &mut self,
+        base_text: Arc<str>,
+        buffer: text::BufferSnapshot,
+        line_changes: Arc<[(Range<u32>, Range<u32>)]>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        self.line_changes = Some((buffer.version().clone(), line_changes));
+        self.set_base_text(Some(base_text), buffer, cx)
     }
 
     pub fn base_text_string(&self, _cx: &App) -> Option<String> {

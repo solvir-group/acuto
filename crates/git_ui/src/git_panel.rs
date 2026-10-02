@@ -5877,13 +5877,15 @@ impl GitPanel {
     }
 
     pub fn commit_button_title(&self) -> &'static str {
-        // Plain verbs. "Commit Tracked" named an implementation detail --
-        // which files get included when nothing is staged -- on the one button
-        // everyone presses; what it commits is already listed right above it.
-        if self.amend_pending {
-            "Amend"
-        } else {
-            "Commit"
+        // Plain verbs, but honest ones: with nothing staged the button commits
+        // every tracked change, and a bare "Commit" read as committing only
+        // what had been picked.
+        let everything = !self.has_staged_changes() && self.has_tracked_changes();
+        match (self.amend_pending, everything) {
+            (true, true) => "Amend All",
+            (true, false) => "Amend",
+            (false, true) => "Commit All",
+            (false, false) => "Commit",
         }
     }
 

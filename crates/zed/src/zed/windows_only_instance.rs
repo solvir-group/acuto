@@ -33,6 +33,11 @@ use crate::{Args, OpenListener, RawOpenRequest};
 /// data directory means same directory joins the running instance, different
 /// directory gets its own -- which is what the flag is for.
 fn instance_key() -> String {
+    // The default directory keeps the plain name, which is what the CLI and
+    // the installer look for.
+    if !paths::has_custom_data_dir() {
+        return app_identifier().to_string();
+    }
     let data_dir = paths::data_dir().to_string_lossy().to_lowercase();
 
     // A hash rather than the path itself: a Windows object name cannot contain

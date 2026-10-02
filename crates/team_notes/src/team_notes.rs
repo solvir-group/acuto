@@ -428,9 +428,12 @@ pub fn now_timestamp() -> String {
 pub async fn author_name(executor: &gpui::BackgroundExecutor) -> Arc<str> {
     let from_git = executor
         .spawn(async {
-            let output = std::process::Command::new("git")
+            // Not `std::process::Command`, which on Windows flashes a console
+            // window for every call from a GUI process.
+            let output = util::command::new_command("git")
                 .args(["config", "user.name"])
                 .output()
+                .await
                 .ok()?;
             if !output.status.success() {
                 return None;
@@ -472,11 +475,12 @@ pub async fn team_roster(
 
     executor
         .spawn(async move {
-            let Ok(output) = std::process::Command::new("git")
+            let Ok(output) = util::command::new_command("git")
                 .arg("-C")
                 .arg(&worktree_root)
                 .args(["log", "--format=%aN", "--no-merges", COMMITS_SCANNED])
                 .output()
+                .await
             else {
                 return Vec::new();
             };

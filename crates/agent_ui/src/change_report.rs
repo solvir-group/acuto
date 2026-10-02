@@ -28,7 +28,7 @@ use std::time::Duration;
 use action_log::ActionLog;
 use buffer_diff::BufferDiff;
 use gpui::{App, Entity, Task, WeakEntity};
-use language::{Buffer, DiagnosticSeverity};
+use language::{Buffer, DiagnosticSeverity, OffsetRangeExt as _};
 use util::ResultExt as _;
 use workspace::Workspace;
 
@@ -190,17 +190,25 @@ fn errors_in_hunks(buffer: &Entity<Buffer>, diff: &Entity<BufferDiff>, cx: &App)
     // that can change under the loop.
     let diff = diff.read(cx).snapshot(cx);
 
-    let mut errors = 0;
+    // Counted once each: review splits a change into a hunk per line, and an
+    // error spanning several changed lines was counted on every one of them.
+    let mut errors = std::collections::HashSet::new();
     for hunk in diff.hunks(&snapshot.text) {
-        for entry in
-            snapshot.diagnostics_in_range::<_, usize>(hunk.buffer_range.clone(), false)
-        {
+        let mut range = hunk.buffer_range.to_offset(&snapshot);
+        if range.is_empty() {
+            // A deletion has no text of its own; the line it left behind is
+            // where an error it caused shows up.
+            let row = snapshot.offset_to_point(range.start).row;
+            range = snapshot.point_to_offset(language::Point::new(row, 0))
+                ..snapshot.point_to_offset(language::Point::new(row, snapshot.line_len(row)));
+        }
+        for entry in snapshot.diagnostics_in_range::<_, usize>(range, false) {
             if entry.diagnostic.severity == DiagnosticSeverity::ERROR {
-                errors += 1;
+                errors.insert((entry.range.start, entry.range.end));
             }
         }
     }
-    errors
+    errors.len()
 }
 
 #[cfg(test)]

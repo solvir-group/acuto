@@ -28,7 +28,6 @@ project.workspace = true
 telemetry.workspace = true
 text.workspace = true
 util.workspace = true
-watch.workspace = true
 
 
 [dev-dependencies]
@@ -36,9 +35,7 @@ buffer_diff = { workspace = true, features = ["test-support"] }
 clock = { workspace = true, features = ["test-support"] }
 collections = { workspace = true, features = ["test-support"] }
 ctor.workspace = true
-git.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
-indoc.workspace = true
 language = { workspace = true, features = ["test-support"] }
 log.workspace = true
 pretty_assertions.workspace = true

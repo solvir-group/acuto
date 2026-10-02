@@ -1409,11 +1409,14 @@ impl Render for Dock {
                     // commit button. Opening git to press one control is two steps
                     // for the thing you do every few minutes; the panel is still a
                     // keystroke away for everything else.
+                    // The git panel, not `git::Commit`: that commits on the
+                    // spot whenever a message is typed, which an icon next to
+                    // "Project" and "Search" gives no warning of.
                     .child(button(
                         "left-rail-commit",
                         IconName::GitBranch,
-                        "Commit",
-                        "git::Commit",
+                        "Source Control",
+                        "git_panel::ToggleFocus",
                     ))
                     .child(button(
                         "left-rail-search",

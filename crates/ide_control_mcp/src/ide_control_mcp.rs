@@ -111,7 +111,6 @@ const WRITABLE_SETTINGS: &[&[&str]] = &[
     &["vim_mode"],
     &["helix_mode"],
     &["base_keymap"],
-    &["autosave"],
     &["restore_on_startup"],
     &["search"],
     &["use_smartcase_search"],
@@ -180,6 +179,22 @@ const BLOCKED_ACTION_WORDS: &[&str] = &[
     "credential",
     "token",
     "key",
+    // Edits only become destructive once they reach disk, so saving and
+    // anything that empties text into the clipboard are out, as is closing,
+    // which can be told to discard unsaved work.
+    "cut",
+    "paste",
+    "clipboard",
+    "save",
+    "close",
+    // Opening a URL or a file with the system's own handler can start any
+    // program registered for it.
+    "browser",
+    "url",
+    "system",
+    "openwith",
+    "open_with",
+    "external",
 ];
 
 /// Whether an agent may read or write the setting at `key_path`.
@@ -316,14 +331,40 @@ fn serve(
     expected_authorization: String,
     calls_tx: mpsc::UnboundedSender<Call>,
 ) {
-    for mut request in server.incoming_requests() {
+    for request in server.incoming_requests() {
+        // Each request on its own thread: a call waits on the main thread for
+        // its answer, and one slow call held up every agent behind it.
+        let expected_authorization = expected_authorization.clone();
+        let calls_tx = calls_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("ide-control-mcp-request".into())
+            .spawn(move || handle_request(request, &expected_authorization, &calls_tx));
+        if let Err(error) = spawned {
+            log::error!("could not start a thread for an MCP request: {error}");
+        }
+    }
+}
+
+fn handle_request(
+    mut request: tiny_http::Request,
+    expected_authorization: &str,
+    calls_tx: &mpsc::UnboundedSender<Call>,
+) {
+    {
         let authorized = request.headers().iter().any(|header| {
             header.field.equiv("Authorization") && header.value.as_str() == expected_authorization
         });
 
         if !authorized {
             respond_with(request, 401, json!({"error": "unauthorized"}));
-            continue;
+            return;
+        }
+
+        // There is no server-to-client stream to open: Streamable HTTP clients
+        // read 405 as "requests only" and carry on.
+        if *request.method() != tiny_http::Method::Post {
+            respond_with(request, 405, json!({"error": "only POST is supported"}));
+            return;
         }
 
         if request
@@ -331,7 +372,7 @@ fn serve(
             .is_some_and(|length| length as u64 > MAX_REQUEST_BYTES)
         {
             respond_with(request, 413, json!({"error": "request too large"}));
-            continue;
+            return;
         }
 
         let mut body = String::new();
@@ -342,7 +383,7 @@ fn serve(
             .read_to_string(&mut body);
         if body.len() as u64 > MAX_REQUEST_BYTES {
             respond_with(request, 413, json!({"error": "request too large"}));
-            continue;
+            return;
         }
         if let Err(error) = read {
             respond_with(
@@ -350,7 +391,7 @@ fn serve(
                 400,
                 error_response(Value::Null, -32700, &format!("unreadable body: {error}")),
             );
-            continue;
+            return;
         }
 
         let message: Value = match serde_json::from_str(&body) {
@@ -361,7 +402,7 @@ fn serve(
                     400,
                     error_response(Value::Null, -32700, &format!("invalid JSON: {error}")),
                 );
-                continue;
+                return;
             }
         };
 
@@ -375,11 +416,14 @@ fn serve(
         // Notifications carry no id and expect no result, only an ack.
         if id.is_null() {
             respond_empty(request);
-            continue;
+            return;
         }
 
         let response = match method.as_str() {
             "initialize" => success(id, initialize_result()),
+            // Clients ping to check the connection; an error here reads as
+            // the server being gone.
+            "ping" => success(id, json!({})),
             "tools/list" => success(id, json!({ "tools": tool_definitions() })),
             "tools/call" => {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
@@ -393,7 +437,7 @@ fn serve(
                     .cloned()
                     .unwrap_or_else(|| json!({}));
 
-                match dispatch(&calls_tx, name, arguments) {
+                match dispatch(calls_tx, name, arguments) {
                     Ok(text) => success(id, tool_content(&text, false)),
                     // Reported as a successful call carrying an error result,
                     // not as a JSON-RPC error: a tool that refused is something
@@ -610,10 +654,13 @@ fn run_ide_action(arguments: Value, cx: &mut gpui::AsyncApp) -> Result<String, S
             )
         })?;
 
-        // Actions are dispatched into a window, so there has to be one.
+        // Actions are dispatched into a window, so there has to be one. The
+        // agent usually works while the editor is in the background, when no
+        // window is active, so any open window will do then.
         let window = cx
             .active_window()
-            .ok_or_else(|| "No editor window is active.".to_string())?;
+            .or_else(|| cx.windows().into_iter().next())
+            .ok_or_else(|| "No editor window is open.".to_string())?;
 
         window
             .update(cx, |_, window, cx| window.dispatch_action(action, cx))
@@ -674,9 +721,7 @@ fn update_ide_setting(arguments: Value) -> Result<String, String> {
         ));
     }
 
-    let settings_path = paths::settings_file().clone();
-    let text = std::fs::read_to_string(&settings_path)
-        .map_err(|error| format!("Could not read {}: {error}", settings_path.display()))?;
+    let (settings_path, text) = read_settings_file()?;
     let current: Value = settings_json::parse_json_with_comments(&text)
         .map_err(|error| format!("Settings file is not valid JSON: {error}"))?;
 
@@ -720,7 +765,10 @@ fn update_ide_setting(arguments: Value) -> Result<String, String> {
     // Written beside the file and moved into place, so a crash or a full disk
     // mid-write leaves the old settings rather than a truncated file.
     let staging = settings_path.with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&staging, &updated)
+    settings_path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&staging, &updated))
         .and_then(|()| std::fs::rename(&staging, &settings_path))
         .map_err(|error| {
             std::fs::remove_file(&staging).ok();
@@ -730,6 +778,24 @@ fn update_ide_setting(arguments: Value) -> Result<String, String> {
     Ok(format!(
         "Set `{path_label}` to {new_value}. The editor reloads settings on save."
     ))
+}
+
+/// The settings file to edit, and its text.
+///
+/// A symlinked settings file -- one kept in a dotfiles repository -- is
+/// resolved, so the write lands in the real file instead of replacing the
+/// link with a copy. A missing file is an empty one: a fresh install has none
+/// until something is first changed.
+fn read_settings_file() -> Result<(PathBuf, String), String> {
+    let link = paths::settings_file().clone();
+    let path = std::fs::canonicalize(&link).unwrap_or(link);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok((path, text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok((path, "{\n}\n".to_string()))
+        }
+        Err(error) => Err(format!("Could not read {}: {error}", path.display())),
+    }
 }
 
 /// Produces a copy of `current` with `value` placed at `key_path`.
@@ -800,6 +866,15 @@ mod tests {
             "extensions::InstallExtension",
             "agent::AskAgent",
             "workspace::CloseWindow",
+            "editor::Cut",
+            "workspace::Save",
+            "workspace::SaveAll",
+            "pane::CloseAllItems",
+            "pane::CloseActiveItem",
+            "zed::OpenBrowser",
+            "editor::OpenUrl",
+            "project_panel::OpenWithSystem",
+            "workspace::SendKeystrokes",
         ] {
             assert!(!action_is_allowed(blocked), "{blocked} should be refused");
         }

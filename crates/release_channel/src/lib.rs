@@ -44,10 +44,13 @@ pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
 #[cfg(target_os = "windows")]
 pub fn app_identifier() -> &'static str {
     match *RELEASE_CHANNEL {
-        ReleaseChannel::Dev => "Zed-Editor-Dev",
-        ReleaseChannel::Nightly => "Zed-Editor-Nightly",
-        ReleaseChannel::Preview => "Zed-Editor-Preview",
-        ReleaseChannel::Stable => "Zed-Editor-Stable",
+        // Not Zed's names: a Zed install running alongside would otherwise
+        // answer to Acuto's single-instance mutex and pipe. These are also the
+        // names the installer checks to see whether Acuto is running.
+        ReleaseChannel::Dev => "Acuto-Dev",
+        ReleaseChannel::Nightly => "Acuto-Nightly",
+        ReleaseChannel::Preview => "Acuto-Preview",
+        ReleaseChannel::Stable => "Acuto-Stable",
     }
 }
 

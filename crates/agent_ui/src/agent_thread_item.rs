@@ -29,6 +29,16 @@ impl AgentThreadItem {
     pub fn new(conversation_view: Entity<ConversationView>) -> Self {
         Self { conversation_view }
     }
+
+    /// Whether the agent in this tab is in the middle of a turn.
+    pub fn is_generating(&self, cx: &App) -> bool {
+        self.conversation_view
+            .read(cx)
+            .root_thread(cx)
+            .is_some_and(|thread| {
+                thread.read(cx).status() == acp_thread::ThreadStatus::Generating
+            })
+    }
 }
 
 impl Render for AgentThreadItem {

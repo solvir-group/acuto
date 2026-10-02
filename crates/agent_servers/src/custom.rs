@@ -329,9 +329,13 @@ impl AgentServer for CustomAgentServer {
                 .update(cx, |store, cx| {
                     let agent = store.get_external_agent(&agent_id).with_context(|| {
                         if is_registry_agent {
+                            // Also what an unreachable registry looks like, so
+                            // the message covers both rather than promising a
+                            // download that may never come.
                             format!(
-                                "`{agent_id}` is still downloading from the agent registry. \
-                                 Give it a moment and try again."
+                                "`{agent_id}` could not be found in the agent registry yet. \
+                                 It may still be downloading -- try again in a moment -- or \
+                                 the registry may be unreachable from this network."
                             )
                         } else {
                             format!("`{agent_id}` is not set up. Check its entry in agent_servers.")

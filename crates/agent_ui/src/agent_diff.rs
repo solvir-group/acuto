@@ -475,7 +475,7 @@ fn hunks_answered_by(
         };
         let covered = range.start.row..covered_end;
         let covers = |hunk: &multi_buffer::MultiBufferDiffHunk| {
-            let rows = hunk.row_range.start.0..hunk.row_range.end.0;
+            let rows = hunk_rows(hunk, buffer_snapshot);
             if rows.is_empty() {
                 covered.contains(&rows.start)
             } else {
@@ -490,13 +490,13 @@ fn hunks_answered_by(
         if matched.is_empty() {
             let next_start = candidates
                 .iter()
-                .map(|hunk| hunk.row_range.start.0)
+                .map(|hunk| hunk_rows(hunk, buffer_snapshot).start)
                 .filter(|start| *start >= covered.end)
                 .min();
             matched.extend(
                 candidates
                     .into_iter()
-                    .filter(|hunk| Some(hunk.row_range.start.0) == next_start),
+                    .filter(|hunk| Some(hunk_rows(hunk, buffer_snapshot).start) == next_start),
             );
         }
         for hunk in matched {
@@ -509,6 +509,25 @@ fn hunks_answered_by(
         }
     }
     answered
+}
+
+/// The rows a hunk occupies, worked out from its own anchors. Its `row_range`
+/// is clipped to whatever range it was looked up with, so a whole line found
+/// from a click on the line below it reads as an empty range -- a deletion --
+/// on the clicked row.
+fn hunk_rows(
+    hunk: &multi_buffer::MultiBufferDiffHunk,
+    buffer_snapshot: &MultiBufferSnapshot,
+) -> Range<u32> {
+    let range = hunk.multi_buffer_range.start.to_point(buffer_snapshot)
+        ..hunk.multi_buffer_range.end.to_point(buffer_snapshot);
+    if hunk.status.kind == buffer_diff::DiffHunkStatusKind::Deleted {
+        range.start.row..range.start.row
+    } else if range.end.column == 0 && range.end.row > range.start.row {
+        range.start.row..range.end.row
+    } else {
+        range.start.row..range.end.row + 1
+    }
 }
 
 fn update_editor_selection(
@@ -1805,10 +1824,23 @@ impl AgentDiff {
                 continue;
             };
 
+            // The log knows about a change as soon as it happens; its diff is
+            // drawn a moment later. Entering review before then found no hunk
+            // to put the cursor on, and never looked again.
+            let diff_drawn = diff_handle
+                .read(cx)
+                .snapshot(cx)
+                .hunks(&buffer.read(cx).snapshot())
+                .next()
+                .is_some();
+
             for weak_editor in buffer_editors.keys() {
                 let Some(editor) = weak_editor.upgrade() else {
                     continue;
                 };
+                if !diff_drawn && !self.reviewing_editors.contains_key(weak_editor) {
+                    continue;
+                }
 
                 let multibuffer = editor.read(cx).buffer().clone();
                 multibuffer.update(cx, |multibuffer, cx| {
@@ -2022,15 +2054,21 @@ impl AgentDiff {
         if matches!(review_result, PostReviewState::AllReviewed)
             && let Some(curr_buffer) = editor.read(cx).buffer().read(cx).as_singleton()
         {
-            let changed_buffers = thread.read(cx).action_log().read(cx).changed_buffers(cx);
-
-            let mut keys = changed_buffers.map(|(buffer, _)| buffer);
-            keys.find(|k| *k == curr_buffer);
-            let next_project_path = keys
-                .next()
-                .filter(|k| *k != curr_buffer)
-                .and_then(|after| after.read(cx).project_path(cx));
-            drop(keys);
+            // The buffer just answered has usually left the list already, so
+            // the next one is found by order rather than by position after it.
+            let others = thread
+                .read(cx)
+                .action_log()
+                .read(cx)
+                .changed_buffers(cx)
+                .map(|(buffer, _)| buffer)
+                .filter(|buffer| *buffer != curr_buffer)
+                .collect::<Vec<_>>();
+            let next_project_path = others
+                .iter()
+                .find(|buffer| **buffer > curr_buffer)
+                .or_else(|| others.first())
+                .and_then(|next| next.read(cx).project_path(cx));
 
             if let Some(path) = next_project_path {
                 let task = workspace.open_path(path, None, true, window, cx);
@@ -2349,6 +2387,188 @@ mod tests {
             unreviewed_rows(cx),
             Vec::<u32>::new(),
             "nothing left to review"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_review_panel_answers_only_the_clicked_line(cx: &mut TestAppContext) {
+        use language::ToPoint as _;
+
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            prompt_store::init(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
+            workspace::register_project_item::<Editor>(cx);
+        });
+
+        let before = "a\nb\nc\nd\ne\n";
+        let after = "A\nB\nC\nd\ne\nf\ng\n";
+        let new_file = "one\ntwo\n";
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/test"), json!({ ".git": {}, "file.txt": before }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let connection = Rc::new(acp_thread::StubAgentConnection::new());
+        let thread = cx
+            .update(|_, cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let action_log = thread.read_with(cx, |thread, _| thread.action_log().clone());
+        cx.update(|window, cx| {
+            AgentDiff::set_active_thread(&workspace.downgrade(), thread.clone(), window, cx)
+        });
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/test/file.txt"), cx)
+            })
+            .await
+            .unwrap();
+        let new_buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/test/new.txt"), cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            action_log.update(cx, |log, cx| {
+                log.agent_will_write(buffer.clone(), cx);
+                log.agent_will_write(new_buffer.clone(), cx);
+            });
+        });
+        fs.insert_file(path!("/test/file.txt"), after.as_bytes().to_vec())
+            .await;
+        fs.insert_file(path!("/test/new.txt"), new_file.as_bytes().to_vec())
+            .await;
+        let reloads = [
+            buffer.update(cx, |buffer, cx| buffer.reload(cx)),
+            new_buffer.update(cx, |buffer, cx| buffer.reload(cx)),
+        ];
+        cx.run_until_parked();
+        for reload in reloads {
+            reload.await.ok();
+        }
+        cx.run_until_parked();
+
+        let panel = cx.update(|window, cx| {
+            AgentDiffPane::deploy(thread.clone(), workspace.downgrade(), window, cx).unwrap()
+        });
+        cx.run_until_parked();
+        let editor = panel.read_with(cx, |panel, cx| panel.editor.read(cx).rhs_editor().clone());
+
+        let unreviewed_rows = |buffer: &Entity<Buffer>, cx: &mut VisualTestContext| {
+            action_log.read_with(cx, |log, cx| {
+                log.changed_buffers(cx)
+                    .filter(|(changed, _)| changed == buffer)
+                    .flat_map(|(buffer, diff)| {
+                        let snapshot = buffer.read(cx).snapshot();
+                        diff.read(cx)
+                            .snapshot(cx)
+                            .hunks(&snapshot)
+                            .map(|hunk| hunk.range.start.row)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        // Where the hunk on the given row starts, which is where its Keep and
+        // Reject buttons point.
+        let hunk_start = |buffer: &Entity<Buffer>, row: u32, cx: &mut VisualTestContext| {
+            let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let text_snapshot = buffer.read(cx).snapshot();
+                editor
+                    .diff_hunks_in_ranges(&[editor::Anchor::Min..editor::Anchor::Max], &snapshot)
+                    .find(|hunk| {
+                        hunk.buffer_id == buffer_id
+                            && hunk.buffer_range.start.to_point(&text_snapshot).row == row
+                    })
+                    .map(|hunk| hunk.multi_buffer_range.start)
+                    .expect("a hunk on that row")
+            })
+        };
+        let keep = |at: editor::Anchor, cx: &mut VisualTestContext| {
+            editor.update_in(cx, |editor, window, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                keep_edits_in_ranges(editor, &snapshot, &thread, vec![at..at], window, cx);
+            });
+            cx.run_until_parked();
+        };
+        let reject = |at: editor::Anchor, cx: &mut VisualTestContext| {
+            editor.update_in(cx, |editor, window, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                reject_edits_in_ranges(
+                    editor,
+                    &snapshot,
+                    &thread,
+                    vec![at..at],
+                    workspace.downgrade(),
+                    window,
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+        };
+
+        assert_eq!(unreviewed_rows(&buffer, cx), vec![0, 1, 2, 5, 6]);
+        assert_eq!(unreviewed_rows(&new_buffer, cx), vec![0, 1]);
+
+        // Each changed line sits right against the next one. Answering one
+        // must not answer its neighbour.
+        keep(hunk_start(&buffer, 1, cx), cx);
+        assert_eq!(unreviewed_rows(&buffer, cx), vec![0, 2, 5, 6]);
+        assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), after);
+
+        reject(hunk_start(&buffer, 0, cx), cx);
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "a\nB\nC\nd\ne\nf\ng\n"
+        );
+        assert_eq!(unreviewed_rows(&buffer, cx), vec![2, 5, 6]);
+
+        keep(hunk_start(&buffer, 5, cx), cx);
+        assert_eq!(unreviewed_rows(&buffer, cx), vec![2, 6]);
+
+        reject(hunk_start(&buffer, 6, cx), cx);
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "a\nB\nC\nd\ne\nf\n"
+        );
+        assert_eq!(unreviewed_rows(&buffer, cx), vec![2]);
+
+        // Rejecting one line of a new file removes that line, never the file.
+        reject(hunk_start(&new_buffer, 0, cx), cx);
+        assert_eq!(new_buffer.read_with(cx, |buffer, _| buffer.text()), "two\n");
+        assert_eq!(unreviewed_rows(&new_buffer, cx), vec![0]);
+        assert!(
+            fs.is_file(Path::new(path!("/test/new.txt"))).await,
+            "the new file must still exist"
+        );
+
+        // Accepted lines stay in the panel, just no longer as changes.
+        let shown = panel.read_with(cx, |panel, cx| {
+            panel.multibuffer.read(cx).snapshot(cx).text()
+        });
+        assert!(
+            shown.contains("B\n") && shown.contains("f\n"),
+            "accepted lines must stay in the review panel, got {shown:?}"
         );
     }
 

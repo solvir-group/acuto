@@ -151,7 +151,9 @@ fn fix_terminal_failure(
         let mut applied = 0usize;
         let mut first_changed: Option<ProjectPath> = None;
         for file in files {
-            let Some(project_path) = resolve_path(&project, &file.path, cx).await else {
+            let Some(project_path) =
+                resolve_path(&project, &file.path, block.cwd.as_deref(), cx).await
+            else {
                 continue;
             };
             let Some(buffer) = open_buffer(&project, &project_path, cx).await else {
@@ -267,7 +269,8 @@ async fn gather_context(
         if files.len() >= MAX_CONTEXT_FILES {
             break;
         }
-        let Some(project_path) = resolve_path(project, &path, cx).await else {
+        let Some(project_path) = resolve_path(project, &path, block.cwd.as_deref(), cx).await
+        else {
             continue;
         };
         let Some(buffer) = open_buffer(project, &project_path, cx).await else {
@@ -314,13 +317,26 @@ fn paths_in_output(output: &str) -> Vec<String> {
     ordered
 }
 
+/// A path from the command's output as a file in the project.
+///
+/// Relative paths are relative to where the command ran: `cargo build` in a
+/// subdirectory prints `src/lib.rs` for that subdirectory's file, and reading
+/// it from the project root found another file of the same name, or none.
 async fn resolve_path(
     project: &Entity<Project>,
     path: &str,
+    cwd: Option<&std::path::Path>,
     cx: &mut AsyncApp,
 ) -> Option<ProjectPath> {
     let path = PathBuf::from(path);
-    project.update(cx, |project, cx| project.find_project_path(&path, cx))
+    let in_cwd = cwd
+        .filter(|_| path.is_relative())
+        .map(|cwd| cwd.join(&path));
+    project.update(cx, |project, cx| {
+        in_cwd
+            .and_then(|absolute| project.find_project_path(&absolute, cx))
+            .or_else(|| project.find_project_path(&path, cx))
+    })
 }
 
 async fn open_buffer(

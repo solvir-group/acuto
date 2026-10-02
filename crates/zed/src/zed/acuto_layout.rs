@@ -260,7 +260,12 @@ fn close_agent_threads(
         let thread_items: Vec<gpui::EntityId> = pane
             .read(cx)
             .items()
-            .filter(|item| item.downcast::<AgentThreadItem>().is_some())
+            // A thread still working is left open: removing its tab drops it
+            // mid-turn, while the agent keeps writing files nothing tracks.
+            .filter(|item| {
+                item.downcast::<AgentThreadItem>()
+                    .is_some_and(|thread| !thread.read(cx).is_generating(cx))
+            })
             .map(|item| item.item_id())
             .collect();
 

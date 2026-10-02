@@ -19,6 +19,9 @@ use futures::{
 };
 
 use alacritty_terminal::grid::Dimensions as _;
+use alacritty_terminal::index::{
+    Column as AlacColumn, Line as AlacLine, Point as AlacPoint,
+};
 use itertools::Itertools as _;
 use mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
@@ -778,6 +781,9 @@ pub(crate) enum TerminalBackendEvent {
     Osc {
         params: Vec<Vec<u8>>,
         cursor: Point,
+        /// Scrollback length when the sequence was parsed; see
+        /// [`Terminal::absolute_line`].
+        history_size: usize,
     },
     MouseCursorDirty,
     Title(String),
@@ -797,7 +803,7 @@ pub(crate) enum TerminalBackendEvent {
 impl fmt::Debug for TerminalBackendEvent {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Osc { params, cursor } => {
+            Self::Osc { params, cursor, .. } => {
                 let rendered: Vec<String> = params
                     .iter()
                     .map(|param| String::from_utf8_lossy(param).into_owned())
@@ -1223,10 +1229,13 @@ impl TerminalBuilder {
                     .unwrap_or_else(util::shell::get_system_shell);
                 let integration_kind = ShellKind::new(&integration_program, false);
 
-                if let Some(shell) = shell_integration::IntegrationShell::detect(
-                    &integration_program,
-                    integration_kind,
-                ) && let Some(injection) = shell_integration::prepare(
+                // Tasks run one command and exit; their shell has no prompt.
+                if task.is_none()
+                    && let Some(shell) = shell_integration::IntegrationShell::detect(
+                        &integration_program,
+                        integration_kind,
+                    )
+                    && let Some(injection) = shell_integration::prepare(
                     shell,
                     shell_integration_mode,
                     paths::data_dir(),
@@ -1706,6 +1715,18 @@ const SELECTION_DRAG_THRESHOLD: f64 = 2.0;
 /// neither is how anyone writes the name of their shell. Anything unrecognised
 /// passes through with only its extension removed, so a shell this does not know
 /// about still gets a sensible tab rather than a blank one.
+/// A grid line as an absolute row: the same number however far output has
+/// scrolled since, because scrolling moves a row up exactly as much as it
+/// grows the history.
+fn absolute_line(line: i32, history_size: usize) -> i32 {
+    line.saturating_add(i32::try_from(history_size).unwrap_or(i32::MAX))
+}
+
+/// An absolute row as a line of the grid as it is now.
+fn grid_line(absolute: i32, history_size: usize) -> i32 {
+    absolute.saturating_sub(i32::try_from(history_size).unwrap_or(i32::MAX))
+}
+
 fn shell_display_name(program: &str) -> String {
     let stem = program.strip_suffix(".exe").unwrap_or(program);
     match stem.to_ascii_lowercase().as_str() {
@@ -1729,12 +1750,21 @@ impl Terminal {
 
     fn process_event(&mut self, event: TerminalBackendEvent, cx: &mut Context<Self>) {
         match event {
-            TerminalBackendEvent::Osc { params, cursor } => {
+            TerminalBackendEvent::Osc {
+                params,
+                cursor,
+                history_size,
+            } => {
                 // The cursor at the moment `133;B` arrives is where the user's
                 // input begins, so it is read here rather than looked up later:
                 // by the time anything asks, the shell has printed more.
+                //
+                // Kept as an absolute row. A grid line number names a
+                // different row each time output scrolls, so a prompt recorded
+                // that way pointed at the wrong text once a command printed
+                // more than the space below it.
                 let cursor = shell_state::GridPoint {
-                    line: cursor.line,
+                    line: absolute_line(cursor.line, history_size),
                     column: cursor.column,
                 };
                 // Refreshed before the cursor is read: `last_content` is
@@ -1766,7 +1796,10 @@ impl Terminal {
                     .shell_state
                     .handle_osc(&params, cursor, typed_line.as_deref(), now)
                 {
-                    Some(shell_state::HandledOsc::CommandFinished(finished)) => {
+                    Some(shell_state::HandledOsc::CommandFinished(mut finished)) => {
+                        // Redacted before it reaches history, which is kept on
+                        // disk and offered back as suggestions.
+                        finished.command = blocks::redact_secrets(&finished.command).0;
                         // Read now, while the output is still on the grid. One
                         // more screenful and the top of it is gone.
                         let output = finished
@@ -2154,11 +2187,52 @@ impl Terminal {
     /// The first line is skipped: `start` is the cursor at the execution marker,
     /// which sits at the end of the echoed command, so the row it points at is
     /// the command itself rather than its output.
+    /// The rows after `start` up to and including `end`, both absolute rows,
+    /// read from the grid itself so output that scrolled into history is
+    /// still there.
     fn capture_output(
         &self,
         start: shell_state::GridPoint,
         end: shell_state::GridPoint,
     ) -> String {
+        let from_grid = {
+            let term = self.term.lock();
+            let history_size = term.history_size();
+            let topmost = -(history_size as i32);
+            let bottommost = term.screen_lines() as i32 - 1;
+            let first = grid_line(start.line, history_size).saturating_add(1).max(topmost);
+            let last = grid_line(end.line, history_size).min(bottommost);
+            (first <= last).then(|| {
+                term.bounds_to_string(
+                    AlacPoint::new(AlacLine(first), AlacColumn(0)),
+                    AlacPoint::new(AlacLine(last), term.last_column()),
+                )
+            })
+        };
+        if let Some(text) = from_grid {
+            let output = text
+                .lines()
+                // Trailing spaces are the grid padding every row out to its
+                // full width, not something the command printed.
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+            if !output.is_empty() {
+                return output;
+            }
+        }
+
+        let history_size = self.term.lock().history_size();
+        let start = shell_state::GridPoint {
+            line: grid_line(start.line, history_size),
+            column: start.column,
+        };
+        let end = shell_state::GridPoint {
+            line: grid_line(end.line, history_size),
+            column: end.column,
+        };
         let mut rows: Vec<(i32, String)> = Vec::new();
         for cell in &self.last_content.cells {
             let point = cell.point;
@@ -2245,12 +2319,20 @@ impl Terminal {
         // a frame behind unless the snapshot is refreshed here — and a frame
         // behind means the character just typed is missing, so the very first
         // keystroke of a line produces nothing at all.
-        let refreshed = {
+        let (refreshed, history_size) = {
             let term = self.term.lock();
-            crate::alacritty::make_content(&term, &self.last_content)
+            (
+                crate::alacritty::make_content(&term, &self.last_content),
+                term.history_size(),
+            )
         };
         self.last_content = refreshed;
         let start = self.shell_state.command_start()?;
+        // Recorded as an absolute row; back to a grid line for today's grid.
+        let start = shell_state::GridPoint {
+            line: grid_line(start.line, history_size),
+            column: start.column,
+        };
         let cursor = self.last_content.cursor.point;
 
         // A cursor before the reported start means the grid has scrolled or

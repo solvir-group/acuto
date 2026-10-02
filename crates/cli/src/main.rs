@@ -1218,7 +1218,9 @@ mod windows {
         }
 
         fn launch(&self, ipc_url: String, user_data_dir: Option<&str>) -> anyhow::Result<()> {
-            if check_single_instance() {
+            // A custom data directory is its own instance, named after that
+            // directory; the app works out which one and forwards there.
+            if user_data_dir.is_some() || check_single_instance() {
                 let mut cmd = std::process::Command::new(self.0.clone());
                 cmd.arg(ipc_url);
                 if let Some(dir) = user_data_dir {

@@ -56,27 +56,36 @@ impl FocusTimer {
 
     fn start(&mut self, cx: &mut Context<Self>) {
         self.running = true;
-        // A background timer rather than a wall-clock delta, so a suspended or
-        // backgrounded window does not accumulate time the user never spent.
+        // Measured, not counted: adding a flat second per wakeup lost the time
+        // each wakeup ran late. Each step is capped, so a suspended or
+        // backgrounded machine still does not accumulate time the user never
+        // spent. The task ends when the timer stops, rather than waking every
+        // second forever.
+        const LONGEST_STEP: Duration = Duration::from_secs(2);
         self._tick = Some(cx.spawn(async move |this, cx| {
+            let mut last = std::time::Instant::now();
             loop {
                 cx.background_executor()
                     .timer(Duration::from_secs(1))
                     .await;
-                let still_alive = this.update(cx, |this, cx| {
-                    if this.running {
-                        this.elapsed += Duration::from_secs(1);
-                        // A finished countdown stops itself here; left running it
-                        // would tick past zero while the displayed time sat
-                        // saturated at 00:00.
-                        if this.is_finished() {
-                            this.running = false;
-                        }
-                        cx.notify();
+                let now = std::time::Instant::now();
+                let step = now.saturating_duration_since(last).min(LONGEST_STEP);
+                last = now;
+                let keep_ticking = this.update(cx, |this, cx| {
+                    if !this.running {
+                        return false;
                     }
-                    true
+                    this.elapsed += step;
+                    // A finished countdown stops itself here; left running it
+                    // would tick past zero while the displayed time sat
+                    // saturated at 00:00.
+                    if this.is_finished() {
+                        this.running = false;
+                    }
+                    cx.notify();
+                    this.running
                 });
-                if still_alive.is_err() {
+                if !keep_ticking.unwrap_or(false) {
                     break;
                 }
             }
@@ -89,7 +98,12 @@ impl FocusTimer {
         if !self.running && self.is_finished() {
             self.elapsed = Duration::ZERO;
         }
-        self.running = !self.running;
+        if self.running {
+            self.running = false;
+            self._tick = None;
+        } else {
+            self.start(cx);
+        }
         cx.notify();
     }
 
@@ -101,7 +115,7 @@ impl FocusTimer {
     fn set_mode(&mut self, mode: TimerMode, cx: &mut Context<Self>) {
         self.mode = mode;
         self.elapsed = Duration::ZERO;
-        self.running = true;
+        self.start(cx);
         cx.notify();
     }
 
@@ -289,18 +303,41 @@ impl AutoStyleButton {
             return;
         };
 
-        editor.update(cx, |editor, cx| {
-            // The whole buffer, then the caret back where it was. `autoindent`
-            // works on the selection, so reaching every line means selecting
-            // every line first -- and leaving that selection behind would be a
-            // surprise from a button that claims only to tidy formatting.
-            let original = editor.selections.disjoint_anchors().to_vec();
-            editor.select_all(&editor::actions::SelectAll, window, cx);
-            editor.autoindent(&editor::actions::AutoIndent, window, cx);
-            editor.change_selections(Default::default(), window, cx, |selections| {
-                selections.select_anchors(original);
+        // Where indentation is syntax, re-indenting from the grammar can move
+        // a statement into or out of a block and change what the code does.
+        // Those files are only formatted.
+        const INDENTATION_IS_SYNTAX: [&str; 9] = [
+            "Python",
+            "YAML",
+            "Make",
+            "Haskell",
+            "F#",
+            "Nim",
+            "CoffeeScript",
+            "Sass",
+            "Markdown",
+        ];
+        let indentation_is_syntax = editor
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .and_then(|buffer| buffer.read(cx).language().map(|language| language.name()))
+            .is_some_and(|name| INDENTATION_IS_SYNTAX.contains(&name.as_ref()));
+        if !indentation_is_syntax {
+            editor.update(cx, |editor, cx| {
+                // The whole buffer, then the caret back where it was. `autoindent`
+                // works on the selection, so reaching every line means selecting
+                // every line first -- and leaving that selection behind would be a
+                // surprise from a button that claims only to tidy formatting.
+                let original = editor.selections.disjoint_anchors().to_vec();
+                editor.select_all(&editor::actions::SelectAll, window, cx);
+                editor.autoindent(&editor::actions::AutoIndent, window, cx);
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_anchors(original);
+                });
             });
-        });
+        }
 
         // Dispatched rather than called: `Editor::format` is private, it is
         // async, it routes through the project's language servers and it

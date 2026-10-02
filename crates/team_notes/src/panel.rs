@@ -136,6 +136,9 @@ pub struct TeamNotesPanel {
     /// would sit dimmed until some unrelated event happened to repaint.
     _composer_edits: Option<Subscription>,
     _reload: Option<Task<()>>,
+    /// The latest queued write. Each write waits for the one before it, so
+    /// two quick changes reach the file in the order they were made.
+    _write: Option<Task<()>>,
     /// The repository the records belong to: the one holding the file you are
     /// working in. See [`Self::preferred_root`].
     root: Option<PathBuf>,
@@ -214,6 +217,7 @@ impl TeamNotesPanel {
             team: Vec::new(),
             _composer_edits: None,
             _reload: None,
+            _write: None,
             root,
             _subscriptions: subscriptions,
         };
@@ -375,26 +379,75 @@ impl TeamNotesPanel {
         }));
     }
 
+    /// Shows `records` at once and writes the records that changed to disk.
+    ///
+    /// Only the changed records are written, merged into the file as it is
+    /// on disk at the time of writing. Writing the whole in-memory list
+    /// replaced the file with this window's view of it, deleting whatever a
+    /// pull or another window had added in the meantime.
     fn commit(&mut self, records: Vec<NoteThread>, cx: &mut Context<Self>) {
-        self.records = records.clone();
+        let changed = records
+            .iter()
+            .filter(|record| !self.records.contains(record))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.records = records;
         cx.notify();
 
+        if changed.is_empty() {
+            return;
+        }
         let Some(root) = self.worktree_root(cx) else {
             return;
         };
         let fs = self.fs.clone();
+        let previous = self._write.take();
 
-        cx.background_spawn(async move {
-            let Some(contents) = crate::render(&records).log_err() else {
+        self._write = Some(cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let path = notes_file(&root);
+            let current = match fs.load(&path).await {
+                Ok(current) => current,
+                Err(error) => {
+                    // Unreadable is not empty: writing now would replace every
+                    // record in the file with this window's changes alone.
+                    if fs.is_file(&path).await {
+                        log::error!(
+                            "team notes: could not read {} to save a change: {error:#}",
+                            path.display()
+                        );
+                        return;
+                    }
+                    String::new()
+                }
+            };
+            let mut merged = crate::parse(&current);
+            for record in changed {
+                match merged.iter_mut().find(|existing| existing.id == record.id) {
+                    Some(existing) => *existing = record,
+                    None => merged.push(record),
+                }
+            }
+            let Some(contents) = crate::render(&merged).log_err() else {
                 return;
             };
-            let path = notes_file(&root);
             if let Some(parent) = path.parent() {
                 fs.create_dir(parent).await.log_err();
             }
-            fs.write(&path, contents.as_bytes()).await.log_err();
-        })
-        .detach();
+            if fs.atomic_write(path, contents).await.log_err().is_none() {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                if this.root.as_deref() == Some(root.as_path()) {
+                    merged.sort_by(|left, right| left.id.cmp(&right.id));
+                    this.records = merged;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     fn open_composer(
@@ -1115,16 +1168,17 @@ impl TeamNotesPanel {
                 // fell in a different minute puts a row of text between two
                 // things typed twenty seconds apart, which is most of the space
                 // between messages and none of the information.
+                let at = local_time(&message.at);
                 let stamp = match previous_at.as_deref() {
-                    None => Some(separator_stamp(&message.at, None)),
-                    Some(previous) => match minutes_apart(previous, &message.at) {
+                    None => Some(separator_stamp(&at, None)),
+                    Some(previous) => match minutes_apart(previous, &at) {
                         Some(gap) if gap < STAMP_AFTER_MINUTES => None,
-                        _ => Some(separator_stamp(&message.at, Some(previous))),
+                        _ => Some(separator_stamp(&at, Some(previous))),
                     },
                 };
 
                 previous_author = Some(message.author.clone());
-                previous_at = Some(message.at.clone());
+                previous_at = Some(at);
                 bubbles.push(Bubble {
                     message: message.clone(),
                     mine,
@@ -1258,7 +1312,7 @@ impl TeamNotesPanel {
                                 // every message.
                                 this.child(
                                     h_flex().w_full().justify_end().child(
-                                        Label::new(format!("Sent · {}", short_time(&at)))
+                                        Label::new(format!("Sent · {}", short_time(&local_time(&at))))
                                             .size(LabelSize::XSmall)
                                             .color(Color::Muted),
                                     ),
@@ -1641,6 +1695,22 @@ fn separator_stamp(at: &str, previous_minute: Option<&str>) -> String {
     } else {
         format!("{day} · {time}")
     }
+}
+
+/// A stored RFC 3339 stamp in this machine's time zone, in the same shape.
+///
+/// Stamps are written in UTC so teammates in different zones agree on order;
+/// shown as written, everyone outside UTC read the wrong time of day. Anything
+/// that does not parse is passed through to be shown as is.
+fn local_time(at: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(at)
+        .map(|stamp| {
+            stamp
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|_| at.to_string())
 }
 
 /// `2026-08-29T15:04:05Z` as `15:04`.

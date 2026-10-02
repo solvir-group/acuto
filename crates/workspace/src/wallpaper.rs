@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use gpui::{
-    AnyElement, App, Global, IntoElement, ObjectFit, ParentElement, Styled, StyledImage, Task,
+    AnyElement, App, Global, IntoElement, ObjectFit, ParentElement, Styled, StyledImage,
     Window, WindowBackgroundAppearance, div, img, px,
 };
 use image::{ImageBuffer, ImageReader, Rgb, imageops};
@@ -32,8 +32,14 @@ const COLOURFULNESS: f32 = 0.95;
 #[derive(Default)]
 struct WallpaperBackdrop {
     image: Option<Arc<Path>>,
-    load: Option<Task<()>>,
+    loading: bool,
+    /// When the wallpaper was last looked at. Looked at again after
+    /// [`RECHECK_AFTER`], so a changed wallpaper is picked up and a failed load
+    /// is retried rather than leaving the window without a backdrop for good.
+    checked_at: Option<std::time::Instant>,
 }
+
+const RECHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Global for WallpaperBackdrop {}
 
@@ -91,22 +97,35 @@ pub(crate) fn is_active(cx: &App) -> bool {
 
 fn backdrop_image(cx: &mut App) -> Option<Arc<Path>> {
     let state = cx.default_global::<WallpaperBackdrop>();
-    if state.image.is_some() || state.load.is_some() {
+    let due = state
+        .checked_at
+        .is_none_or(|checked_at| checked_at.elapsed() >= RECHECK_AFTER);
+    if state.loading || !due {
         return state.image.clone();
     }
+    state.loading = true;
+    state.checked_at = Some(std::time::Instant::now());
+    let current = state.image.clone();
+    let previous = current.clone();
 
+    // Cheap when nothing changed: the blurred copy is keyed by the
+    // wallpaper's modification time and found on disk.
     let task = cx
         .background_executor()
         .spawn(async move { blurred_wallpaper() });
-    let load = cx.spawn(async move |cx| {
-        let image = task.await.log_err();
+    cx.spawn(async move |cx| {
+        let image = task.await.log_err().map(Arc::<Path>::from);
         cx.update(|cx| {
-            cx.default_global::<WallpaperBackdrop>().image = image.map(Arc::from);
-            cx.refresh_windows();
+            let state = cx.default_global::<WallpaperBackdrop>();
+            state.loading = false;
+            if image.is_some() && image != previous {
+                state.image = image;
+                cx.refresh_windows();
+            }
         });
-    });
-    cx.default_global::<WallpaperBackdrop>().load = Some(load);
-    None
+    })
+    .detach();
+    current
 }
 
 fn wallpaper_path() -> Result<PathBuf> {

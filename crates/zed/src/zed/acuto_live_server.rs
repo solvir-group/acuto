@@ -365,7 +365,14 @@ impl LiveServerButton {
             async move {
                 let (mut events, _watcher) = fs.watch(&root, WATCH_LATENCY).await;
                 while let Some(batch) = events.next().await {
-                    changes.record(batch.into_iter().map(|event| event.path));
+                    // The editor's own git status refresh touches `.git`
+                    // constantly, and none of it is part of a page.
+                    changes.record(
+                        batch
+                            .into_iter()
+                            .map(|event| event.path)
+                            .filter(|path| is_served_change(&root, path)),
+                    );
                 }
             }
         }));
@@ -480,14 +487,39 @@ async fn serve_connection(
     root: Arc<Path>,
     changes: Arc<ChangeLog>,
 ) {
-    let Some(request_target) = read_request_target(&mut stream).await else {
+    let Some(RequestHead {
+        is_head,
+        target: request_target,
+        host,
+        range,
+    }) = read_request_target(&mut stream).await
+    else {
         return;
     };
 
+    // A page on another site can point its own hostname at 127.0.0.1 and then
+    // read anything served here as same-origin. The Host it sends is still
+    // its own, so only loopback names are answered.
+    if !host.as_deref().is_some_and(is_loopback_host) {
+        stream
+            .write_all(&http_response(
+                403,
+                "text/plain; charset=utf-8",
+                b"Forbidden".to_vec(),
+            ))
+            .await
+            .log_err();
+        stream.close().await.log_err();
+        return;
+    }
+
+    // Split before decoding, so an escaped `?` in a file name stays part of
+    // the name instead of starting the query.
     let (path, query) = match request_target.split_once('?') {
-        Some((path, query)) => (path, query),
-        None => (request_target.as_str(), ""),
+        Some((path, query)) => (percent_decode(path), query),
+        None => (percent_decode(&request_target), ""),
     };
+    let path = path.as_str();
 
     let response = if path == "/__acuto_live_reload" {
         let since = query
@@ -497,7 +529,17 @@ async fn serve_connection(
             .unwrap_or(0);
         await_change(since, &changes, &root).await
     } else {
-        serve_path(path, &root).await
+        serve_path(path, range.as_deref(), &root).await
+    };
+    // HEAD answers with the headers GET would send, Content-Length included,
+    // and no body.
+    let response = if is_head {
+        match response.windows(4).position(|window| window == b"\r\n\r\n") {
+            Some(end) => response[..end + 4].to_vec(),
+            None => response,
+        }
+    } else {
+        response
     };
 
     stream.write_all(&response).await.log_err();
@@ -508,7 +550,15 @@ async fn serve_connection(
 ///
 /// Bounded so a client that never sends a blank line cannot grow this buffer
 /// without limit; a request target longer than this is not one a browser sends.
-async fn read_request_target(stream: &mut smol::net::TcpStream) -> Option<String> {
+/// The parts of a request this server acts on.
+struct RequestHead {
+    is_head: bool,
+    target: String,
+    host: Option<String>,
+    range: Option<String>,
+}
+
+async fn read_request_target(stream: &mut smol::net::TcpStream) -> Option<RequestHead> {
     /// Enough for any real URL plus the headers a browser sends.
     const MAX_REQUEST_BYTES: usize = 16 * 1024;
 
@@ -530,13 +580,65 @@ async fn read_request_target(stream: &mut smol::net::TcpStream) -> Option<String
     }
 
     let head = String::from_utf8_lossy(&buffer);
-    let request_line = head.lines().next()?;
+    let mut lines = head.lines();
+    let request_line = lines.next()?;
     let mut parts = request_line.split(' ');
     let method = parts.next()?;
     if method != "GET" && method != "HEAD" {
         return None;
     }
-    Some(percent_decode(parts.next()?))
+    let target = parts.next()?.to_string();
+    let headers = lines
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect::<Vec<_>>();
+    let header = |wanted: &str| {
+        headers
+            .iter()
+            .find(|(name, _)| name == wanted)
+            .map(|(_, value)| value.clone())
+    };
+    Some(RequestHead {
+        is_head: method == "HEAD",
+        target,
+        host: header("host"),
+        range: header("range"),
+    })
+}
+
+/// The byte range a `Range: bytes=...` header asks for within `length`
+/// bytes, or `None` to send the whole file. Only single ranges, which is what
+/// a media element asks for when it seeks.
+fn requested_range(range: &str, length: usize) -> Option<std::ops::Range<usize>> {
+    let spec = range.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') || length == 0 {
+        return None;
+    }
+    let (start, end) = spec.split_once('-')?;
+    let (start, end) = match (start.trim(), end.trim()) {
+        ("", suffix) => {
+            let suffix = suffix.parse::<usize>().ok()?.min(length);
+            (length - suffix, length - 1)
+        }
+        (start, "") => (start.parse::<usize>().ok()?, length - 1),
+        (start, end) => (start.parse::<usize>().ok()?, end.parse::<usize>().ok()?.min(length - 1)),
+    };
+    (start <= end && start < length).then_some(start..end + 1)
+}
+
+/// Whether a Host header names this machine.
+fn is_loopback_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 /// Holds a reload poll open until something changes, or until it times out.
@@ -548,10 +650,10 @@ async fn await_change(since: u64, changes: &ChangeLog, root: &Path) -> Vec<u8> {
     /// How often the poll checks the filesystem itself rather than only the
     /// watcher's counter.
     ///
-    /// Ten times less often than the tick: walking the tree is far more
+    /// Fifty times less often than the tick: walking the tree is far more
     /// expensive than reading an atomic, and this is a safety net for events
     /// the watcher dropped, not the mechanism anyone should be relying on.
-    const VERIFY_EVERY: u32 = 10;
+    const VERIFY_EVERY: u32 = 50;
 
     let deadline = std::time::Instant::now() + RELOAD_POLL_TIMEOUT;
     let baseline = fingerprint(root).await;
@@ -641,7 +743,7 @@ async fn fingerprint(root: &Path) -> (u64, u64) {
     (count, newest)
 }
 
-async fn serve_path(request_path: &str, root: &Path) -> Vec<u8> {
+async fn serve_path(request_path: &str, range: Option<&str>, root: &Path) -> Vec<u8> {
     let Some(mut path) = resolve_within(root, request_path) else {
         return http_response(403, "text/plain; charset=utf-8", b"Forbidden".to_vec());
     };
@@ -697,8 +799,26 @@ async fn serve_path(request_path: &str, root: &Path) -> Vec<u8> {
     };
 
     let content_type = content_type_for(&path);
-    if content_type.starts_with("text/html") {
+    if content_type == "text/html" {
         return http_response(200, content_type, inject_reload_script(bytes));
+    }
+    if let Some(range) = range.and_then(|range| requested_range(range, bytes.len())) {
+        let total = bytes.len();
+        let mut response = format!(
+            "HTTP/1.1 206 Partial Content\r\n\
+             Content-Type: {content_type}\r\n\
+             Content-Length: {}\r\n\
+             Content-Range: bytes {}-{}/{total}\r\n\
+             Accept-Ranges: bytes\r\n\
+             Cache-Control: no-store\r\n\
+             Connection: close\r\n\r\n",
+            range.len(),
+            range.start,
+            range.end - 1,
+        )
+        .into_bytes();
+        response.extend_from_slice(&bytes[range]);
+        return response;
     }
     http_response(200, content_type, bytes)
 }
@@ -718,6 +838,11 @@ fn resolve_within(root: &Path, request_path: &str) -> Option<PathBuf> {
         if segment == ".." {
             return None;
         }
+        // Hidden files are where secrets live -- `.env`, `.git/config` -- and
+        // no page needs them. `.well-known` is the one hidden path the web uses.
+        if segment.starts_with('.') && segment != ".well-known" {
+            return None;
+        }
         let candidate = Path::new(segment);
         // A segment that is anything other than one plain name -- a drive
         // letter, a UNC prefix, a root -- would reset the path being built.
@@ -730,21 +855,36 @@ fn resolve_within(root: &Path, request_path: &str) -> Option<PathBuf> {
     Some(resolved)
 }
 
+/// Whether a changed path belongs to what is being served, rather than to
+/// version control or build output beside it.
+fn is_served_change(root: &Path, path: &Path) -> bool {
+    const SKIP: [&str; 4] = ["node_modules", "target", "dist", ".next"];
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    !relative.components().any(|component| match component {
+        Component::Normal(name) => {
+            let name = name.to_string_lossy();
+            (name.starts_with('.') && name != ".well-known") || SKIP.contains(&name.as_ref())
+        }
+        _ => false,
+    })
+}
+
 fn inject_reload_script(mut html: Vec<u8>) -> Vec<u8> {
-    let text = String::from_utf8_lossy(&html).into_owned();
-    // Before `</body>` if there is one, so the page's own scripts have run;
-    // appended otherwise, because a fragment without a body tag still executes.
-    match text.rfind("</body>") {
+    const BODY_END: &[u8] = b"</body>";
+    // Spliced into the bytes rather than a decoded copy, so a page in another
+    // encoding comes back byte for byte. Before `</body>` if there is one, so
+    // the page's own scripts have run; appended otherwise, because a fragment
+    // without a body tag still executes.
+    let body_end = html
+        .windows(BODY_END.len())
+        .rposition(|window| window.eq_ignore_ascii_case(BODY_END));
+    match body_end {
         Some(index) => {
-            let mut out = text;
-            out.insert_str(index, RELOAD_SCRIPT);
-            out.into_bytes()
+            html.splice(index..index, RELOAD_SCRIPT.bytes());
         }
-        None => {
-            html.extend_from_slice(RELOAD_SCRIPT.as_bytes());
-            html
-        }
+        None => html.extend_from_slice(RELOAD_SCRIPT.as_bytes()),
     }
+    html
 }
 
 /// A page linking to what is in `directory`, for a folder with no
@@ -863,7 +1003,9 @@ fn content_type_for(path: &Path) -> &'static str {
         .to_ascii_lowercase()
         .as_str()
     {
-        "html" | "htm" => "text/html; charset=utf-8",
+        // No charset: the page's own `<meta charset>` decides, and a header
+        // would override it.
+        "html" | "htm" => "text/html",
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "json" => "application/json; charset=utf-8",
@@ -1000,6 +1142,32 @@ mod tests {
         assert_eq!(resolve_within(root, "/C:/Windows"), None);
         // Empty and `.` segments are noise, not an error.
         assert_eq!(resolve_within(root, "//./a"), Some(root.join("a")));
+        // Hidden files are never served.
+        assert_eq!(resolve_within(root, "/.env"), None);
+        assert_eq!(resolve_within(root, "/.git/config"), None);
+        assert_eq!(
+            resolve_within(root, "/.well-known/x"),
+            Some(root.join(".well-known").join("x"))
+        );
+    }
+
+    #[test]
+    fn byte_ranges_are_read_the_way_media_elements_ask() {
+        assert_eq!(requested_range("bytes=0-", 10), Some(0..10));
+        assert_eq!(requested_range("bytes=2-4", 10), Some(2..5));
+        assert_eq!(requested_range("bytes=-3", 10), Some(7..10));
+        assert_eq!(requested_range("bytes=8-99", 10), Some(8..10));
+        assert_eq!(requested_range("bytes=10-", 10), None);
+        assert_eq!(requested_range("bytes=0-1,4-5", 10), None);
+    }
+
+    #[test]
+    fn only_loopback_hosts_are_answered() {
+        assert!(is_loopback_host("127.0.0.1:5173"));
+        assert!(is_loopback_host("localhost:5173"));
+        assert!(is_loopback_host("[::1]:5173"));
+        assert!(!is_loopback_host("attacker.example:5173"));
+        assert!(!is_loopback_host("attacker.example"));
     }
 
     #[test]

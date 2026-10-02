@@ -302,9 +302,14 @@ impl Dimensions for TerminalBounds {
 impl From<AlacTermEvent> for TerminalBackendEvent {
     fn from(event: AlacTermEvent) -> Self {
         match event {
-            AlacTermEvent::Osc { params, cursor } => Self::Osc {
+            AlacTermEvent::Osc {
+                params,
+                cursor,
+                history_size,
+            } => Self::Osc {
                 params,
                 cursor: terminal_point_from_alacritty(cursor),
+                history_size,
             },
             AlacTermEvent::MouseCursorDirty => Self::MouseCursorDirty,
             AlacTermEvent::Title(title) => Self::Title(title),

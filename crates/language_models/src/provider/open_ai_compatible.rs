@@ -272,10 +272,18 @@ fn with_extra_body(
     let Some(extra) = extra.and_then(|value| value.as_object()) else {
         return request;
     };
+    // The extra fields are flattened into the same JSON object as the typed
+    // ones, so one that repeats a typed field would be sent twice.
+    let typed_fields = serde_json::to_value(&request)
+        .ok()
+        .and_then(|value| value.as_object().map(|fields| fields.keys().cloned().collect()))
+        .unwrap_or_else(std::collections::HashSet::<String>::new);
     for (key, value) in extra {
-        if !request.extra_body.contains_key(key) {
-            request.extra_body.insert(key.clone(), value.clone());
+        if typed_fields.contains(key) {
+            log::warn!("extra_body: `{key}` is already set by the request and is ignored");
+            continue;
         }
+        request.extra_body.insert(key.clone(), value.clone());
     }
     request
 }

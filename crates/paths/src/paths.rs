@@ -51,6 +51,11 @@ pub const APP_NAME_LOWERCASE: &str = {
 /// The directory will be created if it doesn't exist when set.
 static CUSTOM_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// Whether `--user-data-dir` moved the data directory for this process.
+pub fn has_custom_data_dir() -> bool {
+    CUSTOM_DATA_DIR.get().is_some()
+}
+
 /// The resolved data directory, combining custom override or platform defaults.
 /// This is set once and cached for subsequent calls.
 /// On macOS, this is `~/Library/Application Support/Zed`.

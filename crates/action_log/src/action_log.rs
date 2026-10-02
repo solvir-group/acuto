@@ -5,7 +5,8 @@ use collections::{BTreeMap, HashMap};
 use fs::MTime;
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
-    App, AppContext, AsyncApp, Context, Entity, SharedString, Subscription, Task, WeakEntity,
+    App, AppContext, AsyncApp, Context, Entity, SharedString, Subscription, Task, TaskExt as _,
+    WeakEntity,
 };
 use language::{Anchor, Buffer, BufferEvent, Point};
 use project::{Project, ProjectItem, lsp_store::OpenLspBufferHandle};
@@ -83,6 +84,9 @@ pub struct ActionLog {
     /// from here, so an agent write that lands before the file is claimed is
     /// still measured against the text it replaced.
     turn_start_snapshots: HashMap<Entity<Buffer>, text::BufferSnapshot>,
+    /// Watches the turn-start buffers that are not tracked yet, so typing in
+    /// them moves their snapshot forward and a reload claims them on the spot.
+    _turn_start_subscriptions: Vec<Subscription>,
     /// Whether the agent has changed any file since the current turn began.
     agent_edited_this_turn: bool,
     /// Buffers that we want to notify the model about when they change.
@@ -109,6 +113,7 @@ impl ActionLog {
         Self {
             agent_turn_active: false,
             turn_start_snapshots: HashMap::default(),
+            _turn_start_subscriptions: Vec::new(),
             agent_edited_this_turn: false,
             tracked_buffers: BTreeMap::default(),
             project,
@@ -229,7 +234,9 @@ impl ActionLog {
                     agent_writes_to_disk: false,
                     diff_base,
                     unreviewed_edits: Patch::default(),
+                    changes: Vec::new(),
                     accepted: Vec::new(),
+                    user_edited: false,
                     snapshot: text_snapshot,
                     status,
                     version: buffer.read(cx).version(),
@@ -282,10 +289,12 @@ impl ActionLog {
             return;
         };
         // A reload applies the disk's contents and marks them saved in the same
-        // step, so a buffer that changed and is still clean was reloaded. Typing
-        // always leaves it dirty. So a clean change to a file the agent writes,
-        // or to any tracked file while the agent is working, is the agent's.
-        let reloaded = !buffer.read(cx).is_dirty();
+        // step. Typing always leaves the buffer dirty; undoing back to the saved
+        // text leaves it clean but at a version the save never saw. So a change
+        // that left the buffer clean *at its saved version* came from disk, and
+        // to a file the agent writes, or to any tracked file while the agent is
+        // working, it is the agent's.
+        let reloaded = was_reloaded(buffer.read(cx));
         if reloaded && (tracked_buffer.agent_writes_to_disk || self.agent_turn_active) {
             log::info!(
                 "agent review: {} changed on disk, recorded as the agent's edit",
@@ -358,16 +367,16 @@ impl ActionLog {
     async fn maintain_diff(
         this: WeakEntity<Self>,
         buffer: Entity<Buffer>,
-        mut updates: mpsc::UnboundedReceiver<(Arc<str>, text::BufferSnapshot)>,
+        mut updates: mpsc::UnboundedReceiver<DiffUpdate>,
         cx: &mut AsyncApp,
     ) -> Result<()> {
         while let Some(mut update) = updates.next().await {
             // Only the newest matters; anything queued behind it is already
             // out of date.
-            while let Ok(Some(newer)) = updates.try_next() {
+            while let Ok(newer) = updates.try_recv() {
                 update = newer;
             }
-            let (base_text, buffer_snapshot) = update;
+            let (base_text, buffer_snapshot, line_changes) = update;
             let diff = this.read_with(cx, |this, _cx| {
                 this.tracked_buffers
                     .get(&buffer)
@@ -377,7 +386,7 @@ impl ActionLog {
                 break;
             };
             diff.update(cx, |diff, cx| {
-                diff.set_base_text(Some(base_text), buffer_snapshot, cx)
+                diff.set_base_text_with_line_changes(base_text, buffer_snapshot, line_changes, cx)
             })
             .await;
             this.update(cx, |_this, cx| cx.notify())?;
@@ -448,6 +457,21 @@ impl ActionLog {
                 cx.notify();
             }
         }
+        // Rejections are let go on the same rule: kept while their file is
+        // still under review, dropped once it was all answered and the agent
+        // moves on. Without this the list only ever grew.
+        let tracked_buffers = &self.tracked_buffers;
+        let rejected_before = self.rejected_hunks.len();
+        self.rejected_hunks.retain(|hunk| {
+            hunk.buffer.upgrade().is_some_and(|buffer| {
+                tracked_buffers
+                    .get(&buffer)
+                    .is_some_and(|tracked| !tracked.unreviewed_edits.is_empty())
+            })
+        });
+        if self.rejected_hunks.len() != rejected_before {
+            cx.notify();
+        }
         self.turn_start_snapshots = open_buffers
             .into_iter()
             .map(|buffer| {
@@ -455,6 +479,41 @@ impl ActionLog {
                 (buffer, snapshot)
             })
             .collect();
+        self._turn_start_subscriptions = self
+            .turn_start_snapshots
+            .keys()
+            .map(|buffer| cx.subscribe(buffer, Self::handle_turn_start_buffer_event))
+            .collect();
+    }
+
+    /// Keeps a turn-start snapshot honest for a buffer not yet tracked.
+    ///
+    /// Without this, everything typed in an open file during a turn sat between
+    /// the snapshot and the file, and the moment the agent claimed the file it
+    /// was offered for review as the agent's -- Reject threw the typing away.
+    fn handle_turn_start_buffer_event(
+        &mut self,
+        buffer: Entity<Buffer>,
+        event: &BufferEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(event, BufferEvent::Edited { .. })
+            || !self.agent_turn_active
+            || self.tracked_buffers.contains_key(&buffer)
+            || !self.turn_start_snapshots.contains_key(&buffer)
+        {
+            return;
+        }
+        if was_reloaded(buffer.read(cx)) {
+            log::info!(
+                "agent review: {} changed on disk during the turn, recorded as the agent's edit",
+                buffer_display_path(&buffer, cx)
+            );
+            self.agent_will_write(buffer, cx);
+        } else {
+            let snapshot = buffer.read(cx).text_snapshot();
+            self.turn_start_snapshots.insert(buffer, snapshot);
+        }
     }
 
     /// Whether a prompt is in flight.
@@ -475,6 +534,7 @@ impl ActionLog {
     pub fn end_agent_turn(&mut self) {
         self.agent_turn_active = false;
         self.turn_start_snapshots.clear();
+        self._turn_start_subscriptions.clear();
         for tracked_buffer in self.tracked_buffers.values_mut() {
             tracked_buffer.agent_writes_to_disk = false;
         }
@@ -631,15 +691,18 @@ impl ActionLog {
     ///
     /// - An empty range is a click or a cursor. It answers the deletion it sits
     ///   on, or else the line it is in.
-    /// - A range over the whole buffer answers everything.
     /// - Any other range answers the lines it overlaps and the deletions inside
     ///   it. A hunk's range ends where the next line starts, so a change there
     ///   is not part of it: reading it as included made every Keep and Reject
     ///   take two lines.
     fn reviewed_changes(
         tracked_buffer: &TrackedBuffer,
-        ranges: &[Range<usize>],
+        selection: &Selection,
     ) -> Vec<ReviewedChange> {
+        let ranges = match selection {
+            Selection::Everything => return Self::all_changes(tracked_buffer),
+            Selection::Ranges(ranges) => ranges,
+        };
         let snapshot = &tracked_buffer.snapshot;
         let len = snapshot.len();
         let unterminated = snapshot.reversed_chars_at(len).next().is_some_and(|c| c != '\n');
@@ -668,8 +731,6 @@ impl ActionLog {
                             && (offset < change.end || (offset == change.end && at_unterminated_end));
                     }
                 }
-            } else if range.start == 0 && range.end >= len {
-                answered.iter_mut().for_each(|answered| *answered = true);
             } else {
                 for (answered, change) in answered.iter_mut().zip(&bytes) {
                     *answered |= if change.is_empty() {
@@ -689,13 +750,12 @@ impl ActionLog {
 
     /// The buffer's changes the log has not had answered, one per line.
     fn all_changes(tracked_buffer: &TrackedBuffer) -> Vec<ReviewedChange> {
-        let base_text = tracked_buffer.diff_base.to_string();
-        let buffer_text = tracked_buffer.snapshot.text();
-        buffer_diff::line_changes(&base_text, &buffer_text, true)
-            .into_iter()
+        tracked_buffer
+            .changes
+            .iter()
             .map(|(base_rows, buffer_rows)| ReviewedChange {
-                base_rows,
-                buffer_rows,
+                base_rows: base_rows.clone(),
+                buffer_rows: buffer_rows.clone(),
             })
             .collect()
     }
@@ -724,6 +784,31 @@ impl ActionLog {
         cx: &mut Context<Self>,
     ) {
         self.catch_up(&buffer, cx);
+        let Some(tracked_buffer) = self.tracked_buffers.get(&buffer) else {
+            return;
+        };
+        let selection = Selection::Ranges(offset_ranges(&tracked_buffer.snapshot, buffer_ranges));
+        self.keep_selected_edits(buffer, selection, telemetry, cx);
+    }
+
+    /// Accepts every agent change in the buffer.
+    pub fn keep_all_edits_in_buffer(
+        &mut self,
+        buffer: Entity<Buffer>,
+        telemetry: Option<ActionLogTelemetry>,
+        cx: &mut Context<Self>,
+    ) {
+        self.keep_selected_edits(buffer, Selection::Everything, telemetry, cx);
+    }
+
+    fn keep_selected_edits(
+        &mut self,
+        buffer: Entity<Buffer>,
+        selection: Selection,
+        telemetry: Option<ActionLogTelemetry>,
+        cx: &mut Context<Self>,
+    ) {
+        self.catch_up(&buffer, cx);
         let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
             return;
         };
@@ -736,8 +821,7 @@ impl ActionLog {
                 cx.notify();
             }
             _ => {
-                let ranges = offset_ranges(&tracked_buffer.snapshot, buffer_ranges);
-                let accepted = Self::reviewed_changes(tracked_buffer, &ranges);
+                let accepted = Self::reviewed_changes(tracked_buffer, &selection);
                 tracked_buffer.remember_accepted(&accepted);
                 // Latest first, so each replacement leaves the rows of the ones
                 // before it where they were.
@@ -768,7 +852,7 @@ impl ActionLog {
                 {
                     tracked_buffer.status = TrackedBufferStatus::Modified;
                 }
-                tracked_buffer.refresh();
+                tracked_buffer.settle_answers(&accepted, Answer::Kept);
                 cx.notify();
             }
         }
@@ -781,6 +865,31 @@ impl ActionLog {
         &mut self,
         buffer: Entity<Buffer>,
         buffer_ranges: Vec<Range<impl language::ToPoint>>,
+        telemetry: Option<ActionLogTelemetry>,
+        cx: &mut Context<Self>,
+    ) -> (Task<Result<()>>, Option<PerBufferUndo>) {
+        self.catch_up(&buffer, cx);
+        let Some(tracked_buffer) = self.tracked_buffers.get(&buffer) else {
+            return (Task::ready(Ok(())), None);
+        };
+        let selection = Selection::Ranges(offset_ranges(&tracked_buffer.snapshot, buffer_ranges));
+        self.reject_selected_edits(buffer, selection, telemetry, cx)
+    }
+
+    /// Rejects every agent change in the buffer.
+    pub fn reject_all_edits_in_buffer(
+        &mut self,
+        buffer: Entity<Buffer>,
+        telemetry: Option<ActionLogTelemetry>,
+        cx: &mut Context<Self>,
+    ) -> (Task<Result<()>>, Option<PerBufferUndo>) {
+        self.reject_selected_edits(buffer, Selection::Everything, telemetry, cx)
+    }
+
+    fn reject_selected_edits(
+        &mut self,
+        buffer: Entity<Buffer>,
+        selection: Selection,
         telemetry: Option<ActionLogTelemetry>,
         cx: &mut Context<Self>,
     ) -> (Task<Result<()>>, Option<PerBufferUndo>) {
@@ -801,9 +910,8 @@ impl ActionLog {
         // lines the user kept is no longer the agent's alone, and turning down
         // the rest of it must not take the kept lines with it. Deleting there
         // is what made a file vanish after part of it had been accepted.
-        let (ranges, rejects_whole_file, change_count) = {
-            let ranges = offset_ranges(&tracked_buffer.snapshot, buffer_ranges);
-            let selected = Self::reviewed_changes(tracked_buffer, &ranges);
+        let (rejects_whole_file, change_count) = {
+            let selected = Self::reviewed_changes(tracked_buffer, &selection);
             let all = Self::all_changes(tracked_buffer);
             let count = selected.len();
             let nothing_accepted = tracked_buffer.diff_base.len() == 0;
@@ -816,11 +924,10 @@ impl ActionLog {
             let untouched_since_agent = match &tracked_buffer.status {
                 TrackedBufferStatus::Created {
                     existing_file_content: None,
-                } => tracked_buffer.version == buffer.read(cx).version(),
+                } => !tracked_buffer.user_edited,
                 _ => true,
             };
             (
-                ranges,
                 nothing_accepted && untouched_since_agent && !all.is_empty() && count == all.len(),
                 count,
             )
@@ -908,7 +1015,7 @@ impl ActionLog {
                 // The same hunks the panel offers, reverted one by one. Going
                 // through `unreviewed_edits` would revert whole runs of
                 // touching lines at once, because a `Patch` merges them.
-                let rejected = Self::reviewed_changes(tracked_buffer, &ranges);
+                let rejected = Self::reviewed_changes(tracked_buffer, &selection);
                 log::info!("agent review: reverting {} line change(s)", rejected.len());
                 let base = tracked_buffer.diff_base.clone();
                 let mut newline_only = Vec::new();
@@ -953,8 +1060,8 @@ impl ActionLog {
                 }
                 // Taken in now rather than when the edit event arrives, so an
                 // answer given straight after this one sees the reverted text.
-                // The reverted lines equal the base, so they leave review.
-                tracked_buffer.observe(ChangeAuthor::User, cx);
+                tracked_buffer.snapshot = buffer.read(cx).text_snapshot();
+                tracked_buffer.settle_answers(&rejected, Answer::Rejected);
 
                 let reviewed = rejected
                     .iter()
@@ -1034,12 +1141,40 @@ impl ActionLog {
             return false;
         };
 
+        // Anything typed since the log last looked is the user's, and has to
+        // be taken in as theirs before the restored text is marked the agent's.
+        if self.tracked_buffers.contains_key(&buffer) {
+            self.catch_up(&buffer, cx);
+        } else {
+            self.buffer_read(buffer.clone(), cx);
+        }
         buffer.update(cx, |buffer, cx| {
             buffer.edit([(hunk.range.clone(), hunk.agent_text.clone())], None, cx);
         });
         // Re-tracked as an agent edit, so the restored hunk reappears in review
         // rather than being mistaken for something the user typed.
-        self.buffer_edited(buffer, cx);
+        self.buffer_edited(buffer.clone(), cx);
+        // The undo of the rejection this restores would put the same text back
+        // a second time.
+        if let Some(undo) = self.last_reject_undo.as_mut() {
+            for per_buffer in &mut undo.buffers {
+                if per_buffer.buffer.entity_id() == buffer.entity_id() {
+                    per_buffer.edits_to_restore.retain(|(range, agent_text)| {
+                        *range != hunk.range || *agent_text != hunk.agent_text
+                    });
+                }
+            }
+            undo.buffers
+                .retain(|per_buffer| !per_buffer.edits_to_restore.is_empty());
+            if undo.buffers.is_empty() {
+                self.last_reject_undo = None;
+            }
+        }
+        // Rejecting wrote the original to disk; taking it back has to as well,
+        // or an agent reading the file sees the rejection still in force.
+        self.project
+            .update(cx, |project, cx| project.save_buffer(buffer, cx))
+            .detach_and_log_err(cx);
         cx.notify();
         true
     }
@@ -1101,11 +1236,8 @@ impl ActionLog {
             .map(|(buffer, _)| buffer)
             .collect::<Vec<_>>()
         {
-            let buffer_ranges = vec![Anchor::min_max_range_for_buffer(
-                buffer.read(cx).remote_id(),
-            )];
             let (reject_task, undo_info) =
-                self.reject_edits_in_ranges(buffer, buffer_ranges, telemetry.clone(), cx);
+                self.reject_all_edits_in_buffer(buffer, telemetry.clone(), cx);
 
             if let Some(undo) = undo_info {
                 undo_buffers.push(undo);
@@ -1153,25 +1285,41 @@ impl ActionLog {
                 continue;
             };
 
-            buffer.update(cx, |buffer, cx| {
-                let mut valid_edits = Vec::new();
+            let buffer_id = buffer.read(cx).remote_id();
+            let valid_edits = per_buffer_undo
+                .edits_to_restore
+                .into_iter()
+                .filter(|(anchor_range, _)| {
+                    anchor_range.start.buffer_id == buffer_id
+                        && anchor_range.end.buffer_id == buffer_id
+                })
+                .collect::<Vec<_>>();
+            if valid_edits.is_empty() {
+                continue;
+            }
 
-                for (anchor_range, text_to_restore) in per_buffer_undo.edits_to_restore {
-                    if anchor_range.start.buffer_id == buffer.remote_id()
-                        && anchor_range.end.buffer_id == buffer.remote_id()
-                    {
-                        valid_edits.push((anchor_range, text_to_restore));
-                    }
-                }
+            // The text as it is now is the base the restored lines are
+            // measured against. Applied as a plain edit and left to the edit
+            // event, the restored lines were taken for the user's typing and
+            // folded into the base: undo silently accepted them.
+            if self.tracked_buffers.contains_key(&buffer) {
+                self.catch_up(&buffer, cx);
+            } else {
+                self.buffer_read(buffer.clone(), cx);
+            }
 
-                if !valid_edits.is_empty() {
-                    buffer.edit(valid_edits, None, cx);
-                }
+            let entity_id = buffer.entity_id();
+            self.rejected_hunks.retain(|hunk| {
+                hunk.buffer.entity_id() != entity_id
+                    || !valid_edits.iter().any(|(range, agent_text)| {
+                        *range == hunk.range && *agent_text == hunk.agent_text
+                    })
             });
 
-            if !self.tracked_buffers.contains_key(&buffer) {
-                self.buffer_edited(buffer.clone(), cx);
-            }
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit(valid_edits, None, cx);
+            });
+            self.buffer_edited(buffer.clone(), cx);
 
             let save = self
                 .project
@@ -1431,6 +1579,13 @@ fn point_to_row_edit(edit: Edit<Point>, old_text: &Rope, new_text: &Rope) -> Edi
     }
 }
 
+/// A base text, the buffer it is compared with, and the changes between them.
+type DiffUpdate = (
+    Arc<str>,
+    text::BufferSnapshot,
+    Arc<[(Range<u32>, Range<u32>)]>,
+);
+
 #[derive(Copy, Clone, Debug)]
 enum ChangeAuthor {
     User,
@@ -1459,11 +1614,18 @@ pub struct TrackedBuffer {
     /// Lines accepted in this review. They are no longer changes, so they are
     /// no longer highlighted, but they stay in the review pane for reference.
     accepted: Vec<Range<Anchor>>,
+    /// Whether the user has typed in the buffer since it was tracked. The
+    /// log's own reverts are not counted.
+    user_edited: bool,
     status: TrackedBufferStatus,
     version: clock::Global,
     diff: Entity<BufferDiff>,
     snapshot: text::BufferSnapshot,
-    diff_update: mpsc::UnboundedSender<(Arc<str>, text::BufferSnapshot)>,
+    /// What is left to answer, one change per line, as rows of `diff_base`
+    /// and of `snapshot`. The diff is drawn from these, and answering a line
+    /// takes that line out and leaves the rest paired as they were.
+    changes: Vec<(Range<u32>, Range<u32>)>,
+    diff_update: mpsc::UnboundedSender<DiffUpdate>,
     _open_lsp_handle: OpenLspBufferHandle,
     _maintain_diff: Task<()>,
     _subscription: Subscription,
@@ -1492,7 +1654,23 @@ impl TrackedBuffer {
     /// being reviewed.
     fn observe(&mut self, author: ChangeAuthor, cx: &App) {
         let new_snapshot = self.buffer.read(cx).text_snapshot();
+        // Already taken in, as a rejection's own edit is. Working the changes
+        // out again would throw away how the remaining lines are paired.
+        if new_snapshot.version() == self.snapshot.version() {
+            return;
+        }
         if let ChangeAuthor::User = author {
+            self.user_edited = true;
+        }
+        // A new file is the agent's change as a whole until some of it is
+        // accepted, so nothing typed into it is set apart as the user's: an
+        // agent's write that arrives as a plain edit before the agent says so
+        // would otherwise be taken as the user's and never offered for review.
+        let whole_file_under_review =
+            matches!(self.status, TrackedBufferStatus::Created { .. }) && self.diff_base.len() == 0;
+        if let ChangeAuthor::User = author
+            && !whole_file_under_review
+        {
             let edits = diff_snapshots(&self.snapshot, &new_snapshot);
             apply_non_conflicting_edits(
                 &self.unreviewed_edits,
@@ -1505,18 +1683,96 @@ impl TrackedBuffer {
         self.refresh();
     }
 
-    /// Recomputes what is left to answer and redraws the diff.
+    /// Works out afresh what is left to answer and redraws the diff.
     fn refresh(&mut self) {
         let base_text = self.diff_base.to_string();
         let buffer_text = self.snapshot.text();
-        self.unreviewed_edits = Patch::new(
-            buffer_diff::line_changes(&base_text, &buffer_text, false)
-                .into_iter()
-                .map(|(old, new)| Edit { old, new })
-                .collect(),
-        );
+        self.changes = buffer_diff::line_changes(&base_text, &buffer_text, true);
+        self.publish(base_text);
+    }
+
+    /// Takes the answered lines out of what is left to answer, after the base
+    /// (kept) or the buffer (rejected) was edited to agree with the other side
+    /// on them.
+    ///
+    /// Every other line stays paired as it was, with its rows moved by the
+    /// lines added or removed before it. Working the changes out afresh
+    /// instead can pair identical lines differently each time, so a line
+    /// nobody answered would turn from added into deleted-and-added. The
+    /// result is checked against the texts, and worked out afresh only if it
+    /// does not describe them.
+    fn settle_answers(&mut self, answered: &[ReviewedChange], answer: Answer) {
+        let mut shift = 0i64;
+        let mut remaining = Vec::with_capacity(self.changes.len());
+        let mut out_of_range = false;
+        for (base_rows, buffer_rows) in &self.changes {
+            if answered
+                .iter()
+                .any(|change| change.base_rows == *base_rows && change.buffer_rows == *buffer_rows)
+            {
+                let base_len = i64::from(base_rows.end - base_rows.start);
+                let buffer_len = i64::from(buffer_rows.end - buffer_rows.start);
+                shift += match answer {
+                    Answer::Kept => buffer_len - base_len,
+                    Answer::Rejected => base_len - buffer_len,
+                };
+                continue;
+            }
+            let shifted = |rows: &Range<u32>| -> Option<Range<u32>> {
+                Some(
+                    u32::try_from(i64::from(rows.start) + shift).ok()?
+                        ..u32::try_from(i64::from(rows.end) + shift).ok()?,
+                )
+            };
+            let moved = match answer {
+                Answer::Kept => shifted(base_rows).map(|rows| (rows, buffer_rows.clone())),
+                Answer::Rejected => shifted(buffer_rows).map(|rows| (base_rows.clone(), rows)),
+            };
+            match moved {
+                Some(change) => remaining.push(change),
+                None => out_of_range = true,
+            }
+        }
+        let base_text = self.diff_base.to_string();
+        let buffer_text = self.snapshot.text();
+        match (!out_of_range)
+            .then(|| describe_exactly(&base_text, &buffer_text, remaining))
+            .flatten()
+        {
+            Some(changes) => {
+                self.changes = changes;
+                self.publish(base_text);
+            }
+            None => {
+                log::warn!("agent review: remaining changes no longer line up, recomputing them");
+                self.refresh();
+            }
+        }
+    }
+
+    fn publish(&mut self, base_text: String) {
+        let mut edits: Vec<Edit<u32>> = Vec::with_capacity(self.changes.len());
+        // One run of touching lines is one edit: a `Patch` cannot hold edits
+        // that touch.
+        for (old, new) in &self.changes {
+            match edits.last_mut() {
+                Some(last) if old.start <= last.old.end || new.start <= last.new.end => {
+                    last.old.end = last.old.end.max(old.end);
+                    last.new.end = last.new.end.max(new.end);
+                }
+                _ => edits.push(Edit {
+                    old: old.clone(),
+                    new: new.clone(),
+                }),
+            }
+        }
+        self.unreviewed_edits = Patch::new(edits);
         self.diff_update
-            .unbounded_send((Arc::from(base_text), self.snapshot.clone()))
+            .unbounded_send((
+                Arc::from(base_text),
+                self.snapshot.clone(),
+                Arc::from(self.changes.clone()),
+            ))
             .ok();
     }
 
@@ -1529,6 +1785,53 @@ impl TrackedBuffer {
                 .push(snapshot.anchor_before(bytes.start)..snapshot.anchor_after(bytes.end));
         }
     }
+}
+
+/// Which of a buffer's changes an answer is for.
+///
+/// The whole buffer is said outright rather than as a range over it: a range
+/// spanning a one-line file is also exactly that line's hunk, and taking it as
+/// the whole file answered the deletion after the line along with it.
+enum Selection {
+    Ranges(Vec<Range<usize>>),
+    Everything,
+}
+
+#[derive(Clone, Copy)]
+enum Answer {
+    Kept,
+    Rejected,
+}
+
+/// `changes` if they describe `base` against `buffer` exactly -- in order,
+/// within both texts, with identical lines between them -- leaving out any
+/// whose two sides have come to read the same. `None` if they do not.
+fn describe_exactly(
+    base: &str,
+    buffer: &str,
+    changes: Vec<(Range<u32>, Range<u32>)>,
+) -> Option<Vec<(Range<u32>, Range<u32>)>> {
+    let base_lines = base.split_inclusive('\n').collect::<Vec<_>>();
+    let buffer_lines = buffer.split_inclusive('\n').collect::<Vec<_>>();
+    let mut base_row = 0usize;
+    let mut buffer_row = 0usize;
+    let mut described = Vec::with_capacity(changes.len());
+    for (base_rows, buffer_rows) in changes {
+        let base_range = base_rows.start as usize..base_rows.end as usize;
+        let buffer_range = buffer_rows.start as usize..buffer_rows.end as usize;
+        let unchanged_before = base_lines.get(base_row..base_range.start)?;
+        if unchanged_before != buffer_lines.get(buffer_row..buffer_range.start)? {
+            return None;
+        }
+        let base_side = base_lines.get(base_range.clone())?;
+        let buffer_side = buffer_lines.get(buffer_range.clone())?;
+        if base_side != buffer_side {
+            described.push((base_rows, buffer_rows));
+        }
+        base_row = base_range.end;
+        buffer_row = buffer_range.end;
+    }
+    (base_lines.get(base_row..)? == buffer_lines.get(buffer_row..)?).then_some(described)
 }
 
 /// Where a run of whole lines goes in `target`, and the text to put there.
@@ -1565,6 +1868,12 @@ fn offset_ranges(
                 ..snapshot.point_to_offset(range.end.to_point(snapshot))
         })
         .collect()
+}
+
+/// Whether the buffer's latest change was a reload from disk: clean, and at the
+/// version the reload marked as saved.
+fn was_reloaded(buffer: &Buffer) -> bool {
+    !buffer.is_dirty() && *buffer.saved_version() == buffer.version()
 }
 
 fn buffer_display_path(buffer: &Entity<Buffer>, cx: &App) -> String {
@@ -1625,7 +1934,6 @@ mod tests {
     use super::*;
     use buffer_diff::DiffHunkStatusKind;
     use gpui::TestAppContext;
-    use indoc::indoc;
     use language::{OffsetRangeExt, Point};
     use project::{FakeFs, Fs, Project, RemoveOptions};
     use rand::prelude::*;
@@ -2335,7 +2643,14 @@ mod tests {
             hunks
                 .iter()
                 .filter(|hunk| !newline_only(hunk))
-                .map(|hunk| (hunk.old_text.clone(), hunk.new_text.clone()))
+                // Compared without the newline at the end: the unterminated
+                // last line gains one when a line is put back after it.
+                .map(|hunk| {
+                    (
+                        hunk.old_text.trim_end_matches('\n').to_string(),
+                        hunk.new_text.trim_end_matches('\n').to_string(),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -2875,7 +3190,7 @@ line7
 
         action_log.update(cx, |log, cx| {
             // Both rewritten lines, since each is now answered separately.
-            log.keep_edits_in_range(buffer.clone(), Point::new(0, 0)..Point::new(2, 0), None, cx)
+            log.keep_edits_in_range(buffer.clone(), Point::new(0, 0)..Point::new(3, 0), None, cx)
         });
         cx.run_until_parked();
         assert_eq!(unreviewed_hunks(&action_log, cx), vec![]);
@@ -3298,7 +3613,7 @@ line7
                     buffer.clone(),
                     // The rewritten line and the line added below it: two
                     // changes now, each answered on its own.
-                    vec![Point::new(0, 0)..Point::new(2, 0)],
+                    vec![Point::new(0, 0)..Point::new(3, 0)],
                     None,
                     cx,
                 );
@@ -3405,7 +3720,7 @@ line7
 
         action_log.update(cx, |log, cx| {
             let range_1 = buffer.read(cx).anchor_before(Point::new(0, 0))
-                ..buffer.read(cx).anchor_before(Point::new(2, 0));
+                ..buffer.read(cx).anchor_before(Point::new(3, 0));
             let range_2 = buffer.read(cx).anchor_before(Point::new(5, 0))
                 ..buffer.read(cx).anchor_before(Point::new(5, 3));
 
@@ -3667,11 +3982,12 @@ three
             .unwrap();
         cx.run_until_parked();
 
-        // File should still contain all the content
+        // Every line on screen was turned down, so every line goes -- but the
+        // file stays, since the user has written in it.
         assert!(fs.is_file(path!("/dir/new_file").as_ref()).await);
 
         let content = buffer.read_with(cx, |buffer, _| buffer.text());
-        assert_eq!(content, "ai content\nuser added this line");
+        assert_eq!(content, "");
     }
 
     #[gpui::test]
@@ -3903,350 +4219,6 @@ three
                 pretty_assertions::assert_eq!(old_text.to_string(), new_text.to_string());
             })
         }
-    }
-
-    #[gpui::test]
-    async fn test_keep_edits_on_commit(cx: &mut gpui::TestAppContext) {
-        init_test(cx);
-
-        let fs = FakeFs::new(cx.background_executor.clone());
-        fs.insert_tree(
-            path!("/project"),
-            json!({
-                ".git": {},
-                "file.txt": "a\nb\nc\nd\ne\nf\ng\nh\ni\nj",
-            }),
-        )
-        .await;
-        fs.set_head_for_repo(
-            path!("/project/.git").as_ref(),
-            &[("file.txt", "a\nb\nc\nd\ne\nf\ng\nh\ni\nj".into())],
-            "0000000",
-        );
-        cx.run_until_parked();
-
-        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
-        let action_log = cx.new(|_| ActionLog::new(project.clone()));
-
-        let file_path = project
-            .read_with(cx, |project, cx| {
-                project.find_project_path(path!("/project/file.txt"), cx)
-            })
-            .unwrap();
-        let buffer = project
-            .update(cx, |project, cx| project.open_buffer(file_path, cx))
-            .await
-            .unwrap();
-
-        cx.update(|cx| {
-            action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
-            buffer.update(cx, |buffer, cx| {
-                buffer.edit(
-                    [
-                        // Edit at the very start: a -> A
-                        (Point::new(0, 0)..Point::new(0, 1), "A"),
-                        // Deletion in the middle: remove lines d and e
-                        (Point::new(3, 0)..Point::new(5, 0), ""),
-                        // Modification: g -> GGG
-                        (Point::new(6, 0)..Point::new(6, 1), "GGG"),
-                        // Addition: insert new line after h
-                        (Point::new(7, 1)..Point::new(7, 1), "\nNEW"),
-                        // Edit the very last character: j -> J
-                        (Point::new(9, 0)..Point::new(9, 1), "J"),
-                    ],
-                    None,
-                    cx,
-                );
-            });
-            action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            unreviewed_hunks(&action_log, cx),
-            vec![(
-                buffer.clone(),
-                vec![
-                    HunkStatus {
-                        range: Point::new(0, 0)..Point::new(1, 0),
-                        diff_status: DiffHunkStatusKind::Modified,
-                        old_text: "a\n".into()
-                    },
-                    HunkStatus {
-                        range: Point::new(3, 0)..Point::new(3, 0),
-                        diff_status: DiffHunkStatusKind::Deleted,
-                        old_text: "d\ne\n".into()
-                    },
-                    HunkStatus {
-                        range: Point::new(4, 0)..Point::new(5, 0),
-                        diff_status: DiffHunkStatusKind::Modified,
-                        old_text: "g\n".into()
-                    },
-                    HunkStatus {
-                        range: Point::new(6, 0)..Point::new(7, 0),
-                        diff_status: DiffHunkStatusKind::Added,
-                        old_text: "".into()
-                    },
-                    HunkStatus {
-                        range: Point::new(8, 0)..Point::new(8, 1),
-                        diff_status: DiffHunkStatusKind::Modified,
-                        old_text: "j".into()
-                    }
-                ]
-            )]
-        );
-
-        // Simulate a git commit that matches some edits but not others:
-        // - Accepts the first edit (a -> A)
-        // - Accepts the deletion (remove d and e)
-        // - Makes a different change to g (g -> G instead of GGG)
-        // - Ignores the NEW line addition
-        // - Ignores the last line edit (j stays as j)
-        fs.set_head_for_repo(
-            path!("/project/.git").as_ref(),
-            &[("file.txt", "A\nb\nc\nf\nG\nh\ni\nj".into())],
-            "0000001",
-        );
-        cx.run_until_parked();
-        assert_eq!(
-            unreviewed_hunks(&action_log, cx),
-            vec![(
-                buffer.clone(),
-                vec![
-                    HunkStatus {
-                        range: Point::new(4, 0)..Point::new(5, 0),
-                        diff_status: DiffHunkStatusKind::Modified,
-                        old_text: "g\n".into()
-                    },
-                    HunkStatus {
-                        range: Point::new(6, 0)..Point::new(7, 0),
-                        diff_status: DiffHunkStatusKind::Added,
-                        old_text: "".into()
-                    },
-                    HunkStatus {
-                        range: Point::new(8, 0)..Point::new(8, 1),
-                        diff_status: DiffHunkStatusKind::Modified,
-                        old_text: "j".into()
-                    }
-                ]
-            )]
-        );
-
-        // Make another commit that accepts the NEW line but with different content
-        fs.set_head_for_repo(
-            path!("/project/.git").as_ref(),
-            &[("file.txt", "A\nb\nc\nf\nGGG\nh\nDIFFERENT\ni\nj".into())],
-            "0000002",
-        );
-        cx.run_until_parked();
-        assert_eq!(
-            unreviewed_hunks(&action_log, cx),
-            vec![(
-                buffer,
-                vec![
-                    HunkStatus {
-                        range: Point::new(6, 0)..Point::new(7, 0),
-                        diff_status: DiffHunkStatusKind::Added,
-                        old_text: "".into()
-                    },
-                    HunkStatus {
-                        range: Point::new(8, 0)..Point::new(8, 1),
-                        diff_status: DiffHunkStatusKind::Modified,
-                        old_text: "j".into()
-                    }
-                ]
-            )]
-        );
-
-        // Final commit that accepts all remaining edits
-        fs.set_head_for_repo(
-            path!("/project/.git").as_ref(),
-            &[("file.txt", "A\nb\nc\nf\nGGG\nh\nNEW\ni\nJ".into())],
-            "0000003",
-        );
-        cx.run_until_parked();
-        assert_eq!(unreviewed_hunks(&action_log, cx), vec![]);
-    }
-
-    #[gpui::test]
-    async fn test_keep_edits_on_commit_with_shifted_diff_boundaries(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let initial_text = indoc! {"
-            use crate::{Alpha, Beta};
-
-            fn keep() {
-                work();
-            }
-
-            fn remove() {
-                work();
-            }
-
-            fn after() {
-                work();
-            }
-        "};
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/project"),
-            json!({
-                ".git": {},
-                "file.rs": initial_text,
-            }),
-        )
-        .await;
-        fs.set_head_for_repo(
-            path!("/project/.git").as_ref(),
-            &[("file.rs", initial_text.into())],
-            "0000000",
-        );
-        cx.run_until_parked();
-
-        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
-        let action_log = cx.new(|_| ActionLog::new(project.clone()));
-
-        let file_path = project
-            .read_with(cx, |project, cx| {
-                project.find_project_path(path!("/project/file.rs"), cx)
-            })
-            .unwrap();
-        let buffer = project
-            .update(cx, |project, cx| project.open_buffer(file_path, cx))
-            .await
-            .unwrap();
-
-        let final_text = indoc! {"
-            use crate::{Alpha};
-
-            fn keep() {
-                work();
-            }
-
-            fn after() {
-                work();
-            }
-        "};
-
-        cx.update(|cx| {
-            action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
-            buffer.update(cx, |buffer, cx| {
-                buffer.set_text(final_text, cx);
-            });
-            action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
-        });
-        cx.run_until_parked();
-        assert!(!unreviewed_hunks(&action_log, cx).is_empty());
-
-        fs.set_head_for_repo(
-            path!("/project/.git").as_ref(),
-            &[("file.rs", final_text.into())],
-            "0000001",
-        );
-        cx.run_until_parked();
-
-        assert_eq!(unreviewed_hunks(&action_log, cx), vec![]);
-    }
-
-    /// Regression test: when head_commit updates before the BufferDiff's base
-    /// text does, an intermediate DiffChanged (e.g. from a buffer-edit diff
-    /// recalculation) must NOT consume the commit signal.  The subscription
-    /// should only fire once the base text itself has changed.
-    #[gpui::test]
-    async fn test_keep_edits_on_commit_with_stale_diff_changed(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/project"),
-            json!({
-                ".git": {},
-                "file.txt": "aaa\nbbb\nccc\nddd\neee",
-            }),
-        )
-        .await;
-        fs.set_head_for_repo(
-            path!("/project/.git").as_ref(),
-            &[("file.txt", "aaa\nbbb\nccc\nddd\neee".into())],
-            "0000000",
-        );
-        cx.run_until_parked();
-
-        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
-        let action_log = cx.new(|_| ActionLog::new(project.clone()));
-
-        let file_path = project
-            .read_with(cx, |project, cx| {
-                project.find_project_path(path!("/project/file.txt"), cx)
-            })
-            .unwrap();
-        let buffer = project
-            .update(cx, |project, cx| project.open_buffer(file_path, cx))
-            .await
-            .unwrap();
-
-        // Agent makes an edit: bbb -> BBB
-        cx.update(|cx| {
-            action_log.update(cx, |log, cx| log.buffer_read(buffer.clone(), cx));
-            buffer.update(cx, |buffer, cx| {
-                buffer.edit([(Point::new(1, 0)..Point::new(1, 3), "BBB")], None, cx);
-            });
-            action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
-        });
-        cx.run_until_parked();
-
-        // Verify the edit is tracked
-        let hunks = unreviewed_hunks(&action_log, cx);
-        assert_eq!(hunks.len(), 1);
-        let hunk = &hunks[0].1;
-        assert_eq!(hunk.len(), 1);
-        assert_eq!(hunk[0].old_text, "bbb\n");
-
-        // Simulate the race condition: update only the HEAD SHA first,
-        // without changing the committed file contents. This is analogous
-        // to compute_snapshot updating head_commit before
-        // reload_buffer_diff_bases has loaded the new base text.
-        fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
-            state.refs.insert("HEAD".into(), "0000001".into());
-        })
-        .unwrap();
-        cx.run_until_parked();
-
-        // Make a user edit (on a different line) to trigger a buffer diff
-        // recalculation.  This fires DiffChanged while the BufferDiff base
-        // text is still the OLD text.  With the old head_commit-based
-        // subscription this would "consume" the commit detection.
-        cx.update(|cx| {
-            buffer.update(cx, |buffer, cx| {
-                buffer.edit([(Point::new(3, 0)..Point::new(3, 3), "DDD")], None, cx);
-            });
-            action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
-        });
-        cx.run_until_parked();
-
-        // Now update the committed file contents to match the buffer
-        // (the agent edit was committed). Keep the same SHA so head_commit
-        // does NOT change again — this is the second half of the race.
-        {
-            use git::repository::repo_path;
-            fs.with_git_state(path!("/project/.git").as_ref(), true, |state| {
-                state
-                    .head_contents
-                    .insert(repo_path("file.txt"), "aaa\nBBB\nccc\nDDD\neee".into());
-            })
-            .unwrap();
-        }
-        cx.run_until_parked();
-
-        // The agent's edit (bbb -> BBB) should be accepted because the
-        // committed content now matches. Only the user edit (ddd -> DDD)
-        // should remain, but since the user edit is tracked as coming from
-        // the user (ChangeAuthor::User) it would have been rebased into
-        // the diff base already. So no unreviewed hunks should remain.
-        assert_eq!(
-            unreviewed_hunks(&action_log, cx),
-            vec![],
-            "agent edits should have been accepted after the base text update"
-        );
     }
 
     #[gpui::test]

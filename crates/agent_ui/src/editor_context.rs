@@ -3,7 +3,7 @@ use std::{ops::RangeInclusive, path::PathBuf};
 use acp_thread::EDITOR_CONTEXT_OPEN_TAG;
 use collections::HashSet;
 use editor::{DisplayPoint, Editor, display_map::DisplayRow};
-use gpui::{App, AppContext as _, Entity, Task};
+use gpui::{App, Entity, Task};
 use language::{Buffer, BufferSnapshot, DiagnosticEntryRef, DiagnosticSeverity, Point};
 use project::{Project, ProjectPath};
 use text::Bias;

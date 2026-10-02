@@ -51,13 +51,19 @@ jobs:
       - name: Work out the version
         id: version
         shell: pwsh
+        # Through the environment, not pasted into the script: an input is
+        # text, and interpolated it would run as PowerShell.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            $version = "${{ github.event.inputs.version }}"
+          if ($env:EVENT_NAME -eq "workflow_dispatch") {
+            $version = $env:INPUT_VERSION
           } else {
-            $version = "${{ github.ref_name }}".TrimStart("v")
+            $version = $env:REF_NAME.TrimStart("v")
           }
-          if ($version -notmatch '^\d+\.\d+\.\d+') {
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
             throw "'$version' is not a version like 0.1.0"
           }
           "version=$version" >> $env:GITHUB_OUTPUT

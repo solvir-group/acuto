@@ -109,6 +109,16 @@ pub fn request_prediction(
         }
     );
 
+    // A remote endpoint with no key cannot answer, and asking it anyway sends
+    // the code around the caret to a third party that was never configured.
+    // Only a server on this machine is asked without one.
+    if api_key.is_none()
+        && provider == settings::EditPredictionProvider::OpenAiCompatibleApi
+        && !is_loopback_host(endpoint_host)
+    {
+        return Task::ready(Ok(None));
+    }
+
     let result = cx.background_spawn(async move {
         let cursor_offset = cursor_point.to_offset(&snapshot);
         let (excerpt_point_range, excerpt_offset_range, cursor_offset_in_excerpt) =
@@ -286,6 +296,17 @@ fn endpoint_host(api_url: &str) -> &str {
         .map_or(authority, |(_, host)| host)
 }
 
+fn is_loopback_host(authority: &str) -> bool {
+    let host = match authority.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => authority.rsplit_once(':').map_or(authority, |(host, _)| host),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 fn last_lines(text: &str, count: usize) -> &str {
     let mut start = text.len();
     let mut seen = 0;
@@ -336,6 +357,12 @@ fn worsens_syntax(
     offset: usize,
     completion: &str,
 ) -> bool {
+    // Two full parses per suggestion; past this size that costs more than the
+    // check is worth, so the completion is shown unchecked.
+    const LARGEST_CHECKED_FILE: usize = 512 * 1024;
+    if text.len() > LARGEST_CHECKED_FILE {
+        return false;
+    }
     let Some(before) = error_count(language, text) else {
         return false;
     };

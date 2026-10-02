@@ -1233,9 +1233,20 @@ impl AcpConnection {
                     CLAUDE_TERMINAL_AUTH_METHOD_ID,
                     "Sign in with Anthropic",
                 )
+                // Claude Code prefers an API key over a signed-in account, and
+                // one in the environment is passed through to it, so promising
+                // subscription billing then would be untrue.
                 .description(
-                    "Opens your browser to confirm. Uses your Claude subscription, \
-                     not API credit.",
+                    if std::env::var_os("ANTHROPIC_API_KEY")
+                        .is_some_and(|key| !key.is_empty())
+                    {
+                        "Opens your browser to confirm. ANTHROPIC_API_KEY is set in your \
+                         environment, so Claude Code bills that key's API credit \
+                         instead of your subscription until it is unset."
+                    } else {
+                        "Opens your browser to confirm. Uses your Claude subscription, \
+                         not API credit."
+                    },
                 )
                 .meta(meta),
             )]

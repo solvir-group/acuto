@@ -1488,7 +1488,9 @@
   //     "autosave": "on_focus_change",
   // 4. Save when idle for a certain amount of time:
   //     "autosave": { "after_delay": {"milliseconds": 500} },
-  "autosave": "off",
+  // Saved a second after you stop typing, so an edit reaches disk (and any
+  // agent or tool reading the file) without a manual save.
+  "autosave": { "after_delay": { "milliseconds": 1000 } },
   // Maximum number of tabs per pane. Unset for unlimited.
   //
   // Capped. Unlimited tabs are unlimited in name only -- past a dozen the

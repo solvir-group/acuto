@@ -5125,6 +5125,9 @@ where
             .join(", ")
     });
 
+    // Leaving the field confirms it; with nothing changed that would rewrite
+    // the setting in this file even though the user never touched it.
+    let text_before = initial_text.clone().unwrap_or_default();
     SettingsInputField::new(field.json_path.unwrap_or("settings-string-list-field"))
         .tab_index(0)
         .aria_label(title)
@@ -5141,12 +5144,13 @@ where
         .confirm_on_focus_out()
         .on_confirm({
             move |new_text, window, cx| {
+                if new_text.as_deref().unwrap_or_default().trim() == text_before.trim() {
+                    return;
+                }
                 let entries: Option<Vec<T>> = new_text.and_then(|text| {
-                    let entries: Vec<T> = text
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|entry| !entry.is_empty())
-                        .map(|entry| T::from(entry.to_string()))
+                    let entries: Vec<T> = split_list_entries(&text)
+                        .into_iter()
+                        .map(T::from)
                         .collect();
                     // Cleared, rather than set to an empty list.
                     (!entries.is_empty()).then_some(entries)
@@ -5165,6 +5169,33 @@ where
             }
         })
         .into_any_element()
+}
+
+/// The entries of a comma-separated list, splitting only at commas outside
+/// brackets: a glob such as `**/{target,dist}` is one entry, and splitting it
+/// there wrote two broken globs back into the settings file.
+fn split_list_entries(text: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    for character in text.chars() {
+        match character {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                entries.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(character);
+    }
+    entries.push(current);
+    entries
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect()
 }
 
 /// The same control for settings stored as an `ExtendingVec`.
@@ -5198,6 +5229,9 @@ where
             .join(", ")
     });
 
+    // Leaving the field confirms it; with nothing changed that would rewrite
+    // the setting in this file even though the user never touched it.
+    let text_before = initial_text.clone().unwrap_or_default();
     SettingsInputField::new(field.json_path.unwrap_or("settings-extending-list-field"))
         .tab_index(0)
         .aria_label(title)
@@ -5214,12 +5248,13 @@ where
         .confirm_on_focus_out()
         .on_confirm({
             move |new_text, window, cx| {
+                if new_text.as_deref().unwrap_or_default().trim() == text_before.trim() {
+                    return;
+                }
                 let entries = new_text.and_then(|text| {
-                    let entries: Vec<T> = text
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|entry| !entry.is_empty())
-                        .map(|entry| T::from(entry.to_string()))
+                    let entries: Vec<T> = split_list_entries(&text)
+                        .into_iter()
+                        .map(T::from)
                         .collect();
                     (!entries.is_empty()).then(|| settings::ExtendingVec(entries))
                 });

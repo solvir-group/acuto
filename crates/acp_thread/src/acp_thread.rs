@@ -4025,6 +4025,12 @@ impl AcpThread {
                 // state even when the send_task is cancelled before tx.send().
                 if is_same_turn {
                     this.running_turn.take();
+                }
+                // Also when the turn was stopped: cancelling takes the running
+                // turn before this runs, and leaving the turn open made every
+                // later change on disk count as the agent's. A follow-up turn
+                // that is already running keeps it open.
+                if this.running_turn.is_none() {
                     this.action_log
                         .update(cx, |action_log, _cx| action_log.end_agent_turn());
                 }
@@ -7977,8 +7983,21 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
+            fs.is_file(Path::new(path!("/test/file.txt"))).await,
+            "rejecting one line of a created file keeps the file"
+        );
+        assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), "file\n");
+        assert_eq!(unreviewed_rows(&thread, cx), vec![0]);
+
+        let (task, _) = action_log.update(cx, |log, cx| {
+            log.reject_all_edits_in_buffer(buffer.clone(), None, cx)
+        });
+        task.await.unwrap();
+        cx.run_until_parked();
+
+        assert!(
             !fs.is_file(Path::new(path!("/test/file.txt"))).await,
-            "rejecting a created file removes it"
+            "rejecting all of a created file removes it"
         );
     }
 
