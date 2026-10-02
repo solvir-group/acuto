@@ -1033,7 +1033,7 @@ impl TitleBar {
 
         let has_destination = !Self::FEATURE_REQUEST_URL.is_empty();
         let workspace = self.workspace.clone();
-        let feature_request = IconButton::new("top-bar-feature-request", IconName::Star)
+        let feature_request = IconButton::new("top-bar-feature-request", IconName::HandHeart)
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
             .tooltip(Tooltip::text(if has_destination {

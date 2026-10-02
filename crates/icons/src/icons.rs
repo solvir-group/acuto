@@ -172,6 +172,7 @@ pub enum IconName {
     Gitea,
     Github,
     Gitlab,
+    HandHeart,
     Hash,
     HistoryRerun,
     Image,
