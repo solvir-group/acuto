@@ -1,5 +1,3 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
 
 
 # Acuto
@@ -58,3 +56,6 @@ Acuto is free software under the [GNU General Public License v3.0 or later](./LI
 Acuto is an independent project. It is not affiliated with or endorsed by Zed Industries, Anthropic, OpenAI, GitHub or Google; their product names belong to them.
 
 Third-party licences are collected with [`cargo-about`](https://github.com/EmbarkStudios/cargo-about). If a new crate trips it, add `publish = false` to the crate's `Cargo.toml`, or add a checked licence to `accepted` in [`script/licenses/zed-licenses.toml`](./script/licenses/zed-licenses.toml).
+
+
+we hope you like it ❤
