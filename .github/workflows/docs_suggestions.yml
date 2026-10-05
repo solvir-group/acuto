@@ -52,12 +52,16 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
+    # Zed's own documentation bot, which needs credentials only Zed's
+    # repository has. Without this it ran in forks and failed on every merged
+    # pull request.
     if: |
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.merged == true &&
-       github.event.pull_request.base.ref == 'main' &&
-       github.event.pull_request.head.repo.full_name == github.repository) ||
-      (github.event_name == 'workflow_dispatch' && inputs.mode == 'batch')
+      github.repository_owner == 'zed-industries' &&
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.base.ref == 'main' &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
+       (github.event_name == 'workflow_dispatch' && inputs.mode == 'batch'))
 
     steps:
       - name: Checkout repository
@@ -286,13 +290,14 @@ jobs:
       group: docs-suggestions-${{ github.event.pull_request.number || inputs.pr_number || 'manual' }}
       cancel-in-progress: true
     if: |
-      (github.event_name == 'pull_request' &&
-       contains(fromJSON('["opened","synchronize"]'), github.event.action) &&
-       startsWith(github.event.pull_request.base.ref, 'v0.') &&
-       github.event.pull_request.head.repo.full_name == github.repository &&
-       contains(fromJSON('["MEMBER","OWNER"]'),
-                github.event.pull_request.author_association)) ||
-      (github.event_name == 'workflow_dispatch' && inputs.mode == 'immediate')
+      github.repository_owner == 'zed-industries' &&
+      ((github.event_name == 'pull_request' &&
+        contains(fromJSON('["opened","synchronize"]'), github.event.action) &&
+        startsWith(github.event.pull_request.base.ref, 'v0.') &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        contains(fromJSON('["MEMBER","OWNER"]'),
+                 github.event.pull_request.author_association)) ||
+       (github.event_name == 'workflow_dispatch' && inputs.mode == 'immediate'))
 
     steps:
       - name: Checkout repository
