@@ -182,10 +182,17 @@ impl ApplicationMenu {
             )
     }
 
-    fn render_standard_menu(&self, entry: &MenuEntry) -> impl IntoElement {
+    fn render_standard_menu(&self, entry: &MenuEntry, is_light: bool) -> impl IntoElement {
         let current_handle = entry.handle.clone();
 
         let menu_name = entry.menu.name.clone();
+        // The first menu is the application's own. It is drawn as the Acuto
+        // mark rather than the word, the way the corner of a window usually
+        // carries the app's icon.
+        let is_application_menu = self
+            .entries
+            .first()
+            .is_some_and(|first| first.menu.name == menu_name);
         let entry = entry.clone();
 
         let all_handles: Vec<_> = self
@@ -197,27 +204,50 @@ impl ApplicationMenu {
         div()
             .id(format!("{}-menu-item", menu_name))
             .occlude()
-            .child(
-                PopoverMenu::new(format!("{}-menu-popover", menu_name))
-                    .menu(move |window, cx| {
-                        Self::build_menu_from_items(entry.clone(), window, cx).into()
-                    })
-                    .trigger(
-                        // Dimmer than body text. These are always present and
-                        // rarely used, so at full contrast they competed with
-                        // the file you are actually looking at; hover and the
-                        // open state still bring them up to full strength.
-                        Button::new(
-                            SharedString::from(format!("{}-menu-trigger", menu_name)),
-                            menu_name,
+            .child({
+                let popover = PopoverMenu::new(format!("{}-menu-popover", menu_name)).menu(
+                    move |window, cx| Self::build_menu_from_items(entry.clone(), window, cx).into(),
+                );
+                let trigger_id = SharedString::from(format!("{}-menu-trigger", menu_name));
+                if is_application_menu {
+                    popover
+                        .trigger_with_tooltip(
+                            IconButton::new(trigger_id, ui::IconName::AcutoMark)
+                                .style(ButtonStyle::Subtle)
+                                .icon_size(IconSize::Small)
+                                // White on a dark title bar. A light theme's
+                                // title bar is near white itself, where a
+                                // white mark would be a menu nobody can see,
+                                // so there it takes the theme's ink.
+                                .icon_color(if is_light {
+                                    Color::Default
+                                } else {
+                                    Color::Custom(gpui::white())
+                                })
+                                .tab_index(0isize)
+                                .aria_label(menu_name.clone()),
+                            Tooltip::text(menu_name),
                         )
-                        .style(ButtonStyle::Subtle)
-                        .label_size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .tab_index(0isize),
-                    )
-                    .with_handle(current_handle.clone()),
-            )
+                        .with_handle(current_handle.clone())
+                        .into_any_element()
+                } else {
+                    popover
+                        .trigger(
+                            // Dimmer than body text. These are always present
+                            // and rarely used, so at full contrast they
+                            // competed with the file you are actually looking
+                            // at; hover and the open state still bring them up
+                            // to full strength.
+                            Button::new(trigger_id, menu_name)
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .tab_index(0isize),
+                        )
+                        .with_handle(current_handle.clone())
+                        .into_any_element()
+                }
+            })
             .on_hover(move |hover_enter, window, cx| {
                 if *hover_enter && !current_handle.is_deployed() {
                     all_handles.iter().for_each(|h| h.hide(cx));
@@ -302,6 +332,7 @@ pub(crate) fn show_menus(cx: &mut App) -> bool {
 impl Render for ApplicationMenu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let all_menus_shown = self.all_menus_shown(cx);
+        let is_light = cx.theme().appearance().is_light();
 
         if let Some(pending_menu_open) = self.pending_menu_open.take()
             && let Some(entry) = self
@@ -343,7 +374,7 @@ impl Render for ApplicationMenu {
                 this.children(
                     self.entries
                         .iter()
-                        .map(|entry| self.render_standard_menu(entry)),
+                        .map(|entry| self.render_standard_menu(entry, is_light)),
                 )
             })
     }
