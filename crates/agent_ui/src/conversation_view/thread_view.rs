@@ -4454,36 +4454,62 @@ impl ThreadView {
         )
     }
 
-    /// Which account the agent is using, and a way to use another.
+    /// Which account the agent is using, and ways to change it.
     ///
-    /// Agents sign in with their own tools and keep the login, so a thread can
-    /// start already signed in with no word from Acuto about who as. This says.
-    fn render_signed_in_line(&self, agent_name: &str, cx: &mut Context<Self>) -> AnyElement {
-        let text = match &self.signed_in_as {
-            Some(account) => format!("Signed in as {account}"),
-            None => format!("Using this PC's {agent_name} sign-in"),
-        };
-        let can_switch = self
+    /// Only an account that was actually found is named. When none was, this
+    /// says nothing about who is signed in rather than implying someone is.
+    fn render_signed_in_line(&self, _agent_name: &str, cx: &mut Context<Self>) -> AnyElement {
+        let (can_switch, can_sign_out) = self
             .server_view
             .upgrade()
-            .is_some_and(|view| view.read(cx).can_switch_account());
+            .map(|view| {
+                let view = view.read(cx);
+                (view.can_switch_account(), view.supports_logout())
+            })
+            .unwrap_or_default();
+
+        let separator = || {
+            Label::new("\u{00b7}")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+        };
 
         h_flex()
             .gap_1()
-            .child(Label::new(text).size(LabelSize::Small).color(Color::Muted))
-            .when(can_switch, |this| {
+            .when_some(self.signed_in_as.clone(), |this, account| {
                 this.child(
-                    Label::new("\u{00b7}")
-                        .size(LabelSize::Small)
+                    Icon::new(IconName::Person)
+                        .size(IconSize::XSmall)
                         .color(Color::Muted),
                 )
                 .child(
+                    Label::new(format!("Signed in as {account}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .when(can_switch || can_sign_out, |this| this.child(separator()))
+            })
+            .when(can_switch, |this| {
+                this.child(
                     Button::new("switch-agent-account", "Switch account")
                         .label_size(LabelSize::Small)
                         .color(Color::Muted)
                         .on_click(cx.listener(|this, _, _window, cx| {
                             if let Some(view) = this.server_view.upgrade() {
                                 view.update(cx, |view, cx| view.show_sign_in(cx));
+                            }
+                        })),
+                )
+            })
+            .when(can_switch && can_sign_out, |this| this.child(separator()))
+            .when(can_sign_out, |this| {
+                this.child(
+                    Button::new("sign-out-agent-account", "Sign out")
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if let Some(view) = this.server_view.upgrade() {
+                                view.update(cx, |view, cx| view.logout(window, cx));
                             }
                         })),
                 )
@@ -4536,6 +4562,13 @@ impl ThreadView {
                             this.flex_col()
                                 .gap_2()
                                 .child(agent_greeting(brand, cx))
+                                .child(
+                                    Label::new(
+                                        "Ask about this project, or describe a change to make.",
+                                    )
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                                )
                                 .child(self.render_signed_in_line(brand.name, cx))
                         })
                 }
@@ -4568,10 +4601,31 @@ impl ThreadView {
                     // should read as a raised surface on the panel, not a hole
                     // punched into it.
                     .rounded_lg()
-                    .bg(cx.theme().colors().element_background)
-                    .map(|this| match self.brand(cx) {
-                        Some(brand) => this.border_color(brand.accent.opacity(0.35)),
-                        None => this.border_color(cx.theme().colors().border),
+                    .map(|this| {
+                        let colors = cx.theme().colors();
+                        let focused = self
+                            .message_editor
+                            .focus_handle(cx)
+                            .contains_focused(window, cx);
+                        if cx.theme().appearance().is_light() {
+                            // On a light theme the edge is only just there: a
+                            // hairline of ink on a white card, a little firmer
+                            // while you type. A stronger frame read as a form
+                            // field rather than a place to talk.
+                            this.bg(colors.elevated_surface_background.opacity(1.))
+                                .border_color(colors.text.opacity(if focused {
+                                    0.2
+                                } else {
+                                    0.09
+                                }))
+                                .shadow_xs()
+                        } else {
+                            let accent = self.brand(cx).map_or(colors.border_focused, |brand| {
+                                brand.accent
+                            });
+                            this.bg(colors.element_background)
+                                .border_color(accent.opacity(if focused { 0.5 } else { 0.28 }))
+                        }
                     })
                     // Tight padding: the composer should not take more vertical
                     // space than the text it holds plus its controls.
@@ -6576,7 +6630,11 @@ impl ThreadView {
                                     .rounded_lg()
                                     .border_1()
                                     .bg(cx.theme().colors().element_background)
-                                    .border_color(cx.theme().colors().border_transparent)
+                                    // A hairline as well as the fill: on the
+                                    // frosted and paper themes the fill alone is
+                                    // a few percent off the panel and the bubble
+                                    // has no edge.
+                                    .border_color(cx.theme().colors().border_variant)
                                     .when(is_indented, |this| {
                                         this.py_1().px_2().when(
                                             opaque_window && !cx.theme().appearance().is_light(),
@@ -13157,7 +13215,6 @@ fn strip_leading_command(text: &str, command_name: &str) -> String {
         .unwrap_or_else(|| trimmed.to_string())
 }
 
-
 /// How wide a sent prompt's bubble is: its longest line as the composer draws
 /// it, plus the bubble's padding and border. Capped by the caller.
 fn user_bubble_width(text: &str, window: &Window, cx: &App) -> Pixels {
@@ -13185,13 +13242,17 @@ fn user_bubble_width(text: &str, window: &Window, cx: &App) -> Pixels {
             };
             window
                 .text_system()
-                .shape_line(SharedString::from(line.to_string()), font_size, &[run], None)
+                .shape_line(
+                    SharedString::from(line.to_string()),
+                    font_size,
+                    &[run],
+                    None,
+                )
                 .width
         })
         .fold(px(0.), |widest, width| widest.max(width));
     widest + px(CHROME)
 }
-
 
 /// Agents read a slash command from the start of the prompt and its arguments
 /// from the rest, so nothing may be added to a prompt that is one.

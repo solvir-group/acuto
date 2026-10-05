@@ -487,8 +487,12 @@ fn email_in_id_token(token: &str) -> Option<String> {
 /// the agent appears, at the size a logo is shown at, not a glyph.
 pub(crate) fn agent_greeting(brand: AgentBrand, cx: &App) -> AnyElement {
     use theme::ActiveTheme as _;
-    const WORDMARK_HEIGHT: f32 = 40.;
+    const WORDMARK_HEIGHT: f32 = 36.;
+    const MARK_TILE: f32 = 44.;
 
+    // The vendor's own wordmark where there is one; otherwise the mark on a
+    // tile of the agent's colour above its name, so every agent opens on the
+    // same shape rather than some on a logo and some on a line of text.
     let lockup = match brand.wordmark {
         Some(wordmark) => {
             let source = if cx.theme().appearance().is_light() {
@@ -501,20 +505,30 @@ pub(crate) fn agent_greeting(brand: AgentBrand, cx: &App) -> AnyElement {
                 .w(px(WORDMARK_HEIGHT * wordmark.aspect_ratio))
                 .into_any_element()
         }
-        None => h_flex()
+        None => v_flex()
             .gap_3()
             .items_center()
             .child(
-                svg()
-                    .path(brand.icon.path())
-                    .size(px(32.))
+                h_flex()
+                    .size(px(MARK_TILE))
                     .flex_none()
-                    .text_color(brand.accent),
+                    .justify_center()
+                    .rounded_xl()
+                    .bg(brand.accent.opacity(0.14))
+                    .border_1()
+                    .border_color(brand.accent.opacity(0.28))
+                    .child(
+                        svg()
+                            .path(brand.icon.path())
+                            .size(px(24.))
+                            .flex_none()
+                            .text_color(brand.accent),
+                    ),
             )
             .child(
                 div()
-                    .text_size(px(30.))
-                    .line_height(px(36.))
+                    .text_size(px(22.))
+                    .line_height(px(28.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(cx.theme().colors().text)
                     .child(brand.name),
@@ -525,7 +539,7 @@ pub(crate) fn agent_greeting(brand: AgentBrand, cx: &App) -> AnyElement {
     v_flex()
         .items_center()
         .gap_2()
-        .pb_6()
+        .pb_4()
         .child(lockup)
         .into_any_element()
 }

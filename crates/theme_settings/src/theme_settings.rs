@@ -482,3 +482,126 @@ pub fn increase_buffer_font_size(cx: &mut App) {
 pub fn decrease_buffer_font_size(cx: &mut App) {
     adjust_buffer_font_size(cx, |size| size - px(1.0));
 }
+
+#[cfg(test)]
+mod bundled_theme_contrast {
+    use gpui::{Hsla, Rgba, hsla};
+
+    use super::*;
+
+    /// WCAG contrast ratio between two opaque colours.
+    fn contrast(foreground: Hsla, background: Hsla) -> f32 {
+        fn luminance(color: Hsla) -> f32 {
+            let Rgba { r, g, b, .. } = color.to_rgb();
+            let channel = |value: f32| {
+                if value <= 0.03928 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+        }
+        let (a, b) = (luminance(foreground), luminance(background));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// Every bundled Acuto theme keeps its text, icons and status colours
+    /// legible on every surface they are drawn on, including selected and
+    /// hovered rows.
+    ///
+    /// A see-through theme is measured over the darkest ground it can sit on:
+    /// the frosted wallpaper is never darker than 74% white for a light theme,
+    /// and the backdrop of a dark one is never lighter than 20%.
+    #[test]
+    fn acuto_themes_are_legible() {
+        let family: ThemeFamilyContent =
+            serde_json::from_str(include_str!("../../../assets/themes/acuto/acuto.json"))
+                .expect("the bundled Acuto themes parse");
+
+        let mut failures = Vec::new();
+        for content in &family.themes {
+            let theme = refine_theme(content);
+            let colors = theme.colors();
+            let status = theme.status();
+            let ground = if theme.appearance.is_light() {
+                hsla(0., 0., 0.74, 1.)
+            } else {
+                hsla(0., 0., 0.2, 1.)
+            };
+            let window = ground.blend(colors.background);
+
+            let planes = [
+                ("panel", window.blend(colors.panel_background)),
+                ("editor", window.blend(colors.editor_background)),
+                (
+                    "elevated surface",
+                    window.blend(colors.elevated_surface_background),
+                ),
+                ("title bar", window.blend(colors.title_bar_background)),
+                ("status bar", window.blend(colors.status_bar_background)),
+                ("tab bar", window.blend(colors.tab_bar_background)),
+            ];
+            let mut surfaces: Vec<(String, Hsla)> = planes
+                .iter()
+                .map(|(name, color)| (name.to_string(), *color))
+                .collect();
+            for (row, overlay) in [
+                ("hovered", colors.element_hover),
+                ("selected", colors.element_selected),
+                ("ghost selected", colors.ghost_element_selected),
+            ] {
+                for (plane, base) in planes {
+                    surfaces.push((format!("{row} row on {plane}"), base.blend(overlay)));
+                }
+            }
+
+            let foregrounds = [
+                ("text", colors.text, 4.5),
+                ("muted text", colors.text_muted, 3.0),
+                ("icon", colors.icon, 3.0),
+                ("muted icon", colors.icon_muted, 2.2),
+                ("placeholder", colors.text_placeholder, 2.0),
+                ("error", status.error, 2.9),
+                ("warning", status.warning, 2.9),
+                ("success", status.success, 2.9),
+                ("modified", status.modified, 2.9),
+                ("created", status.created, 2.9),
+                ("deleted", status.deleted, 2.9),
+            ];
+            for (surface_name, surface) in &surfaces {
+                for (name, color, needed) in foregrounds {
+                    let ratio = contrast(surface.blend(color), *surface);
+                    if ratio < needed {
+                        failures.push(format!(
+                            "{}: {name} on {surface_name} is {ratio:.2}:1, needs {needed}:1",
+                            theme.name
+                        ));
+                    }
+                }
+            }
+
+            let terminal = window.blend(colors.terminal_background);
+            for (name, color, needed) in [
+                ("terminal text", colors.terminal_foreground, 4.5),
+                ("terminal black", colors.terminal_ansi_black, 1.6),
+                ("terminal white", colors.terminal_ansi_white, 2.4),
+                (
+                    "terminal bright white",
+                    colors.terminal_ansi_bright_white,
+                    1.6,
+                ),
+            ] {
+                let ratio = contrast(terminal.blend(color), terminal);
+                if ratio < needed {
+                    failures.push(format!(
+                        "{}: {name} is {ratio:.2}:1, needs {needed}:1",
+                        theme.name
+                    ));
+                }
+            }
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+}

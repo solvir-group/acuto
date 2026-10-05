@@ -36,10 +36,16 @@ use std::ops::Range;
 use std::process::ExitStatus;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use std::{fmt::Display, mem, path::PathBuf, sync::Arc};
+use std::{
+    fmt::Display,
+    mem,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use task::{Shell, ShellBuilder};
 pub use terminal::*;
 use text::Bias;
+use text::Rope;
 use ui::App;
 use util::markdown::MarkdownEscaped;
 use util::path_list::PathList;
@@ -395,7 +401,9 @@ fn prompt_with_editor_context(
     editor_context: Option<String>,
 ) -> Vec<acp::ContentBlock> {
     if let Some(editor_context) = editor_context {
-        message.push(acp::ContentBlock::Text(acp::TextContent::new(editor_context)));
+        message.push(acp::ContentBlock::Text(acp::TextContent::new(
+            editor_context,
+        )));
     }
     message
 }
@@ -3361,7 +3369,7 @@ impl AcpThread {
 
         let project = self.project.clone();
         let action_log = self.action_log.clone();
-        cx.spawn(async move |_this, cx| {
+        cx.spawn(async move |this, cx| {
             for path in paths {
                 let open = project.update(cx, |project, cx| {
                     let path = project.find_project_path(&path, cx)?;
@@ -3396,11 +3404,106 @@ impl AcpThread {
                         let reload = buffer.update(cx, |buffer, cx| buffer.reload(cx));
                         reload.await.ok();
                     }
+                    this.update(cx, |this, cx| {
+                        this.settle_reported_writes(&path, &buffer, cx)
+                    })
+                    .ok();
                     log::info!("agent diff: {path:?} written by the agent");
                 }
             }
         })
         .detach();
+    }
+
+    /// Gives the action log the text `buffer` held before this turn's writes,
+    /// as the agent's own reports of them describe it.
+    ///
+    /// Claiming a file is asynchronous and the agent does not wait for it, so
+    /// a file first claimed partway through a turn may already hold the
+    /// agent's edit. Measured from that text it has nothing to review and is
+    /// missing from the diff. The reports say what each write replaced, so
+    /// undoing them from the file as it is now recovers what it was.
+    fn settle_reported_writes(
+        &mut self,
+        abs_path: &Path,
+        buffer: &Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(text_before) = self.text_before_reported_writes(abs_path, buffer, cx) else {
+            return;
+        };
+        self.action_log.update(cx, |action_log, cx| {
+            action_log.agent_wrote(buffer.clone(), text_before, cx)
+        });
+    }
+
+    /// The text `buffer` held before this turn's completed writes to it, worked
+    /// out by undoing the agent's reports of them from its current text, newest
+    /// first. `Some(None)` means the turn created the file.
+    ///
+    /// `None` when that cannot be done exactly: a reported change missing from
+    /// the file or found in it more than once. Guessing would put a wrong
+    /// change in front of the user for review, which is worse than the file
+    /// being measured from where it was first seen.
+    fn text_before_reported_writes(
+        &self,
+        abs_path: &Path,
+        buffer: &Entity<Buffer>,
+        cx: &App,
+    ) -> Option<Option<Rope>> {
+        let mut reports = Vec::new();
+        for entry in self.entries.iter().rev() {
+            match entry {
+                AgentThreadEntry::UserMessage(_) => break,
+                AgentThreadEntry::ToolCall(call)
+                    if matches!(call.status, ToolCallStatus::Completed) =>
+                {
+                    let call_reports = call
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            ToolCallContent::Diff(diff) => {
+                                let diff = diff.read(cx);
+                                let path = diff.file_path(cx)?;
+                                (Path::new(&path) == abs_path)
+                                    .then(|| diff.reported_change(cx))
+                                    .flatten()
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    reports.push(call_reports);
+                }
+                _ => {}
+            }
+        }
+        if reports.iter().all(|call_reports| call_reports.is_empty()) {
+            return None;
+        }
+
+        let mut text = buffer.read(cx).text();
+        // Newest call first, the way the entries were walked.
+        for call_reports in reports {
+            for (old_text, new_text) in call_reports.into_iter().rev() {
+                match old_text {
+                    None if text == new_text => return Some(None),
+                    None => return None,
+                    Some(old_text) if text == new_text => text = old_text.to_string(),
+                    Some(old_text) => {
+                        if new_text.is_empty() {
+                            return None;
+                        }
+                        let mut matches = text.match_indices(new_text.as_str());
+                        let (start, _) = matches.next()?;
+                        if matches.next().is_some() {
+                            return None;
+                        }
+                        text.replace_range(start..start + new_text.len(), &old_text);
+                    }
+                }
+            }
+        }
+        Some(Some(Rope::from(text.as_str())))
     }
 
     /// Reloads every file the agent has touched that the user has not edited,
@@ -5018,7 +5121,6 @@ fn markdown_for_raw_output(
     }
 }
 
-
 /// Brings an agent's write on disk into a buffer that has unsaved edits.
 ///
 /// The agent's change is the difference between the file as the buffer last
@@ -5856,8 +5958,7 @@ mod tests {
     #[test]
     fn editor_context_goes_after_the_users_own_blocks() {
         let context = format!("{EDITOR_CONTEXT_OPEN_TAG}\nActive file: /a.rs\n</editor_context>");
-        let prompt =
-            prompt_with_editor_context(vec!["/review this".into()], Some(context.clone()));
+        let prompt = prompt_with_editor_context(vec!["/review this".into()], Some(context.clone()));
 
         assert_eq!(prompt.len(), 2);
         assert_eq!(prompt[0], acp::ContentBlock::from("/review this"));
@@ -5870,9 +5971,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_replayed_editor_context_is_not_shown_as_user_text(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn test_replayed_editor_context_is_not_shown_as_user_text(cx: &mut gpui::TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -11317,5 +11416,159 @@ mod tests {
             ThreadStatus::Idle,
             "running_turn must be cleared even when tx was dropped without send"
         );
+    }
+
+    /// One turn in which the agent writes `file.txt` to disk before the editor
+    /// hears of the call, the way Claude Code does when it may edit without
+    /// asking, and then reports the change with `reports`. The file is not open
+    /// and was never read, so nothing captured it before the write.
+    async fn agent_write_before_claim(
+        initial: Option<&str>,
+        after: &'static str,
+        reports: Vec<acp::Diff>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<AcpThread>, Entity<Buffer>) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        let mut tree = serde_json::Map::new();
+        tree.insert("other.txt".into(), json!(""));
+        if let Some(initial) = initial {
+            tree.insert("file.txt".into(), json!(initial));
+        }
+        fs.insert_tree(path!("/test"), serde_json::Value::Object(tree))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+
+        let reports = Rc::new(RefCell::new(Some(reports)));
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let fs = fs.clone();
+            move |_, thread, mut cx| {
+                let fs = fs.clone();
+                let reports = reports.borrow_mut().take().unwrap_or_default();
+                async move {
+                    let file = PathBuf::from(path!("/test/file.txt"));
+                    fs.insert_file(&file, after.as_bytes().to_vec()).await;
+                    thread
+                        .update(&mut cx, |thread, cx| {
+                            thread.handle_session_update(
+                                acp::SessionUpdate::ToolCall(
+                                    acp::ToolCall::new("edit", "Edit file.txt")
+                                        .kind(acp::ToolKind::Edit)
+                                        .status(acp::ToolCallStatus::InProgress)
+                                        .locations(vec![acp::ToolCallLocation::new(file.clone())]),
+                                ),
+                                cx,
+                            )
+                        })
+                        .unwrap()
+                        .unwrap();
+                    thread
+                        .update(&mut cx, |thread, cx| {
+                            thread.handle_session_update(
+                                acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                                    "edit",
+                                    acp::ToolCallUpdateFields::new()
+                                        .status(acp::ToolCallStatus::Completed)
+                                        .content(
+                                            reports
+                                                .into_iter()
+                                                .map(acp::ToolCallContent::Diff)
+                                                .collect::<Vec<_>>(),
+                                        ),
+                                )),
+                                cx,
+                            )
+                        })
+                        .unwrap()
+                        .unwrap();
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                }
+                .boxed_local()
+            }
+        }));
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let send =
+            cx.update(|cx| thread.update(cx, |thread, cx| thread.send(vec!["Go".into()], cx)));
+        cx.run_until_parked();
+        send.await.unwrap();
+        cx.run_until_parked();
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/test/file.txt"), cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        (thread, buffer)
+    }
+
+    /// The file was first opened after the agent had already written it, so
+    /// its text then was the new text. The agent's report of what it replaced
+    /// still puts the change up for review.
+    #[gpui::test]
+    async fn test_edit_landing_before_an_unopened_file_is_claimed(cx: &mut TestAppContext) {
+        let (thread, buffer) = agent_write_before_claim(
+            Some(BEFORE),
+            AFTER,
+            vec![
+                acp::Diff::new(PathBuf::from(path!("/test/file.txt")), "A\nb\nc\n")
+                    .old_text("a\nb\nc\n"),
+                acp::Diff::new(PathBuf::from(path!("/test/file.txt")), "e\nf\nG\n")
+                    .old_text("e\nf\ng\n"),
+            ],
+            cx,
+        )
+        .await;
+        assert_eq!(buffer_text(&buffer, cx), AFTER);
+        assert_eq!(unreviewed_rows(&thread, cx), vec![0, 6]);
+    }
+
+    /// A file the agent created before it was claimed is reviewed whole, as
+    /// new, rather than tracked from its new text with nothing to review.
+    #[gpui::test]
+    async fn test_file_created_before_it_is_claimed(cx: &mut TestAppContext) {
+        let (thread, buffer) = agent_write_before_claim(
+            None,
+            AFTER,
+            vec![acp::Diff::new(
+                PathBuf::from(path!("/test/file.txt")),
+                AFTER,
+            )],
+            cx,
+        )
+        .await;
+        assert_eq!(buffer_text(&buffer, cx), AFTER);
+        // Review is line by line, so every line of the new file is offered.
+        assert_eq!(unreviewed_rows(&thread, cx), (0..7).collect::<Vec<u32>>());
+    }
+
+    /// A report that does not match the file -- here a snippet that appears
+    /// nowhere in it -- is not used to invent a base. The file is left as it
+    /// was first seen rather than reviewed against a guess.
+    #[gpui::test]
+    async fn test_mismatched_report_does_not_invent_a_change(cx: &mut TestAppContext) {
+        let (thread, buffer) = agent_write_before_claim(
+            Some(BEFORE),
+            AFTER,
+            vec![
+                acp::Diff::new(PathBuf::from(path!("/test/file.txt")), "not in the file")
+                    .old_text("something else"),
+            ],
+            cx,
+        )
+        .await;
+        assert_eq!(buffer_text(&buffer, cx), AFTER);
+        assert_eq!(unreviewed_rows(&thread, cx), Vec::<u32>::new());
     }
 }

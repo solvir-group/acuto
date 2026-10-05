@@ -4700,7 +4700,9 @@ impl Workspace {
             } else {
                 self.find_pane_in_direction(SplitDirection::Right, cx)
                     .filter(|pane| *pane != active_pane)
-                    .unwrap_or_else(|| self.split_pane(active_pane, SplitDirection::Right, window, cx))
+                    .unwrap_or_else(|| {
+                        self.split_pane(active_pane, SplitDirection::Right, window, cx)
+                    })
             };
             self.add_item(target, Box::new(item), None, true, true, window, cx);
         }
@@ -4800,18 +4802,23 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if let Some(center_pane) = self.last_active_center_pane.clone() {
-            if let Some(center_pane) = center_pane.upgrade() {
-                center_pane.update(cx, |pane, cx| {
-                    pane.add_item(item, true, true, None, window, cx)
-                });
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
+        // The pane last active in the centre, or failing that the first one.
+        // The last active pane is forgotten when it is closed, and without the
+        // fallback every view opened on demand from then on -- the agent's
+        // review among them -- silently failed to open until some other centre
+        // pane happened to be clicked.
+        let center_pane = self
+            .last_active_center_pane
+            .as_ref()
+            .and_then(|pane| pane.upgrade())
+            .or_else(|| self.panes.first().cloned());
+        let Some(center_pane) = center_pane else {
+            return false;
+        };
+        center_pane.update(cx, |pane, cx| {
+            pane.add_item(item, true, true, None, window, cx)
+        });
+        true
     }
 
     pub fn add_item_to_active_pane(
@@ -14132,6 +14139,32 @@ mod tests {
             workspace.remove_pane(pane_b.clone(), None, window, cx);
             assert!(!workspace.is_pane_maximized());
         });
+    }
+
+    /// Closing the pane last active in the centre leaves no pane to remember.
+    /// Items opened into the centre still open, in another centre pane.
+    #[gpui::test]
+    async fn test_add_item_to_center_after_closing_its_pane(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let pane_a = workspace.update_in(cx, |workspace, _window, _cx| {
+            workspace.active_pane().clone()
+        });
+        let pane_b = split_pane(cx, &workspace);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.remove_pane(pane_b.clone(), None, window, cx);
+        });
+
+        let added = workspace.update_in(cx, |workspace, window, cx| {
+            let item = cx.new(TestItem::new);
+            workspace.add_item_to_center(Box::new(item), window, cx)
+        });
+        assert!(added);
+        assert_eq!(pane_a.read_with(cx, |pane, _| pane.items_len()), 1);
     }
 
     #[gpui::test]

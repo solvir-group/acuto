@@ -790,7 +790,9 @@ impl TeamNotesPanel {
             let worktree = project
                 .visible_worktrees(cx)
                 .find(|worktree| worktree.read(cx).abs_path().as_ref() == root.as_path())?;
-            let path = util::rel_path::RelPath::from_unix_str(&file).ok()?.into_arc();
+            let path = util::rel_path::RelPath::from_unix_str(&file)
+                .ok()?
+                .into_arc();
             Some(project::ProjectPath {
                 worktree_id: worktree.read(cx).id(),
                 path,
@@ -845,7 +847,12 @@ impl TeamNotesPanel {
             .count()
     }
 
-    fn render_record(&self, record: &NoteThread, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_record(
+        &self,
+        record: &NoteThread,
+        now: chrono::DateTime<chrono::Utc>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let id = record.id.clone();
         let replying = self
             .replying_to
@@ -853,179 +860,331 @@ impl TeamNotesPanel {
             .is_some_and(|(open, _)| *open == record.id);
         let closed = record.is_closed();
         let is_ticket = record.kind == Kind::Ticket;
-
-        let status_label = if is_ticket {
-            record.status.label().to_string()
-        } else if record.resolved {
-            "Resolved".to_string()
-        } else {
-            "Open".to_string()
-        };
-        let status_color = if closed {
-            Color::Success
-        } else if is_ticket && record.status == Status::InProgress {
-            Color::Accent
-        } else {
-            Color::Muted
-        };
+        let (status_label, status_color) = status_presentation(record);
+        let colors = cx.theme().colors();
 
         let location = record.file.as_ref().map(|file| {
             let line = record.anchor.as_ref().map_or(0, |anchor| anchor.line);
             format!("{file}:{}", line + 1)
         });
-
         let mine = record
             .assignee
             .as_deref()
             .is_some_and(|name| name.eq_ignore_ascii_case(&self.author));
-
+        let opener = record.messages.first();
         let group = SharedString::from(format!("record-group-{}", record.id));
+
+        let (kind_icon, kind_color) = match record.kind {
+            Kind::Ticket => (IconName::ListTodo, Color::Accent),
+            Kind::Note => (IconName::Pin, Color::Warning),
+            Kind::Message => (IconName::Chat, Color::Muted),
+        };
+
+        let separator = || {
+            Label::new("·")
+                .size(LabelSize::XSmall)
+                .color(Color::Disabled)
+        };
+
+        // The status is the control, not a label beside one: there is one
+        // thing you do to a record and this is it.
+        let status_pill = h_flex()
+            .id(SharedString::from(format!("status-{}", record.id)))
+            .flex_none()
+            .gap_1()
+            .px_1p5()
+            .py_px()
+            .rounded_full()
+            .border_1()
+            .border_color(colors.border_variant)
+            .cursor_pointer()
+            .hover(|style| style.bg(colors.element_hover))
+            .child(div().size_1p5().rounded_full().bg(status_color.color(cx)))
+            .child(
+                Label::new(status_label)
+                    .size(LabelSize::XSmall)
+                    .color(status_color),
+            )
+            .tooltip(Tooltip::text(if is_ticket {
+                "Move to the next status"
+            } else {
+                "Resolve or reopen"
+            }))
+            .on_click(cx.listener({
+                let id = id.clone();
+                move |this, _, _window, cx| this.advance(&id, cx)
+            }));
+
+        let meta = h_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .child(
+                Label::new(format!("#{}", crate::short_ref(&record.id)))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .buffer_font(cx),
+            )
+            .when_some(opener, |this, opener| {
+                this.child(separator())
+                    .child(
+                        Label::new(opener.author.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(separator())
+                    .child(
+                        Label::new(age(&opener.at, now))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+            })
+            .when_some(location, |this, location| {
+                this.child(separator()).child(
+                    Button::new(SharedString::from(format!("open-{}", record.id)), location)
+                        .label_size(LabelSize::XSmall)
+                        .color(Color::Accent)
+                        .truncate(true)
+                        .tooltip(Tooltip::text("Go to this line"))
+                        .on_click(cx.listener({
+                            let id = id.clone();
+                            move |this, _, window, cx| this.jump_to(id.clone(), window, cx)
+                        })),
+                )
+            });
+
+        let replies = record.messages.iter().skip(1).map(|message| {
+            h_flex()
+                .w_full()
+                .items_start()
+                .gap_2()
+                .child(initials_avatar(&message.author, px(18.), None, cx))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(Label::new(message.author.clone()).size(LabelSize::XSmall))
+                                .child(
+                                    Label::new(age(&message.at, now))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .child(Label::new(message.body.clone()).size(LabelSize::Small)),
+                )
+        });
+        let reply_count = record.messages.len().saturating_sub(1);
 
         v_flex()
             .id(SharedString::from(record.id.clone()))
             .group(group.clone())
             .w_full()
-            .px_2()
-            .py_1p5()
-            .gap_1()
-            .rounded_md()
-            // A frame, so each record reads as one thing. Without it a list of
-            // tickets was loose lines of text with no edge between them.
+            .p_2()
+            .gap_1p5()
+            .rounded_lg()
             .border_1()
-            .border_color(cx.theme().colors().border_variant)
-            .bg(cx.theme().colors().element_background)
-            .hover(|style| style.bg(cx.theme().colors().element_hover))
-            .when(closed, |this| this.opacity(0.55))
+            .border_color(if mine && !closed {
+                colors.border_focused
+            } else {
+                colors.border_variant
+            })
+            .bg(colors.elevated_surface_background)
+            .hover(|style| style.border_color(colors.border))
+            .when(closed, |this| this.opacity(0.6))
             .child(
                 h_flex()
                     .w_full()
                     .min_w_0()
-                    .gap_1()
+                    .items_start()
+                    .gap_2()
                     .child(
-                        Icon::new(match record.kind {
-                            Kind::Ticket => IconName::ListTodo,
-                            Kind::Message => IconName::Chat,
-                            Kind::Note => IconName::Pin,
-                        })
-                        .size(IconSize::XSmall)
-                        .color(status_color),
+                        h_flex()
+                            .flex_none()
+                            .size_6()
+                            .justify_center()
+                            .rounded_md()
+                            .bg(colors.element_background)
+                            .child(Icon::new(kind_icon).size(IconSize::Small).color(kind_color)),
                     )
-                    // The status is the control, not a label beside one: there
-                    // is one thing you do to a record and this is it.
                     .child(
-                        Button::new(
-                            SharedString::from(format!("status-{}", record.id)),
-                            status_label,
-                        )
-                        .label_size(LabelSize::XSmall)
-                        .color(status_color)
-                        .tooltip(Tooltip::text(if is_ticket {
-                            "Move to the next status"
-                        } else {
-                            "Resolve or reopen"
-                        }))
-                        .on_click(cx.listener({
-                            let id = id.clone();
-                            move |this, _, _window, cx| this.advance(&id, cx)
-                        })),
-                    )
-                    .when_some(record.assignee.clone(), |this, assignee| {
-                        this.child(
-                            Label::new(format!("@{assignee}"))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Accent),
-                        )
-                    })
-                    .when_some(location, |this, location| {
-                        this.child(
-                            Button::new(
-                                SharedString::from(format!("open-{}", record.id)),
-                                location,
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(
+                                div().w_full().min_w_0().child(
+                                    Label::new(record.headline().to_string())
+                                        .size(LabelSize::Small)
+                                        .weight(gpui::FontWeight::MEDIUM)
+                                        .when(closed, |label| label.strikethrough()),
+                                ),
                             )
-                            .label_size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .truncate(true)
-                            .tooltip(Tooltip::text("Go to this line"))
-                            .on_click(cx.listener({
-                                let id = id.clone();
-                                move |this, _, window, cx| this.jump_to(id.clone(), window, cx)
-                            })),
-                        )
-                    }),
-            )
-            .child(Label::new(record.headline().to_string()).size(LabelSize::Small))
-            .children(record.messages.iter().skip(1).map(|message| {
-                v_flex()
-                    .child(
-                        Label::new(message.author.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                            .child(meta),
                     )
-                    .child(Label::new(message.body.clone()).size(LabelSize::Small))
-            }))
-            .when(replying, |this| {
-                this.children(
-                    self.replying_to
-                        .as_ref()
-                        .map(|(_, composer)| composer.clone()),
+                    .child(status_pill),
+            )
+            .when(reply_count > 0, |this| {
+                this.child(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .ml_8()
+                        .pl_2()
+                        .border_l_1()
+                        .border_color(colors.border_variant)
+                        .children(replies),
                 )
-                .child(
-                    Button::new(SharedString::from(format!("send-{}", record.id)), "Send")
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|this, _, window, cx| this.submit_reply(window, cx))),
+            })
+            .when(replying, |this| {
+                this.child(
+                    v_flex()
+                        .ml_8()
+                        .gap_1p5()
+                        .p_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border_focused)
+                        .bg(colors.editor_background)
+                        .children(
+                            self.replying_to
+                                .as_ref()
+                                .map(|(_, composer)| composer.clone()),
+                        )
+                        .child(
+                            h_flex()
+                                .justify_end()
+                                .gap_1()
+                                .child(
+                                    Button::new(
+                                        SharedString::from(format!("cancel-reply-{}", record.id)),
+                                        "Cancel",
+                                    )
+                                    .label_size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .on_click(cx.listener(
+                                        |this, _, _window, cx| {
+                                            this.replying_to = None;
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    Button::new(
+                                        SharedString::from(format!("send-{}", record.id)),
+                                        "Reply",
+                                    )
+                                    .style(ButtonStyle::Filled)
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| this.submit_reply(window, cx),
+                                    )),
+                                ),
+                        ),
                 )
             })
             .child(
                 h_flex()
+                    .w_full()
+                    .ml_8()
                     .gap_1()
-                    .when(!replying, |this| this.visible_on_hover(group.clone()))
-                    .when(!replying, |this| {
+                    .when_some(record.assignee.clone(), |this, assignee| {
                         this.child(
-                            Button::new(
-                                SharedString::from(format!("reply-{}", record.id)),
-                                "Reply",
-                            )
-                            .label_size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .on_click(cx.listener({
-                                let id = id.clone();
-                                move |this, _, window, cx| this.start_reply(id.clone(), window, cx)
-                            })),
+                            h_flex()
+                                .gap_1()
+                                .child(initials_avatar(&assignee, px(16.), None, cx))
+                                .child(
+                                    Label::new(if mine {
+                                        "You".to_string()
+                                    } else {
+                                        assignee.clone()
+                                    })
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                                ),
                         )
                     })
-                    .child(
-                        Button::new(
-                            SharedString::from(format!("assign-{}", record.id)),
-                            if mine { "Unassign" } else { "Take" },
+                    .when(reply_count > 0 && !replying, |this| {
+                        this.child(
+                            h_flex()
+                                .gap_0p5()
+                                .child(
+                                    Icon::new(IconName::Chat)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(reply_count.to_string())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
                         )
-                        .label_size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .on_click(cx.listener({
-                            let id = id.clone();
-                            move |this, _, _window, cx| this.take_ownership(&id, cx)
-                        })),
-                    )
-                    // Done in one click, wherever the record currently is. The
-                    // status button cycles, which takes two clicks to finish a
-                    // ticket that has not been started.
+                    })
+                    .child(div().flex_1())
                     .child(
-                        IconButton::new(
-                            SharedString::from(format!("complete-{}", record.id)),
-                            IconName::Check,
-                        )
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(if closed { Color::Success } else { Color::Muted })
-                        .tooltip(Tooltip::text(if closed {
-                            "Reopen"
-                        } else if is_ticket {
-                            "Mark this ticket done"
-                        } else {
-                            "Mark this resolved"
-                        }))
-                        .on_click(cx.listener({
-                            let id = id.clone();
-                            move |this, _, _window, cx| this.complete(&id, cx)
-                        })),
+                        h_flex()
+                            .gap_0p5()
+                            .when(!replying, |this| this.visible_on_hover(group.clone()))
+                            .when(!replying, |this| {
+                                this.child(
+                                    Button::new(
+                                        SharedString::from(format!("reply-{}", record.id)),
+                                        "Reply",
+                                    )
+                                    .label_size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |this, _, window, cx| {
+                                            this.start_reply(id.clone(), window, cx)
+                                        }
+                                    })),
+                                )
+                            })
+                            .child(
+                                Button::new(
+                                    SharedString::from(format!("assign-{}", record.id)),
+                                    if mine { "Unassign" } else { "Take" },
+                                )
+                                .label_size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .on_click(cx.listener({
+                                    let id = id.clone();
+                                    move |this, _, _window, cx| this.take_ownership(&id, cx)
+                                })),
+                            )
+                            // Done in one click, wherever the record is. The
+                            // status pill cycles, which takes two clicks to
+                            // finish a ticket that has not been started.
+                            .child(
+                                Button::new(
+                                    SharedString::from(format!("complete-{}", record.id)),
+                                    if closed { "Reopen" } else { "Done" },
+                                )
+                                .start_icon(
+                                    Icon::new(if closed {
+                                        IconName::RotateCcw
+                                    } else {
+                                        IconName::Check
+                                    })
+                                    .size(IconSize::XSmall),
+                                )
+                                .label_size(LabelSize::XSmall)
+                                .color(if closed { Color::Muted } else { Color::Success })
+                                .tooltip(Tooltip::text(if closed {
+                                    "Reopen"
+                                } else if is_ticket {
+                                    "Mark this ticket done"
+                                } else {
+                                    "Mark this resolved"
+                                }))
+                                .on_click(cx.listener({
+                                    let id = id.clone();
+                                    move |this, _, _window, cx| this.complete(&id, cx)
+                                })),
+                            ),
                     ),
             )
             .into_any_element()
@@ -1101,13 +1260,6 @@ impl TeamNotesPanel {
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     ),
-            )
-            .child(
-                IconButton::new("chat-reload", IconName::ArrowCircle)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Re-read from the repository"))
-                    .on_click(cx.listener(|this, _, _window, cx| this.reload(cx))),
             )
             .into_any_element()
     }
@@ -1312,9 +1464,12 @@ impl TeamNotesPanel {
                                 // every message.
                                 this.child(
                                     h_flex().w_full().justify_end().child(
-                                        Label::new(format!("Sent · {}", short_time(&local_time(&at))))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
+                                        Label::new(format!(
+                                            "Sent · {}",
+                                            short_time(&local_time(&at))
+                                        ))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
                                     ),
                                 )
                             })
@@ -1359,8 +1514,10 @@ impl TeamNotesPanel {
                 };
                 if span.start > cursor {
                     pieces.push(
-                        color(Label::new(line[cursor..span.start].to_string()).size(LabelSize::Small))
-                            .into_any_element(),
+                        color(
+                            Label::new(line[cursor..span.start].to_string()).size(LabelSize::Small),
+                        )
+                        .into_any_element(),
                     );
                 }
                 cursor = span.end;
@@ -1394,7 +1551,11 @@ impl TeamNotesPanel {
             }
             if cursor < line.len() || pieces.is_empty() {
                 // An empty line keeps its height with a single space.
-                let rest = if cursor < line.len() { &line[cursor..] } else { " " };
+                let rest = if cursor < line.len() {
+                    &line[cursor..]
+                } else {
+                    " "
+                };
                 pieces.push(
                     color(Label::new(rest.to_string()).size(LabelSize::Small)).into_any_element(),
                 );
@@ -1604,11 +1765,7 @@ fn initials_avatar(
     ring: Option<gpui::Hsla>,
     cx: &App,
 ) -> gpui::AnyElement {
-    let background = cx
-        .theme()
-        .players()
-        .color_for_participant(name_hash(name))
-        .cursor;
+    let background = avatar_color(name, cx);
 
     h_flex()
         .flex_none()
@@ -1623,6 +1780,58 @@ fn initials_avatar(
                 .color(Color::Custom(readable_on(background))),
         )
         .into_any_element()
+}
+
+/// A person's colour: a hue from their name, at a strength suited to the theme.
+///
+/// Not the theme's player colours. Acuto's themes define a single player, so
+/// every teammate came out the same colour, and in a dark theme that colour is
+/// white. A hue per name tells people apart; the lightness is set per
+/// appearance so the initials on it always read.
+fn avatar_color(name: &str, cx: &App) -> gpui::Hsla {
+    let hue = (name_hash(name) % 360) as f32 / 360.;
+    if cx.theme().appearance().is_light() {
+        gpui::hsla(hue, 0.42, 0.44, 1.)
+    } else {
+        gpui::hsla(hue, 0.45, 0.70, 1.)
+    }
+}
+
+/// How long ago `at` was, in the few characters a list row can spare: `now`,
+/// `5m`, `3h`, `2d`, and the date beyond a week. A stamp that does not parse
+/// is shown as its clock time rather than guessed at.
+fn age(at: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    let Ok(stamp) = chrono::DateTime::parse_from_rfc3339(at) else {
+        return short_time(at);
+    };
+    let minutes = now
+        .signed_duration_since(stamp.with_timezone(&chrono::Utc))
+        .num_minutes();
+    const HOUR: i64 = 60;
+    const DAY: i64 = 24 * HOUR;
+    match minutes {
+        minutes if minutes < 1 => "now".to_string(),
+        minutes if minutes < HOUR => format!("{minutes}m"),
+        minutes if minutes < DAY => format!("{}h", minutes / HOUR),
+        minutes if minutes < 7 * DAY => format!("{}d", minutes / DAY),
+        _ => stamp
+            .with_timezone(&chrono::Local)
+            .format("%b %-d")
+            .to_string(),
+    }
+}
+
+/// What a record's status pill says, and in what colour.
+fn status_presentation(record: &NoteThread) -> (&'static str, Color) {
+    match record.kind {
+        Kind::Ticket => match record.status {
+            Status::Open => ("Open", Color::Muted),
+            Status::InProgress => ("In Progress", Color::Accent),
+            Status::Done => ("Done", Color::Success),
+        },
+        Kind::Note | Kind::Message if record.resolved => ("Resolved", Color::Success),
+        Kind::Note | Kind::Message => ("Open", Color::Muted),
+    }
 }
 
 /// Whichever of white and near-black reads against `background`.
@@ -1737,6 +1946,360 @@ fn short_time(timestamp: &str) -> String {
         .to_string()
 }
 
+impl TeamNotesPanel {
+    /// The panel's title row: what this is and which repository it is for.
+    fn render_title(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let repository = self
+            .root
+            .as_ref()
+            .and_then(|root| root.file_name())
+            .map(|name| name.to_string_lossy().into_owned());
+
+        h_flex()
+            .w_full()
+            .gap_1p5()
+            .child(
+                Icon::new(IconName::UserGroup)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(Label::new("Team").weight(gpui::FontWeight::SEMIBOLD))
+            .when_some(repository, |this, repository| {
+                this.child(
+                    Label::new(repository)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+            })
+            .child(div().flex_1())
+            .child(
+                IconButton::new("reload", IconName::ArrowCircle)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Re-read from the repository"))
+                    .on_click(cx.listener(|this, _, _window, cx| this.reload(cx))),
+            )
+            .into_any_element()
+    }
+
+    /// The tabs, each with the number of open records it holds.
+    fn render_tabs(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let filter = self.filter;
+        let me = self.author.to_string();
+        let open_count = |option: Filter| {
+            self.records
+                .iter()
+                .filter(|record| !record.is_closed() && option.admits(record, &me))
+                .count()
+        };
+
+        h_flex()
+            .w_full()
+            .p_0p5()
+            .gap_0p5()
+            .rounded_md()
+            .bg(cx.theme().colors().element_background)
+            .children(Filter::ALL.into_iter().map(|option| {
+                let is_selected = option == filter;
+                // Counts only where a number answers a question: what is
+                // waiting on me, and what is still to do. A count of every
+                // message ever sent answers nothing.
+                let count = match option {
+                    Filter::Inbox | Filter::Tickets | Filter::Notes => open_count(option),
+                    Filter::Messages | Filter::All => 0,
+                };
+                h_flex()
+                    .id(SharedString::from(option.label()))
+                    .flex_1()
+                    .justify_center()
+                    .gap_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(is_selected, |this| {
+                        this.bg(cx.theme().colors().elevated_surface_background)
+                            .shadow_xs()
+                    })
+                    .when(!is_selected, |this| {
+                        this.hover(|style| style.bg(cx.theme().colors().element_hover))
+                    })
+                    .child(Label::new(option.label()).size(LabelSize::XSmall).color(
+                        if is_selected {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        },
+                    ))
+                    .when(count > 0, |this| {
+                        this.child(
+                            h_flex()
+                                .px_1()
+                                .rounded_full()
+                                .bg(if option == Filter::Inbox {
+                                    cx.theme().status().info_background
+                                } else {
+                                    cx.theme().colors().element_selected
+                                })
+                                .child(
+                                    Label::new(count.to_string()).size(LabelSize::XSmall).color(
+                                        if option == Filter::Inbox {
+                                            Color::Info
+                                        } else {
+                                            Color::Muted
+                                        },
+                                    ),
+                                ),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.filter = option;
+                        // An untouched composer does not follow you to another
+                        // tab, where it would be invisible but still open. One
+                        // with text in it does, because discarding what
+                        // someone typed to tidy up the UI is worse than the
+                        // stray composer.
+                        if this.draft_is_empty(cx) {
+                            this.drafting = None;
+                            this.replying_to = None;
+                        }
+                        cx.notify();
+                    }))
+            }))
+            .into_any_element()
+    }
+
+    /// The ways to add something, the same on every list tab.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let show_closed = self.show_closed;
+        h_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                Button::new("new-ticket", "Ticket")
+                    .start_icon(Icon::new(IconName::Plus).size(IconSize::XSmall))
+                    .style(ButtonStyle::Filled)
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text("New ticket"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.filter = Filter::Tickets;
+                        this.open_composer(
+                            Draft::Ticket,
+                            "What needs doing? @mention someone to assign it.",
+                            window,
+                            cx,
+                        );
+                    })),
+            )
+            .child(
+                Button::new("new-note", "Note")
+                    .start_icon(Icon::new(IconName::Pin).size(IconSize::XSmall))
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text("Add a note on the line your cursor is on"))
+                    // Called directly rather than by dispatching `AddNote`: an
+                    // action only reaches the workspace when focus is inside
+                    // it, and a click on this button does not put it there, so
+                    // the note silently never started. Deferred, because
+                    // starting a note updates this panel, which is mid-render.
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let workspace = this.workspace.clone();
+                        window.defer(cx, move |window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    TeamNotesPanel::start_note_at_cursor(workspace, window, cx);
+                                })
+                                .log_err();
+                        });
+                    })),
+            )
+            .child(
+                Button::new("new-message", "Message")
+                    .start_icon(Icon::new(IconName::Chat).size(IconSize::XSmall))
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text("Message the team"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.filter = Filter::Messages;
+                        this.open_composer(
+                            Draft::Message,
+                            "Say something to the team. @mention to reach someone.",
+                            window,
+                            cx,
+                        );
+                    })),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("show-closed", "Finished")
+                    .start_icon(Icon::new(IconName::Check).size(IconSize::XSmall))
+                    .label_size(LabelSize::Small)
+                    .toggle_state(show_closed)
+                    .color(if show_closed {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    })
+                    .tooltip(Tooltip::text(if show_closed {
+                        "Hide finished"
+                    } else {
+                        "Show finished"
+                    }))
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.show_closed = !this.show_closed;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// The note, ticket or message being written, framed as the card it will
+    /// become.
+    fn render_draft(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (draft, composer) = self.drafting.as_ref()?;
+        let (icon, title) = match draft {
+            Draft::Note { file, anchor } => {
+                (IconName::Pin, format!("Note on {file}:{}", anchor.line + 1))
+            }
+            Draft::Ticket => (IconName::ListTodo, "New ticket".to_string()),
+            Draft::Message => (IconName::Chat, "New message".to_string()),
+        };
+        let colors = cx.theme().colors();
+
+        Some(
+            v_flex()
+                .key_context("TeamNotesDraft")
+                .w_full()
+                .p_2()
+                .gap_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(colors.border_focused)
+                .bg(colors.elevated_surface_background)
+                .on_action(
+                    cx.listener(|this, _: &CancelDraft, window, cx| this.cancel_draft(window, cx)),
+                )
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                        .child(
+                            Label::new(title)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                )
+                .child(
+                    div()
+                        .p_1p5()
+                        .rounded_md()
+                        .bg(colors.editor_background)
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .child(composer.clone()),
+                )
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_1()
+                        .child(
+                            Button::new("cancel-draft", "Cancel")
+                                .label_size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.cancel_draft(window, cx)
+                                    }),
+                                ),
+                        )
+                        .child(
+                            Button::new("submit-draft", "Add")
+                                .style(ButtonStyle::Filled)
+                                .label_size(LabelSize::Small)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.submit_draft(window, cx)
+                                    }),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// What an empty tab says, and the way to put something in it.
+    fn render_empty(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (icon, title, detail) = match self.filter {
+            Filter::Inbox => (
+                IconName::Check,
+                "You're all caught up",
+                "Tickets assigned to you and anything that @mentions you show up here.",
+            ),
+            Filter::Tickets => (
+                IconName::ListTodo,
+                "No open tickets",
+                "Track work alongside the code. @mention someone to assign it, or \
+                 @claude to hand it to an agent.",
+            ),
+            Filter::Notes => (
+                IconName::Pin,
+                "No notes yet",
+                "Put the cursor on a line and add a note to explain why it is the \
+                 way it is. Teammates see it when they open the file.",
+            ),
+            Filter::Messages | Filter::All => (
+                IconName::UserGroup,
+                "Nothing here yet",
+                "Messages, notes and tickets live in .acuto/notes.jsonl and travel \
+                 with the repository: your team sees them on their next pull.",
+            ),
+        };
+
+        v_flex()
+            .w_full()
+            .py_8()
+            .px_4()
+            .gap_2()
+            .items_center()
+            .child(
+                h_flex()
+                    .size_10()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(cx.theme().colors().element_background)
+                    .child(Icon::new(icon).size(IconSize::Medium).color(Color::Muted)),
+            )
+            .child(Label::new(title).weight(gpui::FontWeight::MEDIUM))
+            .child(
+                div().max_w(px(300.)).text_center().child(
+                    Label::new(detail)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// One heading of the list, with how many records sit under it.
+    fn render_section(label: &'static str, count: usize) -> gpui::AnyElement {
+        h_flex()
+            .w_full()
+            .pt_1()
+            .gap_1()
+            .child(
+                Label::new(label.to_uppercase())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .weight(gpui::FontWeight::MEDIUM),
+            )
+            .child(
+                Label::new(count.to_string())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Disabled),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for TeamNotesPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let filter = self.filter;
@@ -1751,274 +2314,92 @@ impl Render for TeamNotesPanel {
             .cloned()
             .collect();
 
-        // Open first, then by file, then by line. What needs an answer is at
-        // the top rather than wherever its id happens to sort.
-        records.sort_by(|a, b| {
-            a.is_closed()
-                .cmp(&b.is_closed())
-                .then_with(|| a.file.cmp(&b.file))
-                .then_with(|| {
-                    a.anchor
-                        .as_ref()
-                        .map(|anchor| anchor.line)
-                        .cmp(&b.anchor.as_ref().map(|anchor| anchor.line))
-                })
-        });
+        // Newest first within each section: what was raised last is the most
+        // likely to still be on someone's mind. Ids are time-ordered.
+        records.sort_by(|a, b| b.id.cmp(&a.id));
 
-        let inbox_count = self.inbox_count();
-        let empty = records.is_empty() && self.drafting.is_none();
+        let header = v_flex()
+            .p_2()
+            .gap_2()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(self.render_title(cx))
+            .child(self.render_tabs(cx))
+            .child(if filter == Filter::Messages {
+                self.render_chat_header(cx)
+            } else {
+                self.render_toolbar(cx)
+            });
 
-        v_flex()
+        let base = v_flex()
             .key_context("TeamNotesPanel")
             .track_focus(&self.focus_handle)
             .size_full()
-            .child(
-                v_flex()
-                    .p_2()
-                    .gap_1p5()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border)
-                    .when(filter == Filter::Messages, |this| {
-                        this.child(self.render_chat_header(cx))
-                    })
-                    .when(filter != Filter::Messages, |this| this.child(
-                        h_flex()
-                            .justify_end()
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        IconButton::new("new-message", IconName::Chat)
-                                            .icon_size(IconSize::Small)
-                                            .icon_color(Color::Muted)
-                                            .tooltip(Tooltip::text("New Message"))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.filter = Filter::Messages;
-                                                this.open_composer(
-                                                    Draft::Message,
-                                                    "Say something to the team. @mention to reach someone.",
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    // Labelled, not icons: a pin and a plus side
-                                    // by side did not say which made a note,
-                                    // and people concluded notes could not be
-                                    // made at all. A note goes on the line
-                                    // under your cursor in the file you were
-                                    // last in.
-                                    .child(
-                                        Button::new("new-note", "Note")
-                                            .start_icon(
-                                                Icon::new(IconName::Pin).size(IconSize::XSmall),
-                                            )
-                                            .label_size(LabelSize::Small)
-                                            .color(Color::Muted)
-                                            .tooltip(Tooltip::text(
-                                                "Add a note on the line your cursor is on",
-                                            ))
-                                            // Called directly rather than by
-                                            // dispatching `AddNote`: an action
-                                            // only reaches the workspace when
-                                            // focus is inside it, and a click
-                                            // on this button does not put it
-                                            // there, so the note silently
-                                            // never started. Deferred, because
-                                            // starting a note updates this
-                                            // panel, which is mid-render here.
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                let workspace = this.workspace.clone();
-                                                window.defer(cx, move |window, cx| {
-                                                    workspace
-                                                        .update(cx, |workspace, cx| {
-                                                            TeamNotesPanel::start_note_at_cursor(
-                                                                workspace, window, cx,
-                                                            );
-                                                        })
-                                                        .log_err();
-                                                });
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("new-ticket", "Ticket")
-                                            .start_icon(
-                                                Icon::new(IconName::Plus).size(IconSize::XSmall),
-                                            )
-                                            .label_size(LabelSize::Small)
-                                            .color(Color::Muted)
-                                            .tooltip(Tooltip::text("New Ticket"))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.filter = Filter::Tickets;
-                                                this.open_composer(
-                                                    Draft::Ticket,
-                                                    "What needs doing? @mention someone to assign it.",
-                                                    window,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        IconButton::new("show-closed", IconName::Check)
-                                            .icon_size(IconSize::Small)
-                                            .icon_color(if show_closed {
-                                                Color::Accent
-                                            } else {
-                                                Color::Muted
-                                            })
-                                            .tooltip(Tooltip::text(if show_closed {
-                                                "Hide finished"
-                                            } else {
-                                                "Show finished"
-                                            }))
-                                            .on_click(cx.listener(|this, _, _window, cx| {
-                                                this.show_closed = !this.show_closed;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        IconButton::new("reload", IconName::ArrowCircle)
-                                            .icon_size(IconSize::Small)
-                                            .icon_color(Color::Muted)
-                                            .tooltip(Tooltip::text("Re-read from the repository"))
-                                            .on_click(cx.listener(|this, _, _window, cx| {
-                                                this.reload(cx)
-                                            })),
-                                    ),
-                            ),
-                    ))
-                    .child(
-                        h_flex()
-                            .p_0p5()
-                            .gap_0p5()
-                            .rounded_md()
-                            .bg(cx.theme().colors().element_background)
-                            .children(Filter::ALL.into_iter().map(|option| {
-                                let label = if option == Filter::Inbox && inbox_count > 0 {
-                                    format!("Inbox {inbox_count}")
-                                } else {
-                                    option.label().to_string()
-                                };
-                                let is_selected = option == filter;
-                                Button::new(SharedString::from(option.label()), label)
-                                    .label_size(LabelSize::XSmall)
-                                    .style(if is_selected {
-                                        ButtonStyle::Filled
-                                    } else {
-                                        ButtonStyle::Subtle
-                                    })
-                                    .color(if is_selected {
-                                        Color::Default
-                                    } else {
-                                        Color::Muted
-                                    })
-                                    .on_click(cx.listener(move |this, _, _window, cx| {
-                                        this.filter = option;
-                                        // An untouched composer does not follow
-                                        // you to another tab, where it would be
-                                        // invisible but still open. One with
-                                        // text in it does, because discarding
-                                        // what someone typed to tidy up the UI
-                                        // is worse than the stray composer.
-                                        if this.draft_is_empty(cx) {
-                                            this.drafting = None;
-                                            this.replying_to = None;
-                                        }
-                                        cx.notify();
-                                    }))
-                            })),
-                    ),
-            )
-            .map(|this| {
-                // A conversation is read in order and answered at the end; a
-                // list of tickets is scanned. Same records, two shapes, because
-                // one shape cannot do both jobs well.
-                if filter == Filter::Messages {
-                    return this.child(self.render_chat(&records, cx));
-                }
-                this.child(
-                v_flex()
-                    .id("team-list")
-                    .p_2()
-                    .gap_2()
-                    .size_full()
-                    .overflow_y_scroll()
-                    .when_some(self.drafting.as_ref(), |this, (draft, composer)| {
-                        let where_to = match draft {
-                            Draft::Note { file, anchor } => format!("{file}:{}", anchor.line + 1),
-                            Draft::Ticket => "New ticket".to_string(),
-                            Draft::Message => "New message".to_string(),
-                        };
-                        this.child(
-                            v_flex()
-                                .key_context("TeamNotesDraft")
-                                .p_2()
-                                .gap_1p5()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(cx.theme().colors().border_focused)
-                                .on_action(cx.listener(|this, _: &CancelDraft, window, cx| {
-                                    this.cancel_draft(window, cx)
-                                }))
-                                .child(
-                                    Label::new(where_to)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                )
-                                .child(composer.clone())
-                                .child(
-                                    h_flex()
-                                        .gap_1()
-                                        .child(
-                                            Button::new("submit-draft", "Add")
-                                                .label_size(LabelSize::Small)
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.submit_draft(window, cx)
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("cancel-draft", "Cancel")
-                                                .label_size(LabelSize::Small)
-                                                .color(Color::Muted)
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.cancel_draft(window, cx)
-                                                })),
-                                        ),
-                                ),
-                        )
-                    })
-                    .when(empty, |this| {
-                        this.child(
-                            v_flex()
-                                .p_3()
-                                .gap_1()
-                                .child(
-                                    Label::new(match filter {
-                                        Filter::Inbox => "Nothing waiting on you",
-                                        Filter::Messages => "No messages",
-                                        Filter::Notes => "No notes",
-                                        Filter::Tickets => "No tickets",
-                                        Filter::All => "Nothing here yet",
-                                    })
-                                    .color(Color::Muted),
-                                )
-                                .child(
-                                    Label::new(
-                                        "Messages and tickets are the two buttons above; a note \
-                                         attaches to a line, so put the cursor on one and run \
-                                         `team notes: add note`. Everything is written to \
-                                         .acuto/notes.jsonl and travels with the repository, so \
-                                         your team sees it on the next pull -- no account, no \
-                                         server, and it reviews as part of the diff.",
-                                    )
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                                ),
-                        )
-                    })
-                    .children(records.iter().map(|record| self.render_record(record, cx))),
-                )
-            })
+            .bg(cx.theme().colors().panel_background)
+            .child(header);
+
+        // A conversation is read in order and answered at the end; a list of
+        // tickets is scanned. Same records, two shapes, because one shape
+        // cannot do both jobs well.
+        if filter == Filter::Messages {
+            return base.child(self.render_chat(&records, cx));
+        }
+
+        // Tickets by where they have got to; everything else by whether it
+        // still needs anything.
+        let sections: Vec<(&'static str, Vec<&NoteThread>)> = if filter == Filter::Tickets {
+            [Status::InProgress, Status::Open, Status::Done]
+                .into_iter()
+                .map(|status| {
+                    (
+                        status.label(),
+                        records
+                            .iter()
+                            .filter(|record| record.status == status)
+                            .collect(),
+                    )
+                })
+                .collect()
+        } else {
+            vec![
+                (
+                    "Open",
+                    records
+                        .iter()
+                        .filter(|record| !record.is_closed())
+                        .collect(),
+                ),
+                (
+                    "Finished",
+                    records.iter().filter(|record| record.is_closed()).collect(),
+                ),
+            ]
+        };
+        let now = chrono::Utc::now();
+        let draft = self.render_draft(cx);
+        let empty = records.is_empty() && draft.is_none();
+
+        let mut list = v_flex()
+            .id("team-list")
+            .p_2()
+            .gap_2()
+            .size_full()
+            .overflow_y_scroll()
+            .children(draft);
+        if empty {
+            list = list.child(self.render_empty(cx));
+        }
+        for (label, section) in sections {
+            if section.is_empty() {
+                continue;
+            }
+            list = list.child(Self::render_section(label, section.len()));
+            for record in section {
+                list = list.child(self.render_record(record, now, cx));
+            }
+        }
+
+        base.child(list)
     }
 }
 
@@ -2148,6 +2529,18 @@ mod tests {
             separator_stamp("2026-08-29T15:04:05Z", None),
             "2026-08-29 · 15:04"
         );
+    }
+
+    #[test]
+    fn ages_are_short_and_never_negative() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-29T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(age("2026-08-29T12:00:30Z", now), "now");
+        assert_eq!(age("2026-08-29T11:55:00Z", now), "5m");
+        assert_eq!(age("2026-08-29T09:00:00Z", now), "3h");
+        assert_eq!(age("2026-08-27T12:00:00Z", now), "2d");
+        assert_eq!(age("not a time", now), "not a time");
     }
 
     #[test]

@@ -79,6 +79,8 @@ impl Diff {
             multibuffer,
             path,
             base_text,
+            base_text_exists,
+            reported: true,
             new_buffer,
             _update_diff: task,
         })
@@ -144,6 +146,20 @@ impl Diff {
         match self {
             Self::Pending(PendingDiff { new_buffer, .. }) => new_buffer,
             Self::Finalized(FinalizedDiff { new_buffer, .. }) => new_buffer,
+        }
+    }
+
+    /// The change exactly as the agent reported it: the old text, or `None`
+    /// for a file the edit created, and the new text. Only reported diffs
+    /// have one; a diff the editor is streaming into a buffer does not.
+    pub fn reported_change(&self, cx: &App) -> Option<(Option<Arc<str>>, String)> {
+        match self {
+            Self::Pending(_) => None,
+            Self::Finalized(diff) if !diff.reported => None,
+            Self::Finalized(diff) => Some((
+                diff.base_text_exists.then(|| diff.base_text.clone()),
+                diff.new_buffer.read(cx).text(),
+            )),
         }
     }
 
@@ -315,6 +331,8 @@ impl PendingDiff {
         FinalizedDiff {
             path,
             base_text: self.base_text.clone(),
+            base_text_exists: true,
+            reported: false,
             multibuffer: self.multibuffer.clone(),
             new_buffer: self.new_buffer.clone(),
             _update_diff: update_diff,
@@ -379,6 +397,11 @@ impl PendingDiff {
 pub struct FinalizedDiff {
     path: String,
     base_text: Arc<str>,
+    /// False when the agent reported no old text: the edit created the file.
+    base_text_exists: bool,
+    /// Whether this came from an agent's report rather than from an edit the
+    /// editor streamed into the file itself.
+    reported: bool,
     new_buffer: Entity<Buffer>,
     multibuffer: Entity<MultiBuffer>,
     _update_diff: Task<Result<()>>,

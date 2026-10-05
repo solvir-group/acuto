@@ -1,12 +1,12 @@
 use anyhow::Result;
 use buffer_diff::BufferDiff;
 use clock;
-use collections::{BTreeMap, HashMap};
+use collections::{BTreeMap, HashMap, HashSet};
 use fs::MTime;
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
-    App, AppContext, AsyncApp, Context, Entity, SharedString, Subscription, Task, TaskExt as _,
-    WeakEntity,
+    App, AppContext, AsyncApp, Context, Entity, EntityId, SharedString, Subscription, Task,
+    TaskExt as _, WeakEntity,
 };
 use language::{Anchor, Buffer, BufferEvent, Point};
 use project::{Project, ProjectItem, lsp_store::OpenLspBufferHandle};
@@ -89,6 +89,11 @@ pub struct ActionLog {
     _turn_start_subscriptions: Vec<Subscription>,
     /// Whether the agent has changed any file since the current turn began.
     agent_edited_this_turn: bool,
+    /// Buffers the user has kept or rejected changes in since the current turn
+    /// began. A base worked out from the agent's report of its edits is never
+    /// applied to these: the report still describes changes the user has
+    /// already answered, and applying it would put them back under review.
+    answered_this_turn: HashSet<EntityId>,
     /// Buffers that we want to notify the model about when they change.
     tracked_buffers: BTreeMap<Entity<Buffer>, TrackedBuffer>,
     /// The project this action log is associated with
@@ -115,6 +120,7 @@ impl ActionLog {
             turn_start_snapshots: HashMap::default(),
             _turn_start_subscriptions: Vec::new(),
             agent_edited_this_turn: false,
+            answered_this_turn: HashSet::default(),
             tracked_buffers: BTreeMap::default(),
             project,
             linked_action_log: None,
@@ -232,6 +238,7 @@ impl ActionLog {
                 let mut tracked_buffer = TrackedBuffer {
                     buffer: buffer.clone(),
                     agent_writes_to_disk: false,
+                    base_from_report: false,
                     diff_base,
                     unreviewed_edits: Patch::default(),
                     changes: Vec::new(),
@@ -448,6 +455,10 @@ impl ActionLog {
     ) {
         self.agent_turn_active = true;
         self.agent_edited_this_turn = false;
+        self.answered_this_turn.clear();
+        for tracked_buffer in self.tracked_buffers.values_mut() {
+            tracked_buffer.base_from_report = false;
+        }
         // Lines accepted in a file stay on screen for reference while any of
         // that file is still under review, and are let go once the agent starts
         // on something new after it was all answered.
@@ -612,6 +623,69 @@ impl ActionLog {
         }
     }
 
+    /// Settles a file an agent wrote to disk with its own tools, given the text
+    /// it held before this turn's writes, worked out from the agent's own
+    /// report of them. `None` means the turn created the file.
+    ///
+    /// A file the log already measured from before the write needs nothing:
+    /// the reload was recorded as the agent's edit. But claiming a file opens
+    /// it first, and an agent allowed to edit without asking has often written
+    /// it by then. Its base was then the new text, nothing was left to review,
+    /// and the file was missing from the diff. This puts the true base in.
+    pub fn agent_wrote(
+        &mut self,
+        buffer: Entity<Buffer>,
+        text_before: Option<Rope>,
+        cx: &mut Context<Self>,
+    ) {
+        // Deliberately not gated on the turn still running: the report of a
+        // turn's last write often lands after the turn has ended. Replayed
+        // history never gets here; the caller turns it away when it arrives.
+        if self.answered_this_turn.contains(&buffer.entity_id()) {
+            return;
+        }
+        if let Some(tracked_buffer) = self.tracked_buffers.get(&buffer)
+            && !tracked_buffer.base_from_report
+            && !tracked_buffer.changes.is_empty()
+        {
+            return;
+        }
+        let current = buffer.read(cx).as_rope().clone();
+        if text_before.as_ref().is_some_and(|before| {
+            before.len() == current.len() && before.chars().eq(current.chars())
+        }) {
+            return;
+        }
+
+        let created = text_before.is_none();
+        if !self.tracked_buffers.contains_key(&buffer) {
+            self.update_file_read_time(&buffer, cx);
+            self.track_buffer_internal(buffer.clone(), created, cx);
+        }
+        let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
+            return;
+        };
+        if created {
+            tracked_buffer.status = TrackedBufferStatus::Created {
+                existing_file_content: None,
+            };
+        } else if let TrackedBufferStatus::Created { .. } = tracked_buffer.status {
+            tracked_buffer.status = TrackedBufferStatus::Modified;
+        }
+        tracked_buffer.diff_base = text_before.unwrap_or_default();
+        tracked_buffer.base_from_report = true;
+        tracked_buffer.agent_writes_to_disk = true;
+        tracked_buffer.snapshot = buffer.read(cx).text_snapshot();
+        tracked_buffer.version = buffer.read(cx).version();
+        tracked_buffer.refresh();
+        self.agent_edited_this_turn = true;
+        log::info!(
+            "agent review: {} measured against its text before the agent's report of this turn",
+            buffer_display_path(&buffer, cx)
+        );
+        cx.notify();
+    }
+
     /// Mark a buffer as edited by agent, so we can refresh it in the context
     pub fn buffer_edited(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
         self.buffer_edited_impl(buffer, true, cx);
@@ -669,8 +743,7 @@ impl ActionLog {
             linked_action_log.update(cx, |log, cx| log.will_delete_buffer(buffer.clone(), cx));
         }
 
-        if has_linked_action_log
-            && let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer)
+        if has_linked_action_log && let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer)
         {
             tracked_buffer.observe(ChangeAuthor::Agent, cx);
         }
@@ -705,7 +778,10 @@ impl ActionLog {
         };
         let snapshot = &tracked_buffer.snapshot;
         let len = snapshot.len();
-        let unterminated = snapshot.reversed_chars_at(len).next().is_some_and(|c| c != '\n');
+        let unterminated = snapshot
+            .reversed_chars_at(len)
+            .next()
+            .is_some_and(|c| c != '\n');
         let changes = Self::all_changes(tracked_buffer);
         let bytes = changes
             .iter()
@@ -728,7 +804,8 @@ impl ActionLog {
                         let at_unterminated_end = unterminated && change.end == len;
                         *answered |= !change.is_empty()
                             && change.start <= offset
-                            && (offset < change.end || (offset == change.end && at_unterminated_end));
+                            && (offset < change.end
+                                || (offset == change.end && at_unterminated_end));
                     }
                 }
             } else {
@@ -808,6 +885,7 @@ impl ActionLog {
         telemetry: Option<ActionLogTelemetry>,
         cx: &mut Context<Self>,
     ) {
+        self.answered_this_turn.insert(buffer.entity_id());
         self.catch_up(&buffer, cx);
         let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
             return;
@@ -893,6 +971,7 @@ impl ActionLog {
         telemetry: Option<ActionLogTelemetry>,
         cx: &mut Context<Self>,
     ) -> (Task<Result<()>>, Option<PerBufferUndo>) {
+        self.answered_this_turn.insert(buffer.entity_id());
         self.catch_up(&buffer, cx);
         let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
             return (Task::ready(Ok(())), None);
@@ -1193,6 +1272,8 @@ impl ActionLog {
         telemetry: Option<ActionLogTelemetry>,
         cx: &mut Context<Self>,
     ) {
+        self.answered_this_turn
+            .extend(self.tracked_buffers.keys().map(|buffer| buffer.entity_id()));
         self.tracked_buffers.retain(|buffer, tracked_buffer| {
             let mut metrics = ActionLogMetrics::for_buffer(buffer.read(cx));
             metrics.add_edits(tracked_buffer.unreviewed_edits.edits());
@@ -1355,7 +1436,13 @@ impl ActionLog {
         self.tracked_buffers
             .iter()
             .filter(|(_, tracked)| tracked.has_edits(cx) || !tracked.accepted.is_empty())
-            .map(|(buffer, tracked)| (buffer.clone(), tracked.diff.clone(), tracked.accepted.clone()))
+            .map(|(buffer, tracked)| {
+                (
+                    buffer.clone(),
+                    tracked.diff.clone(),
+                    tracked.accepted.clone(),
+                )
+            })
             .collect()
     }
 
@@ -1607,6 +1694,10 @@ pub struct TrackedBuffer {
     /// change into the base and leaves nothing to review. While this is set, a
     /// reload is recorded as the agent's edit instead.
     agent_writes_to_disk: bool,
+    /// Whether `diff_base` was worked out this turn from the agent's report of
+    /// its edits rather than taken from the file before they landed. Such a
+    /// base is replaced when a later report covers more of the turn.
+    base_from_report: bool,
     diff_base: Rope,
     /// The changes from `diff_base` to `snapshot` still to be answered, as row
     /// ranges. Always recomputed from those two, never kept separately.
@@ -1849,7 +1940,10 @@ fn splice_rows(target: &Rope, rows: Range<u32>, mut text: String) -> (Range<usiz
         if range.end < len && !text.ends_with('\n') {
             text.push('\n');
         }
-        let unterminated = target.reversed_chars_at(len).next().is_some_and(|c| c != '\n');
+        let unterminated = target
+            .reversed_chars_at(len)
+            .next()
+            .is_some_and(|c| c != '\n');
         if range.start == len && unterminated {
             text.insert(0, '\n');
         }
@@ -2152,6 +2246,55 @@ mod tests {
     /// in the review list and remains re-acceptable. Upstream computed
     /// everything needed for that while rejecting and handed it to the caller,
     /// which discarded it, so a rejection was unrecoverable in practice.
+    /// A file first seen after the agent wrote it is measured against the
+    /// text the agent's report says it replaced; once the user has answered
+    /// it, a later report for the same write changes nothing.
+    #[gpui::test]
+    async fn test_reported_base_for_a_file_claimed_after_the_write(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "one\nTWO\nthree\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+        let changed = |cx: &mut TestAppContext| {
+            action_log.read_with(cx, |log, cx| log.changed_buffers(cx).count())
+        };
+
+        action_log.update(cx, |log, cx| {
+            log.begin_agent_turn(Vec::new(), cx);
+            // Claimed only now, after the write: its base is the new text.
+            log.agent_will_write(buffer.clone(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(changed(cx), 0);
+
+        let before = Rope::from("one\ntwo\nthree\n");
+        action_log.update(cx, |log, cx| {
+            log.agent_wrote(buffer.clone(), Some(before.clone()), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(changed(cx), 1);
+
+        action_log.update(cx, |log, cx| log.keep_all_edits(None, cx));
+        cx.run_until_parked();
+        assert_eq!(changed(cx), 0);
+
+        action_log.update(cx, |log, cx| {
+            log.agent_wrote(buffer.clone(), Some(before), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(changed(cx), 0, "an answered change came back for review");
+    }
+
     #[gpui::test]
     async fn test_rejected_hunks_are_retained_and_restorable(cx: &mut TestAppContext) {
         init_test(cx);
@@ -2637,8 +2780,9 @@ mod tests {
         // newline and the agent added lines after it (or the reverse), and it
         // goes away with whichever line next to it is answered, because a line
         // that is not last cannot do without one.
-        let newline_only =
-            |hunk: &ShownHunk| hunk.old_text.trim_end_matches('\n') == hunk.new_text.trim_end_matches('\n');
+        let newline_only = |hunk: &ShownHunk| {
+            hunk.old_text.trim_end_matches('\n') == hunk.new_text.trim_end_matches('\n')
+        };
         let texts = |hunks: &[ShownHunk]| {
             hunks
                 .iter()

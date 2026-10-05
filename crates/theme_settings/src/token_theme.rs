@@ -124,7 +124,7 @@ const ACUTO_LIGHT: Palette = &[
     ("link_uri", "#0f7490"),
     ("number", "#8a6a1f"),
     ("operator", "#3b6b80"),
-    ("predictive", "#a2acb8"),
+    ("predictive", "#949eab"),
     ("preproc", "#7b3fa8"),
     ("primary", "#1b2531"),
     ("property", "#0f7490"),

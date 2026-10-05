@@ -19,6 +19,7 @@ use audio::{Audio, Sound};
 use buffer_diff::BufferDiff;
 use client::zed_urls;
 use collections::{HashMap, HashSet, IndexMap};
+use db::kvp::KeyValueStore;
 use editor::scroll::Autoscroll;
 use editor::{
     Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, SelectionEffects, SizingBehavior,
@@ -754,6 +755,14 @@ enum AuthState {
     Unauthenticated {
         description: Option<Entity<Markdown>>,
         pending_auth_method: Option<acp::AuthMethodId>,
+        /// Why the last sign-in attempt did not finish. It is shown on the card
+        /// because before the first thread exists there is nowhere else to
+        /// show it, and a failure nobody sees reads as a button that does
+        /// nothing.
+        error: Option<SharedString>,
+        /// An account this agent would use if allowed, found on this machine.
+        /// It is offered as "Continue as", never used without being chosen.
+        existing_account: Option<SharedString>,
     },
 }
 
@@ -761,6 +770,62 @@ impl AuthState {
     pub fn is_ok(&self) -> bool {
         matches!(self, Self::Ok)
     }
+
+    fn signed_out() -> Self {
+        Self::Unauthenticated {
+            description: None,
+            pending_auth_method: None,
+            error: None,
+            existing_account: None,
+        }
+    }
+}
+
+const AGENT_SIGN_IN_NAMESPACE: &str = "agent_sign_in";
+
+/// Whether the user has signed in to this agent from Acuto, or chosen to keep
+/// the account it found on this machine.
+///
+/// Agents read credentials their own CLIs left behind, and Claude Code also
+/// takes `ANTHROPIC_API_KEY` from the environment, so without this an agent
+/// starts out signed in to whatever account happens to be on the PC. Until the
+/// user picks one, the sign-in card is shown instead of a thread.
+fn sign_in_confirmed(agent_id: &AgentId, cx: &App) -> bool {
+    // This session's choices first: the write below is asynchronous, and the
+    // reload that follows a sign-in reads this before the write has landed.
+    if let Some(choices) = cx.try_global::<SignInChoices>()
+        && let Some(confirmed) = choices.0.get(agent_id)
+    {
+        return *confirmed;
+    }
+    KeyValueStore::global(cx)
+        .scoped(AGENT_SIGN_IN_NAMESPACE)
+        .read(agent_id.0.as_ref())
+        .log_err()
+        .flatten()
+        .is_some()
+}
+
+#[derive(Default)]
+struct SignInChoices(HashMap<AgentId, bool>);
+
+impl gpui::Global for SignInChoices {}
+
+fn remember_sign_in(agent_id: AgentId, confirmed: bool, cx: &mut App) {
+    cx.default_global::<SignInChoices>()
+        .0
+        .insert(agent_id.clone(), confirmed);
+    let kvp = KeyValueStore::global(cx);
+    cx.background_spawn(async move {
+        let store = kvp.scoped(AGENT_SIGN_IN_NAMESPACE);
+        let key = agent_id.0.to_string();
+        if confirmed {
+            store.write(key, "1".to_string()).await
+        } else {
+            store.delete(key).await
+        }
+    })
+    .detach_and_log_err(cx);
 }
 
 struct LoadingView {
@@ -1164,6 +1229,24 @@ impl ConversationView {
                 Ok(thread) => Ok(thread),
             };
 
+            let needs_sign_in = result.is_ok()
+                && cx
+                    .update(|_, cx| {
+                        !connection.auth_methods().is_empty()
+                            && !sign_in_confirmed(&connection.agent_id(), cx)
+                    })
+                    .unwrap_or(false);
+            let existing_account = if needs_sign_in {
+                let agent_id = connection.agent_id().0.to_string();
+                cx.background_spawn(async move {
+                    crate::conversation_view::claude_brand::saved_account(&agent_id)
+                })
+                .await
+                .map(SharedString::from)
+            } else {
+                None
+            };
+
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(thread) => {
@@ -1199,7 +1282,16 @@ impl ConversationView {
                         this.set_server_state(
                             ServerState::Connected(ConnectedServerState {
                                 connection,
-                                auth_state: AuthState::Ok,
+                                auth_state: if needs_sign_in {
+                                    AuthState::Unauthenticated {
+                                        description: None,
+                                        pending_auth_method: None,
+                                        error: None,
+                                        existing_account,
+                                    }
+                                } else {
+                                    AuthState::Ok
+                                },
                                 active_id: Some(root_session_id.clone()),
                                 threads: HashMap::from_iter([(root_session_id, current)]),
                                 conversation,
@@ -1447,6 +1539,8 @@ impl ConversationView {
             let auth_state = AuthState::Unauthenticated {
                 pending_auth_method: None,
                 description,
+                error: None,
+                existing_account: None,
             };
             if let Some(connected) = this.as_connected_mut() {
                 connected.auth_state = auth_state;
@@ -1581,10 +1675,7 @@ impl ConversationView {
         if connected.connection.auth_methods().is_empty() {
             return;
         }
-        connected.auth_state = AuthState::Unauthenticated {
-            description: None,
-            pending_auth_method: None,
-        };
+        connected.auth_state = AuthState::signed_out();
         self.switching_account = true;
         cx.emit(StateChange);
         cx.notify();
@@ -1958,23 +2049,30 @@ impl ConversationView {
 
         let AuthState::Unauthenticated {
             pending_auth_method,
+            error,
             ..
         } = &mut connected.auth_state
         else {
             return;
         };
+        pending_auth_method.replace(method.clone());
+        error.take();
 
         let agent_telemetry_id = connection.telemetry_id();
+        let project = self.project.clone();
+        let terminal_login = connection.terminal_auth_task(&method, cx);
+        let authenticate = if terminal_login.is_none() {
+            Some(connection.authenticate(method.clone(), cx))
+        } else {
+            None
+        };
+        cx.emit(StateChange);
+        cx.notify();
 
-        if let Some(login_task) = connection.terminal_auth_task(&method, cx) {
-            pending_auth_method.replace(method.clone());
-
-            let project = self.project.clone();
-            cx.emit(StateChange);
-            cx.notify();
-            self.auth_task = Some(cx.spawn_in(window, {
-                async move |this, cx| {
-                    let result = async {
+        self.auth_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = match (terminal_login, authenticate) {
+                (Some(login_task), _) => {
+                    async {
                         let login = login_task.await?;
                         this.update_in(cx, |_this, window, cx| {
                             Self::spawn_external_agent_login(
@@ -1989,99 +2087,104 @@ impl ConversationView {
                         })?
                         .await
                     }
-                    .await;
-
-                    match &result {
-                        Ok(_) => telemetry::event!(
-                            "Authenticate Agent Succeeded",
-                            agent = agent_telemetry_id
-                        ),
-                        Err(_) => {
-                            telemetry::event!(
-                                "Authenticate Agent Failed",
-                                agent = agent_telemetry_id,
-                            )
-                        }
-                    }
-
-                    this.update_in(cx, |this, window, cx| {
-                        if let Err(err) = result {
-                            this.cancel_request_elicitations(cx);
-                            if let Some(ConnectedServerState {
-                                auth_state:
-                                    AuthState::Unauthenticated {
-                                        pending_auth_method,
-                                        ..
-                                    },
-                                ..
-                            }) = this.as_connected_mut()
-                            {
-                                pending_auth_method.take();
-                                cx.emit(StateChange);
-                            }
-                            if let Some(active) = this.root_thread_view() {
-                                active.update(cx, |active, cx| {
-                                    active.handle_thread_error(err, cx);
-                                })
-                            }
-                        } else {
-                            this.switching_account = false;
-                            this.reset(window, cx);
-                        }
-                        this.auth_task.take()
-                    })
-                    .ok();
+                    .await
                 }
-            }));
-            return;
+                (None, Some(authenticate)) => authenticate.await,
+                (None, None) => Err(anyhow!("This sign-in method is not available.")),
+            };
+
+            match &result {
+                Ok(_) => {
+                    telemetry::event!("Authenticate Agent Succeeded", agent = agent_telemetry_id)
+                }
+                Err(_) => {
+                    telemetry::event!("Authenticate Agent Failed", agent = agent_telemetry_id)
+                }
+            }
+
+            this.update_in(cx, |this, window, cx| {
+                this.finish_authentication(result, window, cx);
+                this.auth_task.take()
+            })
+            .ok();
+        }));
+    }
+
+    /// Records how a sign-in attempt ended. Success counts as the user choosing
+    /// this agent's account; failure stays on the card with its reason.
+    fn finish_authentication(
+        &mut self,
+        result: Result<()>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.remember_sign_in(true, cx);
+                self.switching_account = false;
+                self.reset(window, cx);
+            }
+            Err(err) => {
+                self.cancel_request_elicitations(cx);
+                if let Some(ConnectedServerState {
+                    auth_state:
+                        AuthState::Unauthenticated {
+                            pending_auth_method,
+                            error,
+                            ..
+                        },
+                    ..
+                }) = self.as_connected_mut()
+                {
+                    pending_auth_method.take();
+                    error.replace(format!("{err:#}").into());
+                }
+                cx.emit(StateChange);
+                cx.notify();
+            }
         }
+    }
 
-        pending_auth_method.replace(method.clone());
+    /// Records the user's choice for this agent, under the id the sign-in gate
+    /// looks it up by: the connection's.
+    fn remember_sign_in(&self, confirmed: bool, cx: &mut App) {
+        let agent_id = self
+            .as_connected()
+            .map(|connected| connected.connection.agent_id())
+            .unwrap_or_else(|| self.agent.agent_id());
+        remember_sign_in(agent_id, confirmed, cx);
+    }
 
-        let authenticate = connection.authenticate(method, cx);
+    /// Stops waiting for a sign-in the user has walked away from. The login
+    /// command may still be open in the terminal; closing it is theirs to do.
+    fn cancel_authentication(&mut self, cx: &mut Context<Self>) {
+        self.auth_task.take();
+        if let Some(ConnectedServerState {
+            auth_state:
+                AuthState::Unauthenticated {
+                    pending_auth_method,
+                    ..
+                },
+            ..
+        }) = self.as_connected_mut()
+        {
+            pending_auth_method.take();
+        }
         cx.emit(StateChange);
         cx.notify();
-        self.auth_task = Some(cx.spawn_in(window, {
-            async move |this, cx| {
-                let result = authenticate.await;
+    }
 
-                match &result {
-                    Ok(_) => telemetry::event!(
-                        "Authenticate Agent Succeeded",
-                        agent = agent_telemetry_id
-                    ),
-                    Err(_) => {
-                        telemetry::event!("Authenticate Agent Failed", agent = agent_telemetry_id,)
-                    }
-                }
-
-                this.update_in(cx, |this, window, cx| {
-                    if let Err(err) = result {
-                        this.cancel_request_elicitations(cx);
-                        if let Some(ConnectedServerState {
-                            auth_state:
-                                AuthState::Unauthenticated {
-                                    pending_auth_method,
-                                    ..
-                                },
-                            ..
-                        }) = this.as_connected_mut()
-                        {
-                            pending_auth_method.take();
-                            cx.emit(StateChange);
-                        }
-                        if let Some(active) = this.root_thread_view() {
-                            active.update(cx, |active, cx| active.handle_thread_error(err, cx));
-                        }
-                    } else {
-                        this.switching_account = false;
-                        this.reset(window, cx);
-                    }
-                    this.auth_task.take()
-                })
-                .ok();
-            }
-        }));
+    /// Lets the agent use the account it already found on this machine.
+    fn continue_with_existing_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_sign_in(true, cx);
+        let has_thread = self
+            .as_connected()
+            .is_some_and(|connected| connected.active_view().is_some());
+        if has_thread {
+            self.keep_current_account(cx);
+        } else {
+            self.reset(window, cx);
+        }
     }
 
     fn load_subagent_session(
@@ -2374,6 +2477,8 @@ impl ConversationView {
         connection: &Rc<dyn AgentConnection>,
         description: Option<&Entity<Markdown>>,
         pending_auth_method: Option<&acp::AuthMethodId>,
+        error: Option<&SharedString>,
+        existing_account: Option<&SharedString>,
         window: &mut Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -2381,6 +2486,8 @@ impl ConversationView {
 
         let auth_methods = connection.auth_methods();
         let agent_id = self.agent.agent_id();
+        let colors = cx.theme().colors();
+        let status = cx.theme().status();
 
         let agent_display_name = self
             .agent_server_store
@@ -2388,17 +2495,19 @@ impl ConversationView {
             .agent_display_name(&agent_id)
             .unwrap_or_else(|| agent_id.0.clone());
         let brand = AgentBrand::for_agent_in(agent_id.0.as_ref(), cx);
-        // The first method is the agent's own recommendation, so it is the one
-        // drawn as the button to press: solid ink on a light theme, the way the
-        // send button is.
+        // The recommended choice is drawn as the button to press: solid ink on
+        // a light theme, the way the send button is.
         let primary_style = if cx.theme().appearance().is_light() {
             ButtonStyle::FilledCustom {
-                background: cx.theme().colors().text,
-                foreground: cx.theme().colors().editor_background.opacity(1.),
+                background: colors.text,
+                foreground: colors.editor_background.opacity(1.),
             }
         } else {
             ButtonStyle::Tinted(TintColor::Accent)
         };
+
+        let switching_account = self.switching_account && pending_auth_method.is_none();
+        let continue_account = existing_account.filter(|_| !self.switching_account);
 
         let heading = if pending_auth_method.is_some() {
             format!("Signing in to {agent_display_name}…")
@@ -2407,23 +2516,62 @@ impl ConversationView {
         };
 
         let body = if pending_auth_method.is_some() {
-            h_flex()
-                .gap_2()
+            v_flex()
+                .w_full()
+                .gap_3()
+                .items_center()
                 .child(
-                    Icon::new(IconName::ArrowCircle)
-                        .size(IconSize::Small)
-                        .color(Color::Muted)
-                        .with_rotate_animation(2),
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::ArrowCircle)
+                                .size(IconSize::Small)
+                                .color(Color::Muted)
+                                .with_rotate_animation(2),
+                        )
+                        .child(
+                            Label::new("Finish signing in in your browser, then come back here.")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
                 )
                 .child(
-                    Label::new(
-                        "Finish signing in in your browser or terminal, then come back here.",
-                    )
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                    Button::new("cancel-sign-in", "Cancel")
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.cancel_authentication(cx);
+                        })),
                 )
                 .into_any_element()
         } else {
+            let method_buttons = auth_methods.iter().enumerate().map(|(ix, method)| {
+                let (method_id, name) = (method.id().0.clone(), method.name().trim().to_string());
+                let agent_telemetry_id = connection.telemetry_id();
+                let is_primary = ix == 0 && continue_account.is_none();
+
+                Button::new(method_id.clone(), name)
+                    .full_width()
+                    .size(ButtonSize::Large)
+                    .style(if is_primary {
+                        primary_style
+                    } else {
+                        ButtonStyle::Outlined
+                    })
+                    .when_some(method.description(), |this, description| {
+                        this.tooltip(Tooltip::text(description.trim().to_string()))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        telemetry::event!(
+                            "Authenticate Agent Started",
+                            agent = agent_telemetry_id,
+                            method = method_id
+                        );
+                        this.authenticate(acp::AuthMethodId::new(method_id.clone()), window, cx)
+                    }))
+            });
+
             v_flex()
                 .w_full()
                 .gap_3()
@@ -2434,57 +2582,96 @@ impl ConversationView {
                         cx,
                     ))),
                     None => this.child(
-                        Label::new(if auth_methods.len() > 1 {
-                            "Choose how you want to sign in."
-                        } else {
-                            "You need to sign in before you can start a thread."
-                        })
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                        h_flex().w_full().justify_center().child(
+                            Label::new(format!(
+                                "Choose the account {agent_display_name} uses in Acuto."
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        ),
                     ),
                 })
-                .child(
-                    v_flex()
-                        .w_full()
-                        .gap_1p5()
-                        .children(auth_methods.iter().enumerate().map(|(ix, method)| {
-                            let (method_id, name) =
-                                (method.id().0.clone(), method.name().to_string());
-                            let agent_telemetry_id = connection.telemetry_id();
-
-                            Button::new(method_id.clone(), name)
-                                .full_width()
-                                .size(ButtonSize::Large)
-                                .style(if ix == 0 {
-                                    primary_style
-                                } else {
-                                    ButtonStyle::Outlined
-                                })
-                                .when_some(method.description(), |this, description| {
-                                    this.tooltip(Tooltip::text(description.to_string()))
-                                })
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    telemetry::event!(
-                                        "Authenticate Agent Started",
-                                        agent = agent_telemetry_id,
-                                        method = method_id
-                                    );
-
-                                    this.authenticate(
-                                        acp::AuthMethodId::new(method_id.clone()),
-                                        window,
-                                        cx,
+                .when_some(error, |this, error| {
+                    this.child(
+                        h_flex()
+                            .w_full()
+                            .items_start()
+                            .gap_2()
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(status.error_border)
+                            .bg(status.error_background)
+                            .child(
+                                Icon::new(IconName::XCircle)
+                                    .size(IconSize::Small)
+                                    .color(Color::Error),
+                            )
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .child(
+                                        Label::new("Sign-in did not finish")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Default),
                                     )
-                                }))
-                        })),
-                )
+                                    .child(
+                                        Label::new(error.clone())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                            ),
+                    )
+                })
+                .when_some(continue_account, |this, account| {
+                    // "an Anthropic API key" reads as a thing, not a person.
+                    let label = if account.starts_with("a ") || account.starts_with("an ") {
+                        format!("Continue with {account}")
+                    } else {
+                        format!("Continue as {account}")
+                    };
+                    this.child(
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .child(
+                                Button::new("continue-existing-account", label)
+                                    .full_width()
+                                    .size(ButtonSize::Large)
+                                    .style(primary_style)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.continue_with_existing_account(window, cx);
+                                    })),
+                            )
+                            .child(
+                                h_flex().w_full().justify_center().child(
+                                    Label::new("Already signed in on this PC")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(div().h_px().flex_1().bg(colors.border_variant))
+                            .child(
+                                Label::new("or use another account")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(div().h_px().flex_1().bg(colors.border_variant)),
+                    )
+                })
+                .child(v_flex().w_full().gap_1p5().children(method_buttons))
                 .into_any_element()
         };
 
-        let switching_account = self.switching_account && pending_auth_method.is_none();
         v_flex()
             .w_full()
-            .max_w(px(360.))
+            .max_w(px(380.))
             .px_4()
             .gap_4()
             .items_center()
@@ -3423,11 +3610,9 @@ impl ConversationView {
                         }
                     } else {
                         this.cancel_request_elicitations(cx);
+                        this.remember_sign_in(false, cx);
                         if let Some(connected) = this.as_connected_mut() {
-                            connected.auth_state = AuthState::Unauthenticated {
-                                description: None,
-                                pending_auth_method: None,
-                            };
+                            connected.auth_state = AuthState::signed_out();
                             cx.emit(StateChange);
                             if let Some(view) = connected.active_view()
                                 && view
@@ -3578,6 +3763,8 @@ impl Render for ConversationView {
                     AuthState::Unauthenticated {
                         description,
                         pending_auth_method,
+                        error,
+                        existing_account,
                     },
                 ..
             }) => v_flex()
@@ -3589,6 +3776,8 @@ impl Render for ConversationView {
                     connection,
                     description.as_ref(),
                     pending_auth_method.as_ref(),
+                    error.as_ref(),
+                    existing_account.as_ref(),
                     window,
                     cx,
                 ))
@@ -5330,7 +5519,9 @@ Paste the code back here:";
         let multi_workspace_handle =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace_handle
-            .read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone())
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
             .unwrap();
         let cx = &mut VisualTestContext::from_window(multi_workspace_handle.into(), cx);
 
@@ -5348,8 +5539,7 @@ Paste the code back here:";
                 .kind(acp::ToolKind::Edit)
                 .status(acp::ToolCallStatus::Completed)
                 .content(vec![acp::ToolCallContent::Diff(
-                    acp::Diff::new("/project/test1.txt", "new content 1")
-                        .old_text("old content 1"),
+                    acp::Diff::new("/project/test1.txt", "new content 1").old_text("old content 1"),
                 )]),
         )]);
         panel.update_in(cx, |panel, window, cx| {

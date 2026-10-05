@@ -45,19 +45,6 @@ use crate::{CLAUDE_AGENT_ID, CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 
-/// Signing in to Claude with an Anthropic account.
-///
-/// Deliberately not the adapter's own `claude-login`: that spawns the full
-/// Claude Code TUI and watches its output for "Type your message", so signing in
-/// means being dropped into a terminal chat session and closing it. `claude auth
-/// login` opens the browser, waits for the confirmation, and exits -- which is
-/// what someone clicking "Sign in" is asking for.
-///
-/// A distinct id also keeps it away from the `claude-login` success-pattern
-/// branch, so completion is judged on the exit code, which is what a
-/// one-shot command actually reports.
-pub const CLAUDE_TERMINAL_AUTH_METHOD_ID: &str = "claude-anthropic-login";
-
 /// The thinking budget Anthropic's own editor extension launches Claude Code
 /// with (`--max-thinking-tokens 31999`).
 ///
@@ -152,30 +139,6 @@ fn session_meta_for_agent(
     Some(claude_session_meta(user_sets_thinking_budget))
 }
 
-/// Where the Claude CLI is, if it is anywhere.
-///
-/// Checked in order: the `CLAUDE_CODE_PATH` override, then the per-user install
-/// location its installer uses, then bare `claude` for a PATH lookup. The bare
-/// name is the last resort rather than the first because a login that resolves
-/// through PATH resolves differently depending on which shell the terminal
-/// happens to spawn.
-fn claude_cli_path() -> String {
-    if let Ok(explicit) = std::env::var("CLAUDE_CODE_PATH") {
-        if !explicit.trim().is_empty() {
-            return explicit;
-        }
-    }
-
-    let installed = util::paths::home_dir()
-        .join(".local")
-        .join("bin")
-        .join(if cfg!(windows) { "claude.exe" } else { "claude" });
-    if installed.exists() {
-        return installed.to_string_lossy().into_owned();
-    }
-
-    "claude".to_string()
-}
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 const MAX_DEBUG_BACKLOG_MESSAGES: usize = 2000;
 
@@ -1214,43 +1177,12 @@ impl AcpConnection {
                     .description("Login with your Google or Vertex AI account")
                     .meta(meta),
             )]
-        } else if agent_id.0.as_ref() == CLAUDE_AGENT_ID {
-            // Replaces whatever the adapter advertised. Its own method drops the
-            // user into the Claude TUI; this one opens the browser, takes the
-            // confirmation, and exits.
-            let value = serde_json::json!({
-                "label": "Sign in with Anthropic",
-                "command": claude_cli_path(),
-                // `--claudeai` is the subscription flow. Without it the CLI can
-                // fall through to Console sign-in, which bills API usage rather
-                // than the plan the user already pays for.
-                "args": ["auth", "login", "--claudeai"],
-                "env": {},
-            });
-            let meta = acp::Meta::from_iter([("terminal-auth".to_string(), value)]);
-            vec![acp::AuthMethod::Agent(
-                acp::AuthMethodAgent::new(
-                    CLAUDE_TERMINAL_AUTH_METHOD_ID,
-                    "Sign in with Anthropic",
-                )
-                // Claude Code prefers an API key over a signed-in account, and
-                // one in the environment is passed through to it, so promising
-                // subscription billing then would be untrue.
-                .description(
-                    if std::env::var_os("ANTHROPIC_API_KEY")
-                        .is_some_and(|key| !key.is_empty())
-                    {
-                        "Opens your browser to confirm. ANTHROPIC_API_KEY is set in your \
-                         environment, so Claude Code bills that key's API credit \
-                         instead of your subscription until it is unset."
-                    } else {
-                        "Opens your browser to confirm. Uses your Claude subscription, \
-                         not API credit."
-                    },
-                )
-                .meta(meta),
-            )]
         } else {
+            // Claude's adapter offers `auth login --claudeai` and `--console`,
+            // run through the CLI it bundles. They are used as advertised. A
+            // replacement that called a separately installed `claude` failed
+            // before it started for everyone who installed Claude Code
+            // through Acuto, because they have no such binary.
             response.auth_methods
         };
         let defaults = AcpConnectionDefaults::new(default_mode, default_config_options);
@@ -1832,11 +1764,8 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
-        let mcp_servers = mcp_servers_for_project(
-            &project,
-            self.agent_capabilities.mcp_capabilities.http,
-            cx,
-        );
+        let mcp_servers =
+            mcp_servers_for_project(&project, self.agent_capabilities.mcp_capabilities.http, cx);
 
         let session_meta = self.session_meta.clone();
         log_session_config(&self.id, "new", session_meta.as_ref());
@@ -1971,11 +1900,8 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(
-            &project,
-            self.agent_capabilities.mcp_capabilities.http,
-            cx,
-        );
+        let mcp_servers =
+            mcp_servers_for_project(&project, self.agent_capabilities.mcp_capabilities.http, cx);
         let session_meta = self.session_meta.clone();
         log_session_config(&self.id, "load", session_meta.as_ref());
         self.open_or_create_session(
@@ -2023,11 +1949,8 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(
-            &project,
-            self.agent_capabilities.mcp_capabilities.http,
-            cx,
-        );
+        let mcp_servers =
+            mcp_servers_for_project(&project, self.agent_capabilities.mcp_capabilities.http, cx);
         let session_meta = self.session_meta.clone();
         log_session_config(&self.id, "resume", session_meta.as_ref());
         self.open_or_create_session(
@@ -4775,48 +4698,50 @@ fn mcp_servers_for_project(
 
     let context_server_store = project.read(cx).context_server_store().read(cx);
     let is_local = project.read(cx).is_local();
-    servers.extend(context_server_store
-        .configured_server_ids()
-        .iter()
-        .filter_map(|id| {
-            let configuration = context_server_store.configuration_for_server(id)?;
-            match &*configuration {
-                project::context_server_store::ContextServerConfiguration::Custom {
-                    command,
-                    remote,
-                    ..
+    servers.extend(
+        context_server_store
+            .configured_server_ids()
+            .iter()
+            .filter_map(|id| {
+                let configuration = context_server_store.configuration_for_server(id)?;
+                match &*configuration {
+                    project::context_server_store::ContextServerConfiguration::Custom {
+                        command,
+                        remote,
+                        ..
+                    }
+                    | project::context_server_store::ContextServerConfiguration::Extension {
+                        command,
+                        remote,
+                        ..
+                    } if is_local || *remote => Some(acp::McpServer::Stdio(
+                        acp::McpServerStdio::new(id.0.to_string(), &command.path)
+                            .args(command.args.clone())
+                            .env(if let Some(env) = command.env.as_ref() {
+                                env.iter()
+                                    .map(|(name, value)| acp::EnvVariable::new(name, value))
+                                    .collect()
+                            } else {
+                                vec![]
+                            }),
+                    )),
+                    project::context_server_store::ContextServerConfiguration::Http {
+                        url,
+                        headers,
+                        timeout: _,
+                        oauth: _,
+                    } => Some(acp::McpServer::Http(
+                        acp::McpServerHttp::new(id.0.to_string(), url.to_string()).headers(
+                            headers
+                                .iter()
+                                .map(|(name, value)| acp::HttpHeader::new(name, value))
+                                .collect(),
+                        ),
+                    )),
+                    _ => None,
                 }
-                | project::context_server_store::ContextServerConfiguration::Extension {
-                    command,
-                    remote,
-                    ..
-                } if is_local || *remote => Some(acp::McpServer::Stdio(
-                    acp::McpServerStdio::new(id.0.to_string(), &command.path)
-                        .args(command.args.clone())
-                        .env(if let Some(env) = command.env.as_ref() {
-                            env.iter()
-                                .map(|(name, value)| acp::EnvVariable::new(name, value))
-                                .collect()
-                        } else {
-                            vec![]
-                        }),
-                )),
-                project::context_server_store::ContextServerConfiguration::Http {
-                    url,
-                    headers,
-                    timeout: _,
-                    oauth: _,
-                } => Some(acp::McpServer::Http(
-                    acp::McpServerHttp::new(id.0.to_string(), url.to_string()).headers(
-                        headers
-                            .iter()
-                            .map(|(name, value)| acp::HttpHeader::new(name, value))
-                            .collect(),
-                    ),
-                )),
-                _ => None,
-            }
-        }));
+            }),
+    );
     servers
 }
 

@@ -272,18 +272,13 @@ impl ConfigOptionsView {
         config_options
             .config_options()
             .into_iter()
-            // Only the two an agent is actually steered with. An adapter
-            // advertises everything it can be configured with -- thought level,
-            // model config, and whatever it adds next -- and rendering one
-            // dropdown per option is what turned the composer into three rows
-            // of controls. The rest stay reachable from the agent's own menu.
-            .filter(|option| {
-                matches!(
-                    option.category,
-                    Some(acp::SessionConfigOptionCategory::Model)
-                        | Some(acp::SessionConfigOptionCategory::Mode)
-                )
-            })
+            // Only what an agent is actually steered with: model, mode and
+            // effort. An adapter advertises everything it can be configured
+            // with, and one dropdown per option is what turned the composer
+            // into three rows of controls. Effort is drawn as an icon rather
+            // than a dropdown for the same reason; the rest stay reachable
+            // from the agent's own menu.
+            .filter(shown_in_composer)
             .map(|option| {
                 let config_options = config_options.clone();
                 let agent_server = agent_server.clone();
@@ -301,6 +296,15 @@ impl ConfigOptionsView {
             })
             .collect()
     }
+}
+
+fn shown_in_composer(option: &acp::SessionConfigOption) -> bool {
+    matches!(
+        option.category,
+        Some(acp::SessionConfigOptionCategory::Model)
+            | Some(acp::SessionConfigOptionCategory::Mode)
+            | Some(acp::SessionConfigOptionCategory::ThoughtLevel)
+    )
 }
 
 impl Render for ConfigOptionsView {
@@ -425,6 +429,48 @@ impl ConfigOptionSelector {
         }
     }
 
+    /// How far up its range the current effort is, from 0 for the lowest
+    /// level to 1 for the highest. `None` for the agent's own default, which
+    /// is not a point on the scale.
+    fn effort_strength(&self) -> Option<f32> {
+        let option = self.current_option()?;
+        let acp::SessionConfigKind::Select(select) = &option.kind else {
+            return None;
+        };
+        let acp::SessionConfigSelectOptions::Ungrouped(options) = &select.options else {
+            return None;
+        };
+        let levels = options
+            .iter()
+            .filter(|level| level.value.0.as_ref() != "default")
+            .collect::<Vec<_>>();
+        let position = levels
+            .iter()
+            .position(|level| level.value == select.current_value)?;
+        Some(if levels.len() > 1 {
+            position as f32 / (levels.len() - 1) as f32
+        } else {
+            1.
+        })
+    }
+
+    /// Effort as one small icon in the composer: brighter the harder the agent
+    /// is asked to think. The level itself is in the tooltip and the menu.
+    fn render_effort_trigger(&self) -> IconButton {
+        let color = match self.effort_strength() {
+            Some(strength) if strength >= 0.75 => Color::Accent,
+            Some(strength) if strength >= 0.34 => Color::Default,
+            _ => Color::Muted,
+        };
+        IconButton::new(
+            ElementId::Name(format!("config-option-{}", self.config_id.0).into()),
+            IconName::ThinkingMode,
+        )
+        .icon_size(IconSize::Small)
+        .icon_color(color)
+        .disabled(self.setting_value)
+    }
+
     fn handles_category_keybindings(&self, category: &acp::SessionConfigOptionCategory) -> bool {
         self.config_options
             .config_options()
@@ -488,14 +534,20 @@ impl Render for ConfigOptionSelector {
                     return div().into_any_element();
                 };
 
-                let trigger_button = self.render_trigger_button(window, cx);
+                let is_effort =
+                    option.category == Some(acp::SessionConfigOptionCategory::ThoughtLevel);
 
                 let show_category_keybindings = option
                     .category
                     .as_ref()
                     .is_some_and(|category| self.handles_category_keybindings(category));
                 let option_category = option.category.clone();
-                let option_name = option.name.clone();
+                // Effort shows only an icon, so its tooltip carries the level.
+                let option_name = if is_effort {
+                    format!("{}: {}", option.name, self.current_value_name())
+                } else {
+                    option.name.clone()
+                };
                 let option_description: Option<SharedString> =
                     option.description.clone().map(Into::into);
 
@@ -561,16 +613,29 @@ impl Render for ConfigOptionSelector {
                     content.into_any()
                 });
 
-                PickerPopoverMenu::new(
-                    picker,
-                    trigger_button,
-                    tooltip,
-                    gpui::Anchor::BottomRight,
-                    cx,
-                )
-                .with_handle(picker_handle)
-                .render(window, cx)
-                .into_any_element()
+                if is_effort {
+                    PickerPopoverMenu::new(
+                        picker,
+                        self.render_effort_trigger(),
+                        tooltip,
+                        gpui::Anchor::BottomRight,
+                        cx,
+                    )
+                    .with_handle(picker_handle)
+                    .render(window, cx)
+                    .into_any_element()
+                } else {
+                    PickerPopoverMenu::new(
+                        picker,
+                        self.render_trigger_button(window, cx),
+                        tooltip,
+                        gpui::Anchor::BottomRight,
+                        cx,
+                    )
+                    .with_handle(picker_handle)
+                    .render(window, cx)
+                    .into_any_element()
+                }
             }
             acp::SessionConfigKind::Boolean(boolean) => {
                 let option_id = option.id.clone();
@@ -1016,11 +1081,11 @@ fn extract_options(
                         .iter()
                         .filter(|opt| !names_the_default(&opt.name))
                         .map(|opt| ConfigOptionValue {
-                        value: opt.value.clone(),
-                        name: opt.name.clone(),
-                        description: opt.description.clone(),
-                        group: Some(group.name.clone()),
-                    })
+                            value: opt.value.clone(),
+                            name: opt.name.clone(),
+                            description: opt.description.clone(),
+                            group: Some(group.name.clone()),
+                        })
                 })
                 .collect(),
             _ => Vec::new(),
@@ -1322,18 +1387,30 @@ mod full_model_name_tests {
     #[test]
     fn the_full_name_comes_from_the_description() {
         assert_eq!(
-            full_model_name("Opus", Some("Opus 5 \u{b7} Best for everyday, complex tasks"), "opus")
-                .as_deref(),
+            full_model_name(
+                "Opus",
+                Some("Opus 5 \u{b7} Best for everyday, complex tasks"),
+                "opus"
+            )
+            .as_deref(),
             Some("Opus 5")
         );
         assert_eq!(
-            full_model_name("Sonnet", Some("Sonnet 5 \u{b7} Efficient for routine tasks"), "sonnet")
-                .as_deref(),
+            full_model_name(
+                "Sonnet",
+                Some("Sonnet 5 \u{b7} Efficient for routine tasks"),
+                "sonnet"
+            )
+            .as_deref(),
             Some("Sonnet 5")
         );
         assert_eq!(
-            full_model_name("Haiku", Some("Haiku 4.5 \u{b7} Fastest for quick answers"), "haiku")
-                .as_deref(),
+            full_model_name(
+                "Haiku",
+                Some("Haiku 4.5 \u{b7} Fastest for quick answers"),
+                "haiku"
+            )
+            .as_deref(),
             Some("Haiku 4.5")
         );
     }
@@ -1371,7 +1448,10 @@ mod full_model_name_tests {
             full_model_name("Opus", None, "claude-opus-4-5-20251101").as_deref(),
             Some("Opus 4.5")
         );
-        assert_eq!(full_model_name("Sonnet", Some("Fast and cheap"), "sonnet"), None);
+        assert_eq!(
+            full_model_name("Sonnet", Some("Fast and cheap"), "sonnet"),
+            None
+        );
     }
 
     #[test]
@@ -1380,7 +1460,10 @@ mod full_model_name_tests {
         assert!(names_the_default("Default (recommended)"));
         assert!(names_the_default("default"));
         assert!(names_the_default("  Default  "));
-        assert!(!names_the_default("Defaulting Model"), "only the whole first word counts");
+        assert!(
+            !names_the_default("Defaulting Model"),
+            "only the whole first word counts"
+        );
         assert!(!names_the_default("Sonnet"));
     }
 }
@@ -1442,6 +1525,64 @@ mod tests {
             &[(
                 "mode".to_string(),
                 acp::SessionConfigOptionValue::value_id("manual")
+            )]
+        );
+    }
+
+    /// Claude Code and Codex report effort as a thought-level option. It used to
+    /// be filtered out of the composer, so there was no way to change it.
+    #[gpui::test]
+    fn effort_is_shown_and_reaches_the_agent(cx: &mut TestAppContext) {
+        let effort = acp::SessionConfigOption::select(
+            "effort",
+            "Effort",
+            "medium",
+            vec![
+                acp::SessionConfigSelectOption::new("low", "Low"),
+                acp::SessionConfigSelectOption::new("medium", "Medium"),
+                acp::SessionConfigSelectOption::new("high", "High"),
+            ],
+        )
+        .category(acp::SessionConfigOptionCategory::ThoughtLevel);
+        assert!(shown_in_composer(&effort));
+
+        let agent_server = Rc::new(TestAgentServer::default());
+        let config_options = Rc::new(TestSessionConfigOptions::new(vec![effort]));
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+
+        cx.update(|cx| {
+            let config_options: Rc<dyn AgentSessionConfigOptions> = config_options.clone();
+            let agent_server: Rc<dyn AgentServer> = agent_server.clone();
+            let view = cx.new(|_| ConfigOptionsView {
+                config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
+                config_options,
+                selectors: Vec::new(),
+                agent_server,
+                fs,
+                _refresh_task: Task::ready(()),
+            });
+
+            assert!(view.update(cx, |view, cx| {
+                view.cycle_category_option(
+                    acp::SessionConfigOptionCategory::ThoughtLevel,
+                    false,
+                    cx,
+                )
+            }));
+        });
+
+        assert_eq!(
+            config_options.set_values.borrow().as_slice(),
+            &[(
+                "effort".to_string(),
+                acp::SessionConfigOptionValue::value_id("high")
+            )]
+        );
+        assert_eq!(
+            agent_server.saved_defaults.lock().as_slice(),
+            &[(
+                "effort".to_string(),
+                Some(AgentConfigOptionValue::ValueId("high".to_string()))
             )]
         );
     }
