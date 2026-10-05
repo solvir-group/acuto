@@ -54,9 +54,13 @@
   // ------------------------------------------------------------ off-machine
   //
   // Acuto talks to nobody but the agent the user chose. Zed's own services --
-  // telemetry, collaboration, the update check -- are switched off here rather
-  // than left on and hoped about, because a fork that ships someone else's
-  // analytics endpoint is a fork that leaks its users to a third party.
+  // telemetry and collaboration -- are switched off here rather than left on
+  // and hoped about, because a fork that ships someone else's analytics
+  // endpoint is a fork that leaks its users to a third party.
+  //
+  // The update check is on. It no longer goes to Zed: it reads Acuto's own
+  // release list on GitHub and sends nothing identifying. Off, a machine set
+  // up from this file stayed on whatever version it was installed with.
   //
   // The panels for collaboration are hidden too: a button for a service that
   // is turned off is a dead end with a login prompt behind it.
@@ -64,7 +68,7 @@
     "diagnostics": false,
     "metrics": false
   },
-  "auto_update": false,
+  "auto_update": true,
   "collaboration_panel": {
     "button": false
   },

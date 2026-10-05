@@ -918,7 +918,8 @@ impl TeamNotesPanel {
         let meta = h_flex()
             .w_full()
             .min_w_0()
-            .gap_1()
+            .gap_x_1()
+            .flex_wrap()
             .child(
                 Label::new(format!("#{}", crate::short_ref(&record.id)))
                     .size(LabelSize::XSmall)
@@ -992,6 +993,9 @@ impl TeamNotesPanel {
                 colors.border_variant
             })
             .bg(colors.elevated_surface_background)
+            // Whatever a long path or an unbroken word does, it stays inside
+            // the card.
+            .overflow_hidden()
             .hover(|style| style.border_color(colors.border))
             .when(closed, |this| this.opacity(0.6))
             .child(
@@ -1029,7 +1033,7 @@ impl TeamNotesPanel {
             .when(reply_count > 0, |this| {
                 this.child(
                     v_flex()
-                        .w_full()
+                        .min_w_0()
                         .gap_2()
                         .ml_8()
                         .pl_2()
@@ -1041,6 +1045,7 @@ impl TeamNotesPanel {
             .when(replying, |this| {
                 this.child(
                     v_flex()
+                        .min_w_0()
                         .ml_8()
                         .gap_1p5()
                         .p_1p5()
@@ -1086,10 +1091,13 @@ impl TeamNotesPanel {
                 )
             })
             .child(
+                // Not `w_full`: with the indent that is wider than the card
+                // by the indent, which pushed the actions out past its edge.
                 h_flex()
-                    .w_full()
+                    .min_w_0()
                     .ml_8()
                     .gap_1()
+                    .flex_wrap()
                     .when_some(record.assignee.clone(), |this, assignee| {
                         this.child(
                             h_flex()

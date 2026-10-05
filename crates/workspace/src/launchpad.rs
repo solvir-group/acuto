@@ -96,12 +96,6 @@ impl Render for Launchpad {
                         "file_finder::Toggle",
                     ))
                     .child(Self::entry(
-                        "launchpad-terminal",
-                        "New Terminal",
-                        IconName::Terminal,
-                        "terminal_panel::Toggle",
-                    ))
-                    .child(Self::entry(
                         "launchpad-agent",
                         "New Agent Thread",
                         IconName::Sparkle,
@@ -131,12 +125,6 @@ impl Render for Launchpad {
                         IconName::Copilot,
                         "agent::NewExternalAgentThreadInPane",
                         Some(serde_json::json!({ "agent": COPILOT_AGENT_ID })),
-                    ))
-                    .child(Self::entry(
-                        "launchpad-git",
-                        "Git Status",
-                        IconName::GitBranch,
-                        "git_panel::ToggleFocus",
                     )),
             )
     }

@@ -3524,12 +3524,6 @@ impl Pane {
                 "file_finder::Toggle",
             ))
             .child(entry(
-                "launchpad-terminal",
-                "New Terminal",
-                IconName::Terminal,
-                "terminal_panel::Toggle",
-            ))
-            .child(entry(
                 "launchpad-agent",
                 "New Agent Thread",
                 IconName::Sparkle,
@@ -3547,12 +3541,6 @@ impl Pane {
                 Some(serde_json::json!({
                     "agent": crate::launchpad::CLAUDE_AGENT_ID
                 })),
-            ))
-            .child(entry(
-                "launchpad-git",
-                "Git Status",
-                IconName::GitBranch,
-                "git_panel::ToggleFocus",
             ))
     }
 
@@ -4023,8 +4011,36 @@ impl Pane {
         self.workspace
             .update(cx, |_, cx| {
                 cx.defer_in(window, move |workspace, window, cx| {
+                    // A pane's only tab, dropped on that pane's own edge.
+                    // Moving it out the usual way closes the pane it left,
+                    // which undoes the split: the tab ends up alone in a pane
+                    // the size of the one it came from and nothing appears to
+                    // have happened. Here the pane it left stays, empty, and
+                    // shows the launchpad.
+                    let leaves_source_empty = split_direction.is_some()
+                        && !is_clone
+                        && to_pane == from_pane
+                        && from_pane.read(cx).items_len() == 1;
                     if let Some(split_direction) = split_direction {
                         to_pane = workspace.split_pane(to_pane, split_direction, window, cx);
+                    }
+                    if leaves_source_empty {
+                        let item = from_pane
+                            .read(cx)
+                            .items()
+                            .find(|item| item.item_id() == item_id)
+                            .cloned();
+                        let Some(item) = item else {
+                            return;
+                        };
+                        from_pane.update(cx, |pane, cx| {
+                            pane.remove_item(item_id, false, false, window, cx);
+                        });
+                        to_pane.update(cx, |pane, cx| {
+                            pane.add_item_inner(item, true, true, true, Some(0), window, cx);
+                            window.focus(&pane.focus_handle(cx), cx);
+                        });
+                        return;
                     }
                     let database_id = workspace.database_id();
                     let was_pinned_in_from_pane = from_pane.read_with(cx, |pane, _| {
@@ -6276,6 +6292,40 @@ mod tests {
         });
         assert_item_labels(&pane_a, ["B*!"], cx);
         assert_item_labels(&pane_b, ["A*"], cx);
+    }
+
+    /// A pane's only tab, dragged to that pane's own edge, moves into the new
+    /// split and leaves its pane open and empty rather than closing it.
+    #[gpui::test]
+    async fn test_drag_only_tab_to_split_keeps_the_emptied_pane(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let pane_a = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let item_a = add_labeled_item(&pane_a, "A", false, cx);
+
+        pane_a.update_in(cx, |pane, window, cx| {
+            pane.drag_split_direction = Some(SplitDirection::Right);
+
+            let dragged_tab = DraggedTab {
+                pane: pane_a.clone(),
+                item: item_a.boxed_clone(),
+                ix: 0,
+                detail: 0,
+                is_active: true,
+            };
+            pane.handle_tab_drop(&dragged_tab, 0, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        let panes = workspace.read_with(cx, |workspace, _| workspace.panes().to_vec());
+        assert_eq!(panes.len(), 2, "the emptied pane was closed");
+        assert_eq!(panes[0], pane_a);
+        assert_eq!(pane_a.read_with(cx, |pane, _| pane.items_len()), 0);
+        assert_item_labels(&panes[1], ["A*"], cx);
     }
 
     #[gpui::test]

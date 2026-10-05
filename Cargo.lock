@@ -10009,6 +10009,7 @@ dependencies = [
  "tree-sitter-css",
  "tree-sitter-gitcommit",
  "tree-sitter-go",
+ "tree-sitter-html",
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",

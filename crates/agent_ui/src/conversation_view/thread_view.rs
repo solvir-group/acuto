@@ -5805,7 +5805,12 @@ impl ThreadView {
             // A rounded square in the agent's own colour: solid once there is
             // something to send, a pale wash of it until then. An agent whose
             // colour is near white gets a dark arrow, so it stays legible.
+            let is_light = cx.theme().appearance().is_light();
             let (background, foreground) = match brand {
+                // On a dark theme the button turns white the moment there is
+                // something to send, whichever agent it is: the one bright
+                // thing in the composer is the thing to press.
+                _ if !is_disabled && !is_light => (gpui::white(), gpui::black()),
                 Some(brand) if is_disabled => (brand.accent.opacity(0.16), brand.accent),
                 Some(brand) => {
                     let arrow = if brand.accent.l > 0.7 {
@@ -5816,8 +5821,7 @@ impl ThreadView {
                     (brand.accent, arrow)
                 }
                 None if is_disabled => (colors.element_background, colors.icon_muted),
-                None if cx.theme().appearance().is_light() => (colors.text, gpui::white()),
-                None => (colors.text_accent.opacity(0.18), colors.text_accent),
+                None => (colors.text, gpui::white()),
             };
             div()
                 .id("send-message")

@@ -259,4 +259,70 @@ mod tests {
             ]
         );
     }
+
+    /// A `<style>` block in an HTML file is CSS, and is coloured as CSS.
+    #[gpui::test]
+    async fn test_css_inside_an_html_style_element(cx: &mut TestAppContext) {
+        use language::LanguageAwareStyling;
+
+        let theme = theme::SyntaxTheme::new_test([
+            ("property", gpui::Hsla::blue()),
+            ("tag", gpui::Hsla::green()),
+        ]);
+        let registry = std::sync::Arc::new(language::LanguageRegistry::new(cx.executor()));
+        let css = crate::language("css", tree_sitter_css::LANGUAGE.into());
+        let html = crate::language("html", tree_sitter_html::LANGUAGE.into());
+        css.set_theme(&theme);
+        html.set_theme(&theme);
+        registry.add(css);
+        registry.add(html.clone());
+
+        let text = "<!DOCTYPE html>\n<html>\n<head>\n<style>\nbody { color: red; }\n</style>\n</head>\n\
+                    <body>\n<p style=\"margin: 0\">hi</p>\n</body>\n</html>\n";
+        let buffer = cx.new(|cx| {
+            let mut buffer = language::Buffer::local(text, cx);
+            buffer.set_sync_parse_timeout(None);
+            buffer.set_language_registry(registry.clone());
+            buffer.set_language(Some(html), cx);
+            buffer
+        });
+        cx.run_until_parked();
+        buffer
+            .read_with(cx, |buffer, _| buffer.parsing_idle())
+            .await;
+        cx.run_until_parked();
+
+        let language_at = |needle: &str, cx: &mut TestAppContext| {
+            let offset = text.find(needle).unwrap();
+            buffer.read_with(cx, |buffer, _| {
+                buffer
+                    .language_at(offset)
+                    .map(|language| language.name().to_string())
+            })
+        };
+        assert_eq!(language_at("body {", cx).as_deref(), Some("CSS"));
+        assert_eq!(language_at("margin: 0", cx).as_deref(), Some("CSS"));
+        assert_eq!(language_at("<p", cx).as_deref(), Some("HTML"));
+
+        let coloured = |needle: &str, cx: &mut TestAppContext| {
+            let offset = text.find(needle).unwrap();
+            buffer.read_with(cx, |buffer, _| {
+                let snapshot = buffer.snapshot();
+                snapshot
+                    .chunks(
+                        offset..offset + needle.len(),
+                        LanguageAwareStyling {
+                            tree_sitter: true,
+                            diagnostics: false,
+                        },
+                    )
+                    .any(|chunk| chunk.syntax_highlight_id.is_some())
+            })
+        };
+        assert!(coloured("color", cx), "a property in <style> has no colour");
+        assert!(
+            coloured("margin", cx),
+            "a property in style=\"\" has no colour"
+        );
+    }
 }

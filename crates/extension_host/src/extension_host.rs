@@ -86,6 +86,12 @@ static SUPPRESSED_EXTENSIONS: LazyLock<FxHashSet<&str>> = LazyLock::new(|| {
         "ty",
         "basedpyright",
         "basher",
+        // HTML is built in. Earlier versions installed this extension
+        // automatically, and a language registered under a name that already
+        // exists replaces the built-in one's grammar and queries in place, so
+        // an install that still had it got a mixture of the two and lost the
+        // CSS and JavaScript inside its HTML files.
+        "html",
         // ACP
         "opencode",
         "mistral-vibe",

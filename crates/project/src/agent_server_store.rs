@@ -1391,18 +1391,35 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
             fs.create_dir(&install_dir).await?;
 
             let (package_name, package_spec) = bounded_npm_package_spec(&package);
-            node_runtime
+            let install = node_runtime
                 .run_npm_subcommand(
                     Some(&install_dir),
                     "install",
                     &[package_spec.as_str(), "--save-exact"],
                 )
-                .await?;
+                .await;
             let executable = node_runtime::read_package_executable(
                 install_dir.join("node_modules"),
                 package_name,
             )
-            .await?;
+            .await;
+            // The install runs on every launch so the agent stays current, but
+            // it is an update, not a precondition. When it fails and a copy is
+            // already installed, that copy is launched: offline, behind a
+            // blocked registry, or on Windows while another window's agent
+            // still holds the package's files open, the agent used to refuse
+            // to start even though nothing was wrong with what was on disk.
+            let executable = match (install, executable) {
+                (Ok(_), executable) => executable?,
+                (Err(install_error), Ok(executable)) => {
+                    log::warn!(
+                        "could not update {package_name}, launching the installed copy: \
+                         {install_error:#}"
+                    );
+                    executable
+                }
+                (Err(install_error), Err(_)) => return Err(install_error),
+            };
 
             let node_binary = node_runtime.binary_path().await?;
             env.extend(node_runtime::npm_command_env(&node_binary));

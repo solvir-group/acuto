@@ -1079,36 +1079,17 @@ impl TitleBar {
     /// an action that is renamed upstream degrades to a logged warning and a
     /// dead button rather than a panic.
     fn render_title_bar_tools(&self) -> impl IntoElement {
-        h_flex()
-            .gap_0p5()
-            // First, ahead of git: the tree is the control you reach for most,
-            // and it used to sit in the status bar where it was the only
-            // navigation control not on this row.
-            .child(
-                IconButton::new("title-bar-project-panel", IconName::FileTree)
-                    .tooltip(Tooltip::text("Project Panel"))
-                    .icon_size(IconSize::Small)
-                    .on_click(move |_, window, cx| {
-                        if let Some(action) = cx
-                            .build_action("project_panel::ToggleFocus", None)
-                            .log_err()
-                        {
-                            window.dispatch_action(action, cx);
-                        }
-                    }),
-            )
-            .child(
-                IconButton::new("title-bar-terminal", IconName::Terminal)
-                    .tooltip(Tooltip::text("Terminal"))
-                    .icon_size(IconSize::Small)
-                    .on_click(move |_, window, cx| {
-                        if let Some(action) =
-                            cx.build_action("terminal_panel::Toggle", None).log_err()
-                        {
-                            window.dispatch_action(action, cx);
-                        }
-                    }),
-            )
+        h_flex().gap_0p5().child(
+            IconButton::new("title-bar-terminal", IconName::Terminal)
+                .tooltip(Tooltip::text("Terminal"))
+                .icon_size(IconSize::Small)
+                .on_click(move |_, window, cx| {
+                    if let Some(action) = cx.build_action("terminal_panel::Toggle", None).log_err()
+                    {
+                        window.dispatch_action(action, cx);
+                    }
+                }),
+        )
     }
 
     /// Agent toggle and settings, rendered on the trailing side of the bar.
